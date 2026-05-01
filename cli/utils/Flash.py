@@ -1,12 +1,5 @@
 """
 MicroPython 设备刷入工具 - 通过串口原始 REPL 上传文件到设备
-
-用法:
-    python Flash.py --scan              # 扫描串口设备
-    python Flash.py --port COM3 --file main.py   # 刷入单个文件
-    python Flash.py --port COM3 --dir ./src       # 刷入整个目录
-    python Flash.py --init-config      # 创建默认配置文件
-
 依赖: pyserial (pip install pyserial)
 """
 
@@ -15,13 +8,8 @@ import sys
 import time
 import json
 from pathlib import Path
-
-try:
-    import serial
-    import serial.tools.list_ports
-except ImportError:
-    print("请先安装 pyserial: pip install pyserial")
-    sys.exit(1)
+import serial
+import serial.tools.list_ports
 
 
 # ── 配置管理 ────────────────────────────────────────────────────────────────

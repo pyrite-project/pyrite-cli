@@ -1,20 +1,8 @@
 # `Flash.py` — MicroPython 设备刷入工具
 
-通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录。不依赖 `esptool`、`ampy`、`mpremote` 等外部工具，仅需 Python 标准库 + `pyserial`。
-
+通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录。
 ---
 
-## 运行方式
-
-```bash
-python utils/Flash.py --scan              # 扫描串口
-python utils/Flash.py --port COM3 --file main.py
-python utils/Flash.py --port COM3 --dir ./src
-python utils/Flash.py -p /dev/ttyUSB0 --ls
-python utils/Flash.py --init-config       # 生成 .pyrite_config.json
-```
-
----
 
 ## 配置文件 `.pyrite_config.json`
 

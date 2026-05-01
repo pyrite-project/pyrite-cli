@@ -220,21 +220,21 @@ class MicroPython:
         old_tty = None
         if not _WIN:
             fd = sys.stdin.fileno()
-            old_tty = termios.tcgetattr(fd)
-            mode = termios.tcgetattr(fd)
-            mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
-            mode[tty.CC][termios.VMIN] = 1
-            mode[tty.CC][termios.VTIME] = 0
-            termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
+            old_tty = termios.tcgetattr(fd) # type: ignore
+            mode = termios.tcgetattr(fd) # type: ignore
+            mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.ISIG) # type: ignore
+            mode[tty.CC][termios.VMIN] = 1 # type: ignore
+            mode[tty.CC][termios.VTIME] = 0 # type: ignore
+            termios.tcsetattr(fd, termios.TCSAFLUSH, mode) # type: ignore
 
         try:
             while not self.close_monitor and self.is_connected:
                 # ── 读取并显示设备输出 ──
                 try:
                     got_serial = False
-                    while self.ser.in_waiting:
+                    while self.ser.in_waiting: # type: ignore
                         got_serial = True
-                        chunk = self.ser.read(self.ser.in_waiting)
+                        chunk = self.ser.read(self.ser.in_waiting) # type: ignore
                         text = chunk.decode("utf-8", errors="replace")
                         for c in ("\x01", "\x02", "\x04"):
                             text = text.replace(c, "")
@@ -336,7 +336,7 @@ class MicroPython:
             print()
             if old_tty is not None:
                 try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty) # type: ignore
                 except Exception:
                     pass
 

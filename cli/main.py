@@ -47,6 +47,22 @@ def flash(
     finally:
         mp.disconnect()
 
+@app.command()
+def repl(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
+):
+    """连接MicroPython设备REPL"""
+    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    try:
+        mp.connect()
+        mp.repl_()
+    finally:
+        mp.disconnect()
+
 
 @app.command()
 def flash_program(

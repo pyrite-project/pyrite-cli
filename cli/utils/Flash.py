@@ -4,19 +4,19 @@ MicroPython 设备刷入工具 - 通过串口原始 REPL 上传文件到设备
 """
 
 import os
-import sys
 import time
 import json
 from pathlib import Path
 import serial
 import serial.tools.list_ports
 
-
-# ── 配置管理 ────────────────────────────────────────────────────────────────
-
 CONFIG_FILE = ".pyrite_config.json"
-DEFAULT_CHUNK_SIZE = 4096  # 字节
+DEFAULT_CHUNK_SIZE = 4096  # 单位:字节
 
+ENTER_RAW_REPL = b'\x01'
+EXIT_RAW_REPL = b'\x02'
+SET_RESET = b'\x03'
+SET_EXECUTE = b'\x04'
 
 def _load_config():
     """从当前或上级目录加载配置文件，未找到则使用默认值。"""
@@ -34,9 +34,6 @@ def _load_config():
             break
     return cfg
 
-
-# ── MicroPython 设备操作类 ─────────────────────────────────────────────────
-
 class MicroPython:
     """通过串口原始 REPL 与 MicroPython 设备交互。
 
@@ -52,8 +49,7 @@ class MicroPython:
         self.ser = None          # pySerial 对象
         self._in_raw = False     # 是否处于原始 REPL 模式
         self._kbd_set = False    # 是否已设置 kbd_intr(-1)
-
-    # ── 串口扫描 ────────────────────────────────────────────────────────────
+        self.close_monitor = False
 
     @staticmethod
     def scan_ports():
@@ -69,22 +65,6 @@ class MicroPython:
                 "serial_number": p.serial_number,
             })
         return ports
-
-    @staticmethod
-    def scan_micropython_ports():
-        """返回疑似 MicroPython 设备的串口列表（基于常见 USB-Serial 芯片 VID）。"""
-        mp_vids = {0x10C4, 0x1A86, 0x0403, 0x2E8A, 0x303A, 0x16D0}  # CP210x, CH340, FTDI, RP2040, ESP32-S3, MCP2221
-        candidates = set()
-        for p in serial.tools.list_ports.comports():
-            if p.vid in mp_vids:
-                candidates.add(p.device)
-            desc = (p.description or "").lower()
-            if any(k in desc for k in ("cp210", "ch340", "ft232", "usb serial",
-                                       "uart", "micropython")):
-                candidates.add(p.device)
-        return [{"device": d} for d in sorted(candidates)]
-
-    # ── 连接管理 ────────────────────────────────────────────────────────────
 
     def connect(self, port=None, baudrate=None):
         """打开串口连接到设备。
@@ -133,20 +113,18 @@ class MicroPython:
         """是否已连接。"""
         return self.ser is not None and self.ser.is_open
 
-    # ── 原始 REPL ───────────────────────────────────────────────────────────
-
     def _enter_raw_repl(self):
         """切换到原始 REPL 模式（Ctrl+A）。"""
         if self._in_raw:
             return
 
         # 先发 Ctrl+C 中断可能正在运行的程序
-        self._write(b"\x03")
+        self._write(SET_RESET)
         time.sleep(0.15)
-        self.ser.reset_input_buffer()
+        self.ser.reset_input_buffer() # type: ignore
 
         # Ctrl+A 进入原始 REPL
-        self._write(b"\x01")
+        self._write(ENTER_RAW_REPL)
         data = self._read_until(b">", timeout=2)
 
         if b">" not in data:
@@ -159,9 +137,9 @@ class MicroPython:
         if not self._in_raw:
             return
         try:
-            self._write(b"\x02")
+            self._write(EXIT_RAW_REPL)
             time.sleep(0.1)
-            self.ser.reset_input_buffer()
+            self.ser.reset_input_buffer() # type: ignore
         except Exception:
             pass
         finally:
@@ -171,25 +149,196 @@ class MicroPython:
         """写入数据到串口。"""
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self.ser.write(data)
+        self.ser.write(data) # type: ignore
 
     def _read_until(self, terminator=b"\x04", timeout=None):
-        """从串口读取直到遇到终止符。
-
-        Returns:
-            包含终止符在内的全部读取数据
-        """
         timeout = timeout or self.timeout
         buf = b""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.ser.in_waiting:
-                chunk = self.ser.read(self.ser.in_waiting)
+            if self.ser.in_waiting: # type: ignore
+                chunk = self.ser.read(self.ser.in_waiting) # type: ignore
                 buf += chunk
-                if terminator in buf:
+                idx = buf.find(terminator)
+                if idx >= 0:
+                    buf = buf[:idx + len(terminator)]
                     break
             time.sleep(0.02)
         return buf
+
+    def repl_(self):
+        """交互式 REPL：实时显示设备输出，非阻塞键盘输入。"""
+        import sys
+        import re as _re
+
+        # 跨平台非阻塞键盘输入
+        try:
+            import msvcrt
+            _WIN = True
+        except ImportError:
+            import select
+            import termios
+            import tty
+            _WIN = False
+
+        if _WIN:
+            def _kbhit():
+                return msvcrt.kbhit()
+            def _getch():
+                return msvcrt.getch()
+        else:
+            fd = sys.stdin.fileno()
+            def _kbhit():
+                return select.select([fd], [], [], 0) == ([fd], [], [])
+            def _getch():
+                return os.read(fd, 1)
+
+        # ANSI 转义序列
+        RST = "\033[0m"
+        RED = "\033[31m"
+        BG = "\033[48;5;237m"       # 深灰背景 (256色)
+        BG_ON = "\033[0;48;5;237m"  # 全复位 + 深灰背景
+
+        self._write(SET_RESET)
+        time.sleep(0.1)
+        self.ser.reset_input_buffer() # type: ignore
+
+        try:
+            self._enter_raw_repl()
+        except RuntimeError as e:
+            print(f"REPL 初始化失败: {e}")
+            return
+
+        self.close_monitor = False
+        input_buffer = ""
+        _in_error = False
+
+        print("=== MicroPython REPL ===")
+        print("Ctrl+D 退出 | Ctrl+C 中断")
+        print()
+
+        old_tty = None
+        if not _WIN:
+            fd = sys.stdin.fileno()
+            old_tty = termios.tcgetattr(fd)
+            mode = termios.tcgetattr(fd)
+            mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+            mode[tty.CC][termios.VMIN] = 1
+            mode[tty.CC][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
+
+        try:
+            while not self.close_monitor and self.is_connected:
+                # ── 读取并显示设备输出 ──
+                try:
+                    got_serial = False
+                    while self.ser.in_waiting:
+                        got_serial = True
+                        chunk = self.ser.read(self.ser.in_waiting)
+                        text = chunk.decode("utf-8", errors="replace")
+                        for c in ("\x01", "\x02", "\x04"):
+                            text = text.replace(c, "")
+                        text = text.replace("OK", "")
+
+                        if not text:
+                            continue
+
+                        # 错误高亮逻辑
+                        if _in_error:
+                            m = _re.search(r"(?:Error|Exception):[^\r\n]*", text)
+                            if m:
+                                # 红色覆盖到错误行末尾，之后恢复正常
+                                colored = text[: m.end()]
+                                rest = text[m.end() :]
+                                sys.stdout.write(RED + colored + RST + rest)
+                                _in_error = False
+                            else:
+                                sys.stdout.write(RED + text + RST)
+                        elif "Traceback" in text:
+                            idx = text.index("Traceback")
+                            sys.stdout.write(text[:idx])
+                            after = text[idx:]
+                            m = _re.search(r"(?:Error|Exception):[^\r\n]*", after)
+                            if m:
+                                colored = after[: m.end()]
+                                rest = after[m.end() :]
+                                sys.stdout.write(RED + colored + RST + rest)
+                            else:
+                                sys.stdout.write(RED + after)
+                                _in_error = True
+                        else:
+                            sys.stdout.write(text)
+                        sys.stdout.flush()
+
+                    if got_serial and input_buffer:
+                        sys.stdout.write("\r" + BG + input_buffer)
+                        sys.stdout.flush()
+                except Exception:
+                    break
+
+                # ── 非阻塞键盘输入 ──
+                if _kbhit():
+                    ch = _getch()
+
+                    if ch == b"\r":  # Enter - 发送命令执行
+                        sys.stdout.write(RST)
+                        print()
+                        if input_buffer:
+                            self._write(input_buffer.encode() + SET_EXECUTE)
+                        input_buffer = ""
+
+                    elif ch == b"\x03":  # Ctrl+C - 中断
+                        self._write(SET_RESET)
+                        input_buffer = ""
+                        sys.stdout.write(RST)
+                        print("^C")
+                        sys.stdout.flush()
+
+                    elif ch == b"\x04":  # Ctrl+D - 退出 REPL
+                        self.close_monitor = True
+                        sys.stdout.write(RST)
+                        print("^D")
+                        break
+
+                    elif ch in (b"\x08", b"\x7f"):  # 退格
+                        if input_buffer:
+                            input_buffer = input_buffer[:-1]
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+
+                    elif ch == b"\xe0":  # 方向键/功能键前缀 (Windows)
+                        _getch()  # 消费第二个字节
+
+                    elif ch == b"\x1b":  # ESC / 方向键前缀 (Unix)
+                        for _ in range(3):
+                            if _kbhit():
+                                _getch()
+                            else:
+                                break
+
+                    else:  # 可打印字符
+                        try:
+                            c = ch.decode("utf-8")
+                            if c.isprintable() or c == "\t":
+                                input_buffer += c
+                                sys.stdout.write(BG_ON + c)
+                                sys.stdout.flush()
+                        except UnicodeDecodeError:
+                            pass
+
+                time.sleep(0.01)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.close_monitor = True
+            sys.stdout.write(RST)
+            print()
+            if old_tty is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
+                except Exception:
+                    pass
 
     def _execute(self, code, timeout=10):
         """在原始 REPL 中执行 Python 代码并返回设备输出。
@@ -208,19 +357,17 @@ class MicroPython:
             code = code.encode("utf-8")
 
         self._write(code)
-        self._write(b"\x04")  # Ctrl+D 执行
+        self._write(SET_EXECUTE)  # Ctrl+D 执行
 
-        resp = self._read_until(b"\x04", timeout=timeout)
+        resp = self._read_until(SET_EXECUTE, timeout=timeout)
         # 去掉尾部的 \x04
-        resp = resp.rstrip(b"\x04")
+        resp = resp.rstrip(SET_EXECUTE)
         text = resp.decode("utf-8", errors="replace").strip()
 
         if "Traceback" in text:
             raise RuntimeError(f"设备执行错误:\n{text}")
 
         return text
-
-    # ── kbd_intr 保护 ───────────────────────────────────────────────────────
 
     def _setup_kbd_intr(self):
         """设置 kbd_intr(-1)，禁用 Ctrl+C 中断（防止数据中 0x03 重启设备）。"""
@@ -238,8 +385,6 @@ class MicroPython:
             pass
         finally:
             self._kbd_set = False
-
-    # ── 文件刷入 ────────────────────────────────────────────────────────────
 
     def _write_raw_chunk(self, data):
         """通过系统标准输入的缓冲区直接将原始字节写入设备已打开的文件。
@@ -313,6 +458,8 @@ class MicroPython:
                 pass
             raise
 
+
+
     def flash_program(self, local_dir, remote_prefix=""):
         """刷入整个目录树到设备。
 
@@ -371,8 +518,6 @@ class MicroPython:
 
         return results
 
-    # ── 工具方法 ────────────────────────────────────────────────────────────
-
     def run(self, code):
         """在设备上执行任意 Python 代码并返回输出。"""
         if not self._in_raw:
@@ -394,9 +539,6 @@ class MicroPython:
 
     def __exit__(self, *args):
         self.disconnect()
-
-
-# ── 辅助函数 ────────────────────────────────────────────────────────────────
 
 def create_default_config():
     """在工作目录创建默认配置文件。"""

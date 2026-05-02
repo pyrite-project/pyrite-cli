@@ -1,7 +1,7 @@
 import typer
 from typing import Optional
 from .utils.Flash import MicroPython, create_default_config
-from .project.project import init_project, init_stubs
+from .project.project import init_project, init_stubs, new_project_interactive
 
 app = typer.Typer(
     name="pyrite-cli",
@@ -130,7 +130,7 @@ def new(
     project_name: str = typer.Argument(..., help = "创建项目名称")
 ):
     '''创建新MicroPython项目'''
-    init_project(project_name)
+    new_project_interactive(project_name)
 
 @app.command()
 def init(

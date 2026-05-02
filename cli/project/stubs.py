@@ -2,6 +2,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 try:
     from tqdm import tqdm
@@ -11,6 +12,24 @@ except ImportError:
 API_BASE = "https://api.github.com/repos/josverl/micropython-stubs"
 VSCODE_DIR = ".vscode"
 VSCODE_SETTINGS = "settings.json"
+
+_DEFAULT_THREADS = 4
+_MAX_THREADS = 12
+
+
+def _get_download_threads() -> int:
+    """Read validated download_threads from .pyrite_config.json."""
+    cfg_file = Path(".pyrite_config.json")
+    if not cfg_file.exists():
+        return _DEFAULT_THREADS
+    try:
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        t = data.get("download_threads", _DEFAULT_THREADS)
+        if not isinstance(t, int) or t <= 0:
+            return _DEFAULT_THREADS
+        return min(t, _MAX_THREADS)
+    except (json.JSONDecodeError, OSError):
+        return _DEFAULT_THREADS
 
 
 def version_to_dir(v: str) -> str:
@@ -135,8 +154,24 @@ def list_all_hardware(dirs: list[str]) -> None:
         print(f"  {hw}")
 
 
-def download_stubs(stub_dir: str, output_dir: str) -> tuple[int, Path]:
-    """下载指定存根目录中的所有 .pyi 文件。"""
+def download_stubs(stub_dir: str, output_dir: str,
+                   max_workers: int | None = None) -> tuple[int, Path]:
+    """下载指定存根目录中的所有 .pyi 文件（多线程）。
+
+    使用 ThreadPoolExecutor 并发下载，线程数受配置或参数控制。
+    HTTP 请求为 I/O 密集型操作，会在 C 层面释放 GIL，线程开销可控。
+
+    Args:
+        stub_dir: 存根目录名
+        output_dir: 本地输出目录
+        max_workers: 下载线程数，None 时从 .pyrite_config.json 读取
+
+    Returns:
+        (成功下载数, 输出路径)
+    """
+    if max_workers is None:
+        max_workers = _get_download_threads()
+
     url = f"{API_BASE}/contents/stubs/{stub_dir}"
     resp = _request_with_retry(url)
     items = resp.json()
@@ -144,23 +179,52 @@ def download_stubs(stub_dir: str, output_dir: str) -> tuple[int, Path]:
     out_path = Path(output_dir) / stub_dir
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # 筛选出 .pyi 文件
     pyi_files = [
         item for item in items
         if item["type"] == "file" and item["name"].endswith(".pyi")
     ]
 
-    downloaded = 0
-    file_iter = tqdm(pyi_files, desc="下载中", unit="file") if tqdm else pyi_files
+    if not pyi_files:
+        return 0, out_path
 
-    for item in file_iter:
+    def _download_one(item: dict) -> str:
+        """下载单个 .pyi 文件，返回文件名。"""
         file_resp = _request_with_retry(item["download_url"])
         (out_path / item["name"]).write_text(file_resp.text, encoding="utf-8")
-        downloaded += 1
-        if not tqdm:
-            print(f"  [{downloaded}/{len(pyi_files)}] {item['name']}")
+        return item["name"]
+
+    downloaded = 0
+    failed = 0
+    total = len(pyi_files)
+
+    bar: tqdm | None = None
+    if tqdm:
+        bar = tqdm(total=total, desc="下载中", unit="file")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_download_one, item): item for item in pyi_files}
+        for future in as_completed(futures):
+            try:
+                future.result()
+                downloaded += 1
+            except Exception as e:
+                failed += 1
+                print(f"\n  ✗ {futures[future]['name']}: {e}")
+            if bar:
+                bar.update(1)
+
+    if bar:
+        bar.close()
+
+    if not tqdm:
+        # 无 tqdm 时简单输出结果
+        total_str = f"{downloaded}/{total}"
+        if failed:
+            total_str += f" ({failed} 失败)"
+        print(f"  下载完成: {total_str}")
 
     return downloaded, out_path
+
 
 def create_vscode_config(stub_path: Path, hardware: str, version: str) -> Path:
     """创建 .vscode/settings.json，配置 Pylance 指向下载的存根。"""

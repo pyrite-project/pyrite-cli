@@ -20,7 +20,10 @@ SET_EXECUTE = b'\x04'
 
 def _load_config():
     """从当前或上级目录加载配置文件，未找到则使用默认值。"""
-    cfg = {"chunk_size": DEFAULT_CHUNK_SIZE}
+    cfg = {
+        "chunk_size": DEFAULT_CHUNK_SIZE,
+        "download_threads": 4,
+    }
     cwd = Path.cwd()
     for parent in [cwd] + list(cwd.parents):
         p = parent / CONFIG_FILE
@@ -29,6 +32,9 @@ def _load_config():
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data.get("chunk_size"), int) and data["chunk_size"] > 0:
                     cfg["chunk_size"] = data["chunk_size"]
+                t = data.get("download_threads", 4)
+                if isinstance(t, int) and t > 0:
+                    cfg["download_threads"] = min(t, 12)
             except (json.JSONDecodeError, OSError):
                 pass
             break
@@ -590,9 +596,13 @@ def create_default_config():
     """在工作目录创建默认配置文件。"""
     cfg_path = Path.cwd() / CONFIG_FILE
     cfg_path.write_text(
-        json.dumps({"chunk_size": DEFAULT_CHUNK_SIZE}, indent=2),
+        json.dumps({
+            "chunk_size": DEFAULT_CHUNK_SIZE,
+            "download_threads": 4,
+        }, indent=2),
         encoding="utf-8",
     )
     print(f"默认配置文件已创建: {cfg_path}")
     print(f"  chunk_size = {DEFAULT_CHUNK_SIZE} 字节（修改后需重启本工具）")
+    print("  download_threads = 4（存根下载线程数，范围 1~12）")
     return cfg_path

@@ -57,10 +57,18 @@ class MicroPython:
         self._kbd_set = False    # 是否已设置 kbd_intr(-1)
 
     @staticmethod
-    def scan_ports():
-        """扫描所有可用串口，返回设备信息列表。"""
+    def scan_ports(vid=None, pid=None, keyword=None, require_vid=True):
+        """扫描可用串口，可按 VID/PID/描述关键字过滤。默认过滤掉无 VID 的设备。"""
         ports = []
         for p in serial.tools.list_ports.comports():
+            if require_vid and p.vid is None:
+                continue
+            if vid is not None and p.vid != vid:
+                continue
+            if pid is not None and p.pid != pid:
+                continue
+            if keyword and keyword.lower() not in (p.description or "").lower():
+                continue
             ports.append({
                 "device": p.device,
                 "description": p.description,

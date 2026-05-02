@@ -10,9 +10,14 @@ app = typer.Typer(
 
 
 @app.command()
-def scan():
+def scan(
+    vid: Optional[int] = typer.Option(None, "--vid", help="按 VID 过滤（十进制）"),
+    pid: Optional[int] = typer.Option(None, "--pid", help="按 PID 过滤（十进制）"),
+    keyword: Optional[str] = typer.Option(None, "--keyword", "-k", help="按描述关键字过滤"),
+    all: bool = typer.Option(False, "--all", "-a", help="显示所有设备（包括无 VID/PID 的）"),
+):
     """扫描所有可用串口设备"""
-    ports = MicroPython.scan_ports()
+    ports = MicroPython.scan_ports(vid=vid, pid=pid, keyword=keyword, require_vid=not all)
     if not ports:
         print("未检测到串口设备。")
         raise typer.Exit()

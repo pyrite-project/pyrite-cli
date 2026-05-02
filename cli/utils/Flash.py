@@ -49,7 +49,6 @@ class MicroPython:
         self.ser = None          # pySerial 对象
         self._in_raw = False     # 是否处于原始 REPL 模式
         self._kbd_set = False    # 是否已设置 kbd_intr(-1)
-        self.close_monitor = False
 
     @staticmethod
     def scan_ports():
@@ -167,7 +166,6 @@ class MicroPython:
         return buf
 
     def repl_(self):
-        """交互式 REPL：实时显示设备输出，非阻塞键盘输入。"""
         import sys
         import re as _re
 
@@ -196,8 +194,6 @@ class MicroPython:
         # ANSI 转义序列
         RST = "\033[0m"
         RED = "\033[31m"
-        BG = "\033[48;5;237m"       # 深灰背景 (256色)
-        BG_ON = "\033[0;48;5;237m"  # 全复位 + 深灰背景
 
         self._write(SET_RESET)
         time.sleep(0.1)
@@ -208,9 +204,14 @@ class MicroPython:
         except RuntimeError as e:
             print(f"REPL 初始化失败: {e}")
             return
+        sys.stdout.write("> ")
+        sys.stdout.flush()
 
         self.close_monitor = False
         input_buffer = ""
+        history = []
+        history_pos = -1
+        saved_input = ""
         _in_error = False
 
         print("=== MicroPython REPL ===")
@@ -271,7 +272,7 @@ class MicroPython:
                         sys.stdout.flush()
 
                     if got_serial and input_buffer:
-                        sys.stdout.write("\r" + BG + input_buffer)
+                        sys.stdout.write("\r\033[K> " + input_buffer)
                         sys.stdout.flush()
                 except Exception:
                     break
@@ -285,11 +286,17 @@ class MicroPython:
                         print()
                         if input_buffer:
                             self._write(input_buffer.encode() + SET_EXECUTE)
+                            if not history or history[-1] != input_buffer:
+                                history.append(input_buffer)
                         input_buffer = ""
+                        history_pos = -1
+                        saved_input = ""
 
                     elif ch == b"\x03":  # Ctrl+C - 中断
                         self._write(SET_RESET)
                         input_buffer = ""
+                        history_pos = -1
+                        saved_input = ""
                         sys.stdout.write(RST)
                         print("^C")
                         sys.stdout.flush()
@@ -306,22 +313,61 @@ class MicroPython:
                             sys.stdout.write("\b \b")
                             sys.stdout.flush()
 
-                    elif ch == b"\xe0":  # 方向键/功能键前缀 (Windows)
-                        _getch()  # 消费第二个字节
-
-                    elif ch == b"\x1b":  # ESC / 方向键前缀 (Unix)
-                        for _ in range(3):
-                            if _kbhit():
-                                _getch()
+                    elif ch == b"\xe0":  # 方向键 (Windows)
+                        ch2 = _getch()
+                        if ch2 == b"H" and history:  # Up
+                            if history_pos == -1:
+                                saved_input = input_buffer
+                            if history_pos == -1:
+                                history_pos = len(history) - 1
+                            elif history_pos > 0:
+                                history_pos -= 1
+                            sys.stdout.write("\r\033[K> ")
+                            input_buffer = history[history_pos]
+                            sys.stdout.write(input_buffer)
+                            sys.stdout.flush()
+                        elif ch2 == b"P" and history_pos >= 0:  # Down
+                            sys.stdout.write("\r\033[K> ")
+                            if history_pos < len(history) - 1:
+                                history_pos += 1
+                                input_buffer = history[history_pos]
                             else:
-                                break
+                                history_pos = -1
+                                input_buffer = saved_input
+                            sys.stdout.write(input_buffer)
+                            sys.stdout.flush()
+
+                    elif ch == b"\x1b":  # 方向键 (Unix)
+                        if _kbhit() and _getch() == b"[" and _kbhit():
+                            ch3 = _getch()
+                            if ch3 == b"A" and history:  # Up
+                                if history_pos == -1:
+                                    saved_input = input_buffer
+                                if history_pos == -1:
+                                    history_pos = len(history) - 1
+                                elif history_pos > 0:
+                                    history_pos -= 1
+                                sys.stdout.write("\r\033[K> ")
+                                input_buffer = history[history_pos]
+                                sys.stdout.write(input_buffer)
+                                sys.stdout.flush()
+                            elif ch3 == b"B" and history_pos >= 0:  # Down
+                                sys.stdout.write("\r\033[K> ")
+                                if history_pos < len(history) - 1:
+                                    history_pos += 1
+                                    input_buffer = history[history_pos]
+                                else:
+                                    history_pos = -1
+                                    input_buffer = saved_input
+                                sys.stdout.write(input_buffer)
+                                sys.stdout.flush()
 
                     else:  # 可打印字符
                         try:
                             c = ch.decode("utf-8")
                             if c.isprintable() or c == "\t":
                                 input_buffer += c
-                                sys.stdout.write(BG_ON + c)
+                                sys.stdout.write(c)
                                 sys.stdout.flush()
                         except UnicodeDecodeError:
                             pass

@@ -1,6 +1,7 @@
 import typer
 from typing import Optional
 from .utils.Flash import MicroPython, create_default_config
+from .project.project import init_project, init_stubs
 
 app = typer.Typer(
     name="pyrite-cli",
@@ -124,6 +125,22 @@ def reset(
     finally:
         mp.disconnect()
 
+@app.command()
+def new(
+    project_name: str = typer.Argument(..., help = "创建项目名称")
+):
+    '''创建新MicroPython项目'''
+    init_project(project_name)
+
+@app.command()
+def init(
+    hardware: str = typer.Argument(..., help = "使用的MicroPython名称"),
+    version: str = typer.Argument(..., help = "硬件所使用MicroPython固件版本，形式同'1.20.0'"),
+    variant: Optional[str] = typer.Option(None, "--variant", "-V",
+                                          help = "具体硬件变体，如 ESP32_GENERIC、PICO_W")
+):
+    """在已创建项目中初始化MicroPython环境"""
+    init_stubs(hardware, version, variant)
 
 @app.command()
 def config():

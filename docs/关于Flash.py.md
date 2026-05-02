@@ -1,8 +1,8 @@
 # `Flash.py` — MicroPython 设备刷入工具
 
-通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录。
----
+通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录，并提供交互式 REPL 终端。
 
+---
 
 ## 配置文件 `.pyrite_config.json`
 
@@ -45,7 +45,7 @@
 
 ## `class MicroPython`
 
-MicroPython 设备操作类。封装了串口扫描、连接、原始 REPL 通信、kbd_intr 保护、文件刷入等全部功能。
+MicroPython 设备操作类。封装了串口扫描、连接、原始 REPL 通信、kbd_intr 保护、文件刷入、REPL 交互终端等全部功能。
 
 ### 构造方法
 
@@ -61,6 +61,15 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 
 构造时自动加载配置（`_load_config`）。
 
+**实例属性**：
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `ser` | `Serial` 或 `None` | pySerial 串口对象 |
+| `_in_raw` | `bool` | 是否处于原始 REPL 模式 |
+| `_kbd_set` | `bool` | 是否已设置 `kbd_intr(-1)` |
+| `close_monitor` | `bool` | REPL 循环退出标志 |
+
 ---
 
 ### 静态方法：串口扫描
@@ -70,15 +79,6 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 扫描系统全部串口设备。
 
 - 返回: `list[dict]`，每个元素包含 `device`、`description`、`hwid`、`vid`、`pid`、`serial_number`
-
-#### `MicroPython.scan_micropython_ports()`
-
-从全部串口中筛选疑似 MicroPython 设备的列表。筛选依据：
-
-- **VID 匹配**：CP210x (0x10C4)、CH340 (0x1A86)、FTDI (0x0403)、RP2040 (0x2E8A)、ESP32-S3 (0x303A)、MCP2221 (0x16D0)
-- **描述关键词**：`cp210`、`ch340`、`ft232`、`usb serial`、`uart`、`micropython`
-
-- 返回: `list[dict]`，每个元素包含 `device`
 
 ---
 
@@ -291,6 +291,59 @@ mp.run("import machine; print(machine.freq())")
 
 ---
 
+### 交互式 REPL
+
+#### `repl_()`
+
+连接到 MicroPython 设备的交互式终端。将串口输出实时显示到终端，同时支持非阻塞键盘输入命令。
+
+**设计特点**：单循环架构，不依赖独立读线程/写线程，无 `input()` 调用。
+
+**跨平台键盘输入**：
+
+| 平台 | 非阻塞检测 | 读键 |
+|------|-----------|------|
+| Windows | `msvcrt.kbhit()` | `msvcrt.getch()` |
+| macOS/Linux | `select.select()` | `os.read(fd, 1)` |
+
+- Unix 下临时切换终端为 cbreak 模式（关闭 `ECHO`/`ICANON`/`ISIG`），退出时自动恢复
+
+**ANSI 高亮**：
+
+| 场景 | 效果 |
+|------|------|
+| Traceback 到错误行 | 红色字（`\033[31m`），覆盖完整错误行（`NameError: message`） |
+| 输入行区域 | 深灰背景（`\033[48;5;237m`），255 色模式 |
+| Traceback + 错误行在同一串口包 | 精准截断，仅错误区域红色 |
+| Traceback 和错误行跨多包 | 状态持续，错误行到来后自动关闭红色 |
+
+**串口输出净化**：
+
+- 过滤原始 REPL 控制字符：`\x01`（Ctrl+A）、`\x02`（Ctrl+B）、`\x04`（Ctrl+D）
+- `replace("OK", "")` 删除 MicroPython 自带执行状态 `OK`
+
+**快捷键**：
+
+| 按键 | 行为 |
+|------|------|
+| `Enter` | 发送输入缓存的代码 + `Ctrl+D` 到原始 REPL 执行 |
+| `Ctrl+C` | 向设备发送 `\x03` 中断，清空输入缓存 |
+| `Ctrl+D` | 退出 REPL 会话 |
+| `Backspace` | 删除输入缓存末尾字符 |
+| 方向键 | 静默消费（Windows `\xe0` 前缀 / Unix `\x1b` 转义序列） |
+
+**循环逻辑**：
+
+```
+while 已连接:
+    读取串口数据 → 净化 → 错误高亮 → 输出到终端
+    如有输入缓存 → 重绘输入行（深灰背景）
+    非阻塞检测键盘 → 有按键则处理（Enter/Ctrl+C/字符等）
+    sleep(0.01)
+```
+
+---
+
 ### 上下文管理器
 
 ```python
@@ -327,7 +380,6 @@ with MicroPython(port="COM3") as mp:
                                     │ 等待设备 \x04 确认         │
                                     └────────────────────────────┘
 ```
-
 ---
 
 ## 常见问题
@@ -345,7 +397,7 @@ with MicroPython(port="COM3") as mp:
 **Q: 如何知道串口号？**
 
 ```bash
-python utils/Flash.py --scan
+pyrcli scan
 ```
 
 **Q: 支持哪些 MicroPython 设备？**

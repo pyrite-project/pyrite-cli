@@ -227,6 +227,7 @@ class MicroPython:
         history_pos = -1
         saved_input = ""
         _in_error = False
+        _expect_ok = False       # 是否期待下一条响应的首个OK
 
         print("=== MicroPython REPL ===")
         print("Ctrl+D 退出 | Ctrl+C 中断")
@@ -253,8 +254,9 @@ class MicroPython:
                         text = chunk.decode("utf-8", errors="replace")
                         for c in ("\x01", "\x02", "\x04"):
                             text = text.replace(c, "")
-                        if text.startswith("OK"):
+                        if text.startswith("OK") and _expect_ok:
                             text = text[2:].lstrip("\r\n")
+                            _expect_ok = False
 
                         if not text:
                             continue
@@ -301,6 +303,7 @@ class MicroPython:
                         print()
                         if input_buffer:
                             self._write(input_buffer.encode() + SET_EXECUTE)
+                            _expect_ok = True
                             if not history or history[-1] != input_buffer:
                                 history.append(input_buffer)
                         input_buffer = ""

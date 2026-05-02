@@ -9,7 +9,7 @@ try:
 except ImportError:
     tqdm = None  # tqdm 不可用时使用简单回退方案
 
-API_BASE = "https://api.github.com/repos/josverl/micropython-stubs"
+SOURCE = "https://api.github.com/repos/josverl/micropython-stubs"
 VSCODE_DIR = ".vscode"
 VSCODE_SETTINGS = "settings.json"
 
@@ -85,7 +85,7 @@ def _request_with_retry(url: str, max_retries: int = 3, **kwargs) -> requests.Re
 
 def list_stub_dirs() -> list[str]:
     """从仓库列出所有存根目录。"""
-    url = f"{API_BASE}/contents/stubs"
+    url = f"{SOURCE}/contents/stubs"
     resp = _request_with_retry(url)
     return [item["name"] for item in resp.json() if item["type"] == "dir"]
 
@@ -172,7 +172,7 @@ def download_stubs(stub_dir: str, output_dir: str,
     if max_workers is None:
         max_workers = _get_download_threads()
 
-    url = f"{API_BASE}/contents/stubs/{stub_dir}"
+    url = f"{SOURCE}/contents/stubs/{stub_dir}"
     resp = _request_with_retry(url)
     items = resp.json()
 

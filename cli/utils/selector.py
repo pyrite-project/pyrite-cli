@@ -1,5 +1,3 @@
-"""Cross-platform interactive terminal selector using keyboard navigation."""
-
 import sys
 import platform
 import unicodedata
@@ -38,9 +36,9 @@ def _get_key() -> str | None:
     import termios
 
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    old = termios.tcgetattr(fd) # type: ignore
     try:
-        tty.setraw(fd)
+        tty.setraw(fd) # type: ignore
         ch = sys.stdin.read(1)
         if ch == '\x1b':
             seq = sys.stdin.read(2)
@@ -54,7 +52,7 @@ def _get_key() -> str | None:
         if ch == '\x03':
             raise KeyboardInterrupt
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old) # type: ignore
     return None
 
 

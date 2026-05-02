@@ -253,7 +253,8 @@ class MicroPython:
                         text = chunk.decode("utf-8", errors="replace")
                         for c in ("\x01", "\x02", "\x04"):
                             text = text.replace(c, "")
-                        text = text.replace("OK", "")
+                        if text.startswith("OK"):
+                            text = text[2:].lstrip("\r\n")
 
                         if not text:
                             continue
@@ -422,7 +423,10 @@ class MicroPython:
         resp = self._read_until(SET_EXECUTE, timeout=timeout)
         # 去掉尾部的 \x04
         resp = resp.rstrip(SET_EXECUTE)
-        text = resp.decode("utf-8", errors="replace").strip()
+        text = resp.decode("utf-8", errors="replace")
+        if text.startswith("OK"):
+            text = text[2:]
+        text = text.strip()
 
         if "Traceback" in text:
             raise RuntimeError(f"设备执行错误:\n{text}")

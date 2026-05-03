@@ -13,8 +13,14 @@ from pathlib import Path
 import serial
 import serial.tools.list_ports
 
+# ANSI 颜色
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_RESET = "\033[0m"
+
 try:
-    import tomllib
+    import tomllib # type: ignore
 except ImportError:
     import tomli as tomllib  # type: ignore
 
@@ -33,6 +39,27 @@ ENTER_RAW_REPL = b'\x01'
 EXIT_RAW_REPL = b'\x02'
 SET_RESET = b'\x03'
 SET_EXECUTE = b'\x04'
+ENTER_RAW_PASTE = b'\x05'
+
+FLASH = """import sys,micropython
+
+micropython.kbd_intr(-1)
+usb = sys.stdin.buffer
+
+print('tg_file_name')
+buf = b''
+with open(FILE, 'wb') as f:
+    while True:
+        ln = usb.read(BFSIZE)
+        if ln:
+            f.flush()
+            if (buf + ln).endswith(b'[fuck!]\\n') or ln.endswith(b'[fuck!]\\n'):
+                f.write(ln[:-8])
+                break
+            f.write(ln)
+            buf = ln
+micropython.kbd_intr(3)
+"""
 
 def _load_config():
     """从当前或上级目录加载配置文件，未找到则使用默认值。"""
@@ -71,7 +98,7 @@ def _load_config():
     return cfg
 
 
-def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None):
+def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None): # type: ignore
     """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
     tmp_dir = tempfile.mkdtemp()
     out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
@@ -86,12 +113,12 @@ def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None)
         r.wait(timeout=30)
         if r.returncode == 0:
             return out_path, tmp_dir
-        print(f"  [警告] mpy-cross 编译失败，回退到 .py\n"
-              f"         {r.stderr.read().decode(errors='replace').strip()}")
+        print(f"  {_YELLOW}[警告]{_RESET} mpy-cross 编译失败，回退到 .py\n"
+              f"         {r.stderr.read().decode(errors='replace').strip()}") # type: ignore
     except ImportError:
-        print("  [提示] 未找到 mpy-cross，跳过编译")
+        print(f"  {_YELLOW}[提示]{_RESET} 未找到 mpy-cross，跳过编译")
     except Exception as e:
-        print(f"  [警告] 编译异常: {e}，回退到 .py")
+        print(f"  {_YELLOW}[警告]{_RESET} 编译异常: {e}，回退到 .py")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return None, None
 
@@ -560,8 +587,16 @@ class MicroPython:
             )
             actual_local = pp_path
 
+        # .pyi、main.py、boot.py 不编译；manifest.py 不上传到设备
+        remote_basename = Path(actual_remote).name
+        if remote_basename == "manifest.py":
+            print(f"  {_YELLOW}[WARN]{_RESET} '{remote_basename}' 是编译所需文件，已跳过刷入")
+            return
+        if remote_basename in ("main.py", "boot.py"):
+            should_compile = False
+
         if should_compile and actual_local.endswith(".py"):
-            mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch)
+            mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch) # type: ignore
             if mpy_path:
                 tmp_dirs.append(tmp_dir)
                 actual_local = mpy_path
@@ -570,34 +605,27 @@ class MicroPython:
         file_size = os.path.getsize(actual_local)
         chunk_size = self.config["chunk_size"]
 
-        if not self._in_raw:
-            self._enter_raw_repl()
-        if not self._kbd_set:
-            self._setup_kbd_intr()
-
-        print(f"  刷入: {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
+        print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
 
         try:
-            self._execute(f"f=open({repr(actual_remote)},'wb')")
+            # 连发两次 Ctrl+C 中断正在运行的程序
+            for _ in range(2):
+                self._write(SET_RESET)
+                time.sleep(0.1)
+            self.ser.reset_input_buffer() # type: ignore
 
-            with open(actual_local, "rb") as lf:
+            self._write(ENTER_RAW_REPL)
+            self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE",str(DEFAULT_CHUNK_SIZE)))
+            self._write(SET_EXECUTE)
+
+            with open(local_path, 'rb') as f:
                 while True:
-                    chunk = lf.read(chunk_size)
-                    if not chunk:
+                    buf = f.read(DEFAULT_CHUNK_SIZE)
+                    self._write(buf)
+                    if len(buf) <= DEFAULT_CHUNK_SIZE:
                         break
-                    self._write_raw_chunk(chunk)
 
-            self._execute("f.close()\ndel f")
-            print(f"  ✓ {actual_remote}")
-
-            # main.mpy 不会被自动执行，重命名为 _main.mpy 并写 stub main.py
-            if actual_remote == "main.mpy":
-                self._execute("import os; os.rename('main.mpy', '_main.mpy')")
-                stub = "import _main\n"
-                self._execute(f"f=open('main.py','w')\nf.write({repr(stub)})\nf.close()")
-                print("  ✓ main.py (stub) + _main.mpy")
-
-            return True
+            print(f"  {_GREEN}✓ 刷入成功{_RESET}")
 
         except Exception:
             try:
@@ -608,8 +636,6 @@ class MicroPython:
         finally:
             for d in tmp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
-
-
 
     def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None):
         if not os.path.isdir(local_dir):
@@ -655,10 +681,12 @@ class MicroPython:
         results = []
         for lp, rp in entries:
             try:
+                if lp.endswith(".pyi"):
+                    continue
                 self.flash_file(lp, rp, bytecode_ver=bytecode_ver, arch=arch, active_tags=active_tags)
                 results.append((lp, rp, True))
             except Exception as e:
-                print(f"  ✗ {rp}: {e}")
+                print(f"  {_RED}✗ {rp}: {e}{_RESET}")
                 results.append((lp, rp, False))
 
         return results

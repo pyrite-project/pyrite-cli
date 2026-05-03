@@ -64,8 +64,7 @@ def scan(
 def flash(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     file: str = typer.Argument(..., help="本地文件路径"),
-    remote: Optional[str] = typer.Option(None, "--remote", "-r",
-                                         help="设备上的目标路径（默认使用文件名）"),
+    remote_path: str = typer.Argument(..., help="设备上的目标路径（必填）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -92,7 +91,7 @@ def flash(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver, arch=arch, active_tags=active_tags or None)
+        mp.flash_file(file, remote_path, compile=not no_compile, bytecode_ver=ver, arch=arch, active_tags=active_tags or None)
     finally:
         mp.disconnect()
 
@@ -117,8 +116,7 @@ def repl(
 def flash_program(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     directory: str = typer.Argument(..., help="本地目录路径"),
-    prefix: Optional[str] = typer.Option(None, "--prefix", "-p",
-                                         help="设备上的远程路径前缀"),
+    remote_path: str = typer.Argument(..., help="设备上的远程路径前缀（必填）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -129,7 +127,7 @@ def flash_program(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
 ):
-    """刷入整个目录到设备"""
+    """刷入整个目录到设备（需指定远程路径前缀）"""
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -148,11 +146,16 @@ def flash_program(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver, arch=arch,
+        results = mp.flash_program(directory, remote_path, bytecode_ver=ver, arch=arch,
                                    active_tags=active_tags or None, manifest_path=manifest)
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)
-        print(f"\n完成: {ok} 成功, {fail} 失败")
+        parts = []
+        if ok:
+            parts.append(f"\033[32m{ok} 成功\033[0m")
+        if fail:
+            parts.append(f"\033[31m{fail} 失败\033[0m")
+        print(f"\n完成: {', '.join(parts)}")
     finally:
         mp.disconnect()
 

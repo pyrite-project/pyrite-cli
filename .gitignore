@@ -8,3 +8,4 @@ __pycache__/
 
 test_proj/
 build/
+log/

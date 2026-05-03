@@ -46,18 +46,15 @@ FLASH = """import sys,micropython
 micropython.kbd_intr(-1)
 usb = sys.stdin.buffer
 
-print('tg_file_name')
-buf = b''
-with open(FILE, 'wb') as f:
-    while True:
+f_size = FSIZE
+with open("FILE", 'wb') as f:
+    while f_size:
         ln = usb.read(BFSIZE)
         if ln:
             f.flush()
-            if (buf + ln).endswith(b'[fuck!]\\n') or ln.endswith(b'[fuck!]\\n'):
-                f.write(ln[:-8])
-                break
             f.write(ln)
-            buf = ln
+            f_size -= len(ln)
+            print(f_size)
 micropython.kbd_intr(3)
 """
 
@@ -137,6 +134,7 @@ class MicroPython:
         self.ser = None          # pySerial 对象
         self._in_raw = False     # 是否处于原始 REPL 模式
         self._kbd_set = False    # 是否已设置 kbd_intr(-1)
+        self._repl_log_file = None   # REPL 原始数据日志文件
 
     @staticmethod
     def scan_ports(vid=None, pid=None, keyword=None, require_vid=True):
@@ -249,10 +247,52 @@ class MicroPython:
         finally:
             self._in_raw = False
 
+    # ── REPL 原始日志 ──────────────────────────────────────────────
+    def _open_repl_log(self):
+        """在 ./log/ 下创建 REPL 原始数据日志文件。"""
+        log_dir = Path.cwd() / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"flash_{ts}.log"
+        self._repl_log_file = open(log_path, "w", encoding="utf-8")
+        return log_path
+
+    def _close_repl_log(self):
+        if self._repl_log_file:
+            self._repl_log_file.close()
+            self._repl_log_file = None
+
+    def _drain_rx_log(self):
+        """非阻塞读取串口 RX 缓冲中所有数据并记录到日志。"""
+        if not self.ser or not self.ser.is_open:
+            return
+        while self.ser.in_waiting:
+            chunk = self.ser.read(self.ser.in_waiting)
+            if chunk:
+                self._log_repl_data("rx", chunk)
+
+    def _log_repl_data(self, direction, data):
+        if not self._repl_log_file:
+            return
+        ts = time.strftime("%H:%M:%S")
+        marker = ">>" if direction == "tx" else "<<"
+        text = data.decode("utf-8", errors="replace")
+        for c, name in [
+            ("\x01", "<RAW>"), ("\x02", "<B>"), ("\x03", "<C>"),
+            ("\x04", "<D>"), ("\x05", "<E>"),
+        ]:
+            text = text.replace(c, name)
+        self._repl_log_file.write(f"[{ts}] {marker} {text}\n")
+        stripped = text.replace("\n", "").replace("\r", "").replace("\t", "")
+        if stripped.strip() == "" and data:
+            self._repl_log_file.write(f"[{ts}] {marker} [hex] {data.hex(' ')}\n")
+        self._repl_log_file.flush()
+
     def _write(self, data):
         """写入数据到串口。"""
         if isinstance(data, str):
             data = data.encode("utf-8")
+        self._log_repl_data("tx", data)
         self.ser.write(data) # type: ignore
 
     def _read_until(self, terminator=b"\x04", timeout=None):
@@ -263,6 +303,7 @@ class MicroPython:
             if self.ser.in_waiting: # type: ignore
                 chunk = self.ser.read(self.ser.in_waiting) # type: ignore
                 buf += chunk
+                self._log_repl_data("rx", chunk)
                 idx = buf.find(terminator)
                 if idx >= 0:
                     buf = buf[:idx + len(terminator)]
@@ -607,6 +648,12 @@ class MicroPython:
 
         print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
 
+        should_close_log = False
+        if not self._repl_log_file:
+            log_path = self._open_repl_log()
+            should_close_log = True
+            print(f"  {_GREEN}日志:{_RESET} {log_path}")
+
         try:
             # 连发两次 Ctrl+C 中断正在运行的程序
             for _ in range(2):
@@ -615,15 +662,22 @@ class MicroPython:
             self.ser.reset_input_buffer() # type: ignore
 
             self._write(ENTER_RAW_REPL)
-            self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE",str(DEFAULT_CHUNK_SIZE)))
+            time.sleep(0.1)
+            self._drain_rx_log()
+
+            self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE",str(DEFAULT_CHUNK_SIZE)).replace("FSIZE",str(file_size)))
             self._write(SET_EXECUTE)
+            time.sleep(0.3)
+            self._drain_rx_log()
 
             with open(local_path, 'rb') as f:
                 while True:
                     buf = f.read(DEFAULT_CHUNK_SIZE)
                     self._write(buf)
-                    if len(buf) <= DEFAULT_CHUNK_SIZE:
+                    if len(buf) < DEFAULT_CHUNK_SIZE:
                         break
+
+            self._drain_rx_log()
 
             print(f"  {_GREEN}✓ 刷入成功{_RESET}")
 
@@ -634,6 +688,8 @@ class MicroPython:
                 pass
             raise
         finally:
+            if should_close_log:
+                self._close_repl_log()
             for d in tmp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
 
@@ -661,35 +717,45 @@ class MicroPython:
             print("  没有需要刷入的文件。")
             return []
 
-        # 在设备上创建远程目录结构
-        dirs = sorted({
-            os.path.dirname(rp) for _, rp in entries if os.path.dirname(rp)
-        })
-        for d in dirs:
-            try:
-                self._execute(
-                    "import os\n"
-                    "try:\n"
-                    f" os.mkdir({repr(d)})\n"
-                    "except OSError:\n"
-                    " pass"
-                )
-            except Exception:
-                pass
+        should_close_log = False
+        if not self._repl_log_file:
+            log_path = self._open_repl_log()
+            should_close_log = True
+            print(f"  {_GREEN}日志:{_RESET} {log_path}")
 
-        # 逐个刷入
-        results = []
-        for lp, rp in entries:
-            try:
-                if lp.endswith(".pyi"):
-                    continue
-                self.flash_file(lp, rp, bytecode_ver=bytecode_ver, arch=arch, active_tags=active_tags)
-                results.append((lp, rp, True))
-            except Exception as e:
-                print(f"  {_RED}✗ {rp}: {e}{_RESET}")
-                results.append((lp, rp, False))
+        try:
+            # 在设备上创建远程目录结构
+            dirs = sorted({
+                os.path.dirname(rp) for _, rp in entries if os.path.dirname(rp)
+            })
+            for d in dirs:
+                try:
+                    self._execute(
+                        "import os\n"
+                        "try:\n"
+                        f" os.mkdir({repr(d)})\n"
+                        "except OSError:\n"
+                        " pass"
+                    )
+                except Exception:
+                    pass
 
-        return results
+            # 逐个刷入
+            results = []
+            for lp, rp in entries:
+                try:
+                    if lp.endswith(".pyi"):
+                        continue
+                    self.flash_file(lp, rp, bytecode_ver=bytecode_ver, arch=arch, active_tags=active_tags)
+                    results.append((lp, rp, True))
+                except Exception as e:
+                    print(f"  {_RED}✗ {rp}: {e}{_RESET}")
+                    results.append((lp, rp, False))
+
+            return results
+        finally:
+            if should_close_log:
+                self._close_repl_log()
 
     def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
         """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""

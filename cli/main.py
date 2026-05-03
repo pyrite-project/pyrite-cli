@@ -79,7 +79,7 @@ def flash(
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
-        ver = mp.get_mpy_version() if not no_compile else None
+        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if target:
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
             active_tags.add(target.upper())
@@ -92,7 +92,7 @@ def flash(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver, active_tags=active_tags or None)
+        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver, arch=arch, active_tags=active_tags or None)
     finally:
         mp.disconnect()
 
@@ -135,7 +135,7 @@ def flash_program(
         mp.connect()
         if no_compile:
             mp.config["auto_compile"] = False
-        ver = mp.get_mpy_version() if not no_compile else None
+        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if target:
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
             active_tags.add(target.upper())
@@ -148,7 +148,7 @@ def flash_program(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver,
+        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver, arch=arch,
                                    active_tags=active_tags or None, manifest_path=manifest)
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)

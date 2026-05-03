@@ -71,13 +71,15 @@ def _load_config():
     return cfg
 
 
-def _compile_to_mpy(local_path: str, bytecode_ver: int = None):
+def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None):
     """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
     tmp_dir = tempfile.mkdtemp()
     out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
     cmd = ["mpy-cross", local_path, "-o", out_path]
     if bytecode_ver is not None:
         cmd += ["-b", str(bytecode_ver)]
+    if arch is not None:
+        cmd += ["-march", arch]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=30)
         if r.returncode == 0:
@@ -536,7 +538,7 @@ class MicroPython:
         if "Traceback" in text:
             raise RuntimeError(f"设备写入错误:\n{text}")
 
-    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None, active_tags=None):
+    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None, arch=None, active_tags=None):
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
 
@@ -557,7 +559,7 @@ class MicroPython:
             actual_local = pp_path
 
         if should_compile and actual_local.endswith(".py"):
-            mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver)
+            mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch)
             if mpy_path:
                 tmp_dirs.append(tmp_dir)
                 actual_local = mpy_path
@@ -585,6 +587,14 @@ class MicroPython:
 
             self._execute("f.close()\ndel f")
             print(f"  ✓ {actual_remote}")
+
+            # main.mpy 不会被自动执行，重命名为 _main.mpy 并写 stub main.py
+            if actual_remote == "main.mpy":
+                self._execute("import os; os.rename('main.mpy', '_main.mpy')")
+                stub = "import _main\n"
+                self._execute(f"f=open('main.py','w')\nf.write({repr(stub)})\nf.close()")
+                print("  ✓ main.py (stub) + _main.mpy")
+
             return True
 
         except Exception:
@@ -599,7 +609,7 @@ class MicroPython:
 
 
 
-    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, active_tags=None, manifest_path=None):
+    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None):
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
@@ -643,7 +653,7 @@ class MicroPython:
         results = []
         for lp, rp in entries:
             try:
-                self.flash_file(lp, rp, bytecode_ver=bytecode_ver, active_tags=active_tags)
+                self.flash_file(lp, rp, bytecode_ver=bytecode_ver, arch=arch, active_tags=active_tags)
                 results.append((lp, rp, True))
             except Exception as e:
                 print(f"  ✗ {rp}: {e}")
@@ -651,13 +661,21 @@ class MicroPython:
 
         return results
 
-    def get_mpy_version(self) -> int | None:
-        """从设备读取 mpy 字节码版本号（sys.implementation._mpy >> 8）。"""
+    def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
+        """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""
         try:
-            out = self.run("import sys; print(sys.implementation._mpy >> 8)")
-            return int(out.strip())
+            out = self.run(
+                "import sys\n"
+                "m=sys.implementation.mpy\n"
+                "a=[None,'x86','x64','armv6','armv6m','armv7m','armv7em','armv7emsp','armv7emdp','xtensa','xtensawin'][m>>10]\n"
+                "print(m&0xff,a or '')"
+            )
+            parts = out.strip().split()
+            ver = int(parts[0])
+            arch = parts[1] if len(parts) > 1 and parts[1] else None
+            return ver, arch
         except Exception:
-            return None
+            return None, None
 
     def detect_tags(self) -> set:
         """从设备读取 board 信息，返回 active_tags 集合。"""

@@ -71,13 +71,28 @@ def flash(
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译，刷入原始 .py"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target（离线时使用）"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
 ):
     """刷入单个文件到设备"""
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
         ver = mp.get_mpy_version() if not no_compile else None
-        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver)
+        if target:
+            active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
+            active_tags.add(target.upper())
+        else:
+            active_tags = mp.detect_tags()
+            if not active_tags:
+                typer.secho("无法识别设备 target，请使用 --target 手动指定", fg=typer.colors.RED)
+                raise typer.Exit(1)
+        if feature:
+            active_tags.update(t.strip() for t in feature.split(","))
+        if no_feature:
+            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver, active_tags=active_tags or None)
     finally:
         mp.disconnect()
 
@@ -109,6 +124,10 @@ def flash_program(
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target（离线时使用）"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
+    manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
 ):
     """刷入整个目录到设备"""
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
@@ -117,7 +136,20 @@ def flash_program(
         if no_compile:
             mp.config["auto_compile"] = False
         ver = mp.get_mpy_version() if not no_compile else None
-        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver)
+        if target:
+            active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
+            active_tags.add(target.upper())
+        else:
+            active_tags = mp.detect_tags()
+            if not active_tags:
+                typer.secho("无法识别设备 target，请使用 --target 手动指定", fg=typer.colors.RED)
+                raise typer.Exit(1)
+        if feature:
+            active_tags.update(t.strip() for t in feature.split(","))
+        if no_feature:
+            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver,
+                                   active_tags=active_tags or None, manifest_path=manifest)
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)
         print(f"\n完成: {ok} 成功, {fail} 失败")

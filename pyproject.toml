@@ -12,6 +12,8 @@ dependencies = [
     "requests>=2.28.0",
     "tqdm>=4.64.0",
     "mpy-cross",
+    "libcst>=1.1.0",
+    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.scripts]
@@ -19,3 +21,6 @@ pyrcli = "cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
+
+[tool.setuptools.package-data]
+"cli.project" = ["feature_stub.pyi"]

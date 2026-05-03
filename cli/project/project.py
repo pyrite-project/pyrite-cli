@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import shutil
+from pathlib import Path
 from .stubs import *
 from ..utils.selector import interactive_select
 
@@ -51,8 +53,18 @@ def detect_device_info(port: str, baudrate: int = 115200,
     return hardware, version
 
 
+_MANIFEST_TEMPLATE = """\
+# manifest.py - 控制哪些文件刷入设备
+# module("main.py")
+# module("lib/utils.py", features=["wifi"])
+# package("lib")
+"""
+
 def init_project(proj_name: str):
     os.mkdir(proj_name)
+    stub_src = Path(__file__).parent / "feature_stub.pyi"
+    shutil.copy(stub_src, Path(proj_name) / "feature_stub.pyi")
+    (Path(proj_name) / "manifest.py").write_text(_MANIFEST_TEMPLATE, encoding="utf-8")
 
 
 def new_project_interactive(proj_name: str, platform: str | None = None):

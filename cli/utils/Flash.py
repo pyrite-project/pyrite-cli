@@ -13,8 +13,21 @@ from pathlib import Path
 import serial
 import serial.tools.list_ports
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore
+
 CONFIG_FILE = ".pyrite_config.json"
 DEFAULT_CHUNK_SIZE = 4096  # 单位:字节
+
+_DEFAULT_BOARD_TAGS = {
+    "ESP32":  ["ESP32", "wifi"],
+    "ESP8266": ["ESP8266"],
+    "RP2040": ["RP2040"],
+    "PICO":   ["RP2040"],
+    "STM32":  ["STM32"],
+}
 
 ENTER_RAW_REPL = b'\x01'
 EXIT_RAW_REPL = b'\x02'
@@ -27,6 +40,7 @@ def _load_config():
         "chunk_size": DEFAULT_CHUNK_SIZE,
         "download_threads": 4,
         "auto_compile": True,
+        "board_tags": dict(_DEFAULT_BOARD_TAGS),
     }
     cwd = Path.cwd()
     for parent in [cwd] + list(cwd.parents):
@@ -42,6 +56,16 @@ def _load_config():
                 if isinstance(data.get("auto_compile"), bool):
                     cfg["auto_compile"] = data["auto_compile"]
             except (json.JSONDecodeError, OSError):
+                pass
+            break
+    for parent in [cwd] + list(cwd.parents):
+        p = parent / "pyproject.toml"
+        if p.exists():
+            try:
+                data = tomllib.loads(p.read_text(encoding="utf-8"))
+                bt = data.get("tool", {}).get("pyrite", {}).get("board_tags", {})
+                cfg["board_tags"].update({k.upper(): v for k, v in bt.items()})
+            except Exception:
                 pass
             break
     return cfg
@@ -503,18 +527,30 @@ class MicroPython:
         if "Traceback" in text:
             raise RuntimeError(f"设备写入错误:\n{text}")
 
-    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None):
+    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None, active_tags=None):
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
 
         should_compile = self.config["auto_compile"] if compile is None else compile
-        tmp_dir = None
+        tmp_dirs = []
         actual_local = local_path
         actual_remote = (remote_path or os.path.basename(local_path)).replace("\\", "/")
 
-        if should_compile and local_path.endswith(".py"):
-            mpy_path, tmp_dir = _compile_to_mpy(local_path, bytecode_ver)
+        if active_tags and local_path.endswith(".py"):
+            from .preprocessor import preprocess
+            pp_dir = tempfile.mkdtemp()
+            tmp_dirs.append(pp_dir)
+            pp_path = os.path.join(pp_dir, Path(local_path).name)
+            Path(pp_path).write_text(
+                preprocess(Path(local_path).read_text(encoding="utf-8"), active_tags, local_path),
+                encoding="utf-8",
+            )
+            actual_local = pp_path
+
+        if should_compile and actual_local.endswith(".py"):
+            mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver)
             if mpy_path:
+                tmp_dirs.append(tmp_dir)
                 actual_local = mpy_path
                 actual_remote = actual_remote[:-3] + ".mpy"
 
@@ -549,36 +585,30 @@ class MicroPython:
                 pass
             raise
         finally:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 
-    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None):
-        """刷入整个目录树到设备。
-
-        Args:
-            local_dir: 本地目录路径
-            remote_prefix: 设备上的远程路径前缀
-
-        Returns:
-            [(本地路径, 远程路径, 成功与否), ...] 列表
-        """
+    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, active_tags=None, manifest_path=None):
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
         if not self._in_raw:
             self._enter_raw_repl()
 
-        # 收集所有文件
-        entries = []
-        for root, _dirs, files in os.walk(local_dir):
-            for fn in files:
-                lp = os.path.join(root, fn)
-                rp = os.path.join(
-                    remote_prefix, os.path.relpath(lp, local_dir)
-                ).replace("\\", "/")
-                entries.append((lp, rp))
+        if manifest_path:
+            from .manifest_loader import load_manifest
+            entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
+        else:
+            entries = []
+            for root, _dirs, files in os.walk(local_dir):
+                for fn in files:
+                    if not fn.endswith(".py"):
+                        continue
+                    lp = os.path.join(root, fn)
+                    rp = os.path.join(remote_prefix, os.path.relpath(lp, local_dir)).replace("\\", "/")
+                    entries.append((lp, rp))
 
         if not entries:
             print("  没有需要刷入的文件。")
@@ -604,7 +634,7 @@ class MicroPython:
         results = []
         for lp, rp in entries:
             try:
-                self.flash_file(lp, rp, bytecode_ver=bytecode_ver)
+                self.flash_file(lp, rp, bytecode_ver=bytecode_ver, active_tags=active_tags)
                 results.append((lp, rp, True))
             except Exception as e:
                 print(f"  ✗ {rp}: {e}")
@@ -619,6 +649,24 @@ class MicroPython:
             return int(out.strip())
         except Exception:
             return None
+
+    def detect_tags(self) -> set:
+        """从设备读取 board 信息，返回 active_tags 集合。"""
+        try:
+            out = self.run("import os,sys\nprint(os.uname().machine)\nprint(sys.platform)")
+        except Exception:
+            return set()
+        lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+        combined = " ".join(lines).upper()
+        board_tags = self.config["board_tags"]
+        tags = set()
+        for kw, tag_list in board_tags.items():
+            if kw in combined:
+                tags.update(tag_list)
+                break
+        if len(lines) > 1:
+            tags.add(lines[1].upper())
+        return tags
 
     def run(self, code):
         """在设备上执行任意 Python 代码并返回输出。"""

@@ -153,6 +153,94 @@ def config():
     create_default_config()
 
 
+@app.command()
+def board_info(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
+    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+):
+    """获取设备板级信息（固件、CPU、内存、Flash 等）"""
+    code = """\
+import sys,os,gc,machine,ubinascii
+u=os.uname()
+st=os.statvfs('/')
+print('FW:'+sys.implementation.name+' '+'.'.join(str(x) for x in sys.implementation.version))
+print('PLAT:'+sys.platform)
+print('HW:'+u.machine)
+print('REL:'+u.release)
+print('CPU:'+str(machine.freq()))
+print('UID:'+ubinascii.hexlify(machine.unique_id()).decode())
+rc=machine.reset_cause()
+_RC={getattr(machine,n):n for n in('PWRON_RESET','HARD_RESET','WDT_RESET','DEEPSLEEP_RESET','SOFT_RESET')if hasattr(machine,n)}
+print('RST:'+_RC.get(rc,str(rc)))
+gc.collect()
+print('MF:'+str(gc.mem_free()))
+print('MA:'+str(gc.mem_alloc()))
+print('FS:'+str(st[0]*st[2])+'/'+str(st[0]*st[3]))
+try:
+ import esp
+ print('FLASH:'+str(esp.flash_size()))
+except:pass
+try:
+ import network
+ w=network.WLAN(network.STA_IF)
+ w.active(True)
+ print('MAC:'+':'.join('%02x'%b for b in w.config('mac')))
+except:pass
+"""
+    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    try:
+        mp.connect()
+        output = mp.run(code)
+    finally:
+        mp.disconnect()
+
+    if not output:
+        typer.secho("未获取到设备信息。", fg=typer.colors.RED)
+        return
+
+    info = {}
+    for line in output.strip().splitlines():
+        if ':' in line:
+            k, _, v = line.partition(':')
+            info[k] = v
+
+    def row(label: str, value: str):
+        # 中文字符占2列，补齐到10列宽
+        pad = 10 - sum(2 if ord(c) > 127 else 1 for c in label)
+        typer.secho(f"  {label}{' ' * pad}", fg=typer.colors.BRIGHT_BLACK, nl=False)
+        typer.echo(value)
+
+    def section(title: str):
+        typer.echo()
+        typer.secho(f"── {title} ", fg=typer.colors.BRIGHT_CYAN, bold=True)
+
+    section("固件")
+    row("名称", info.get('FW', '?'))
+    row("平台", info.get('PLAT', '?'))
+    row("硬件", info.get('HW', '?'))
+    row("版本", info.get('REL', '?'))
+
+    section("设备")
+    if 'CPU' in info:
+        row("CPU", f"{int(info['CPU'])//1_000_000} MHz")
+    row("唯一ID", info.get('UID', '?'))
+    row("复位原因", info.get('RST', '?'))
+    if 'MAC' in info:
+        row("MAC", info['MAC'])
+
+    section("内存")
+    if 'MF' in info and 'MA' in info:
+        mf, ma = int(info['MF']), int(info['MA'])
+        row("RAM", f"{ma//1024} KB used / {(mf+ma)//1024} KB total")
+    if 'FS' in info:
+        total, free = info['FS'].split('/')
+        row("Flash FS", f"{(int(total)-int(free))//1024} KB used / {int(total)//1024} KB total")
+    if 'FLASH' in info:
+        row("Flash", f"{int(info['FLASH'])//1024} KB")
+    typer.echo()
+
+
 def main():
     app()
 

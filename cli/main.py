@@ -9,12 +9,34 @@ app = typer.Typer(
 )
 
 
+_BRIEF_CODE = """\
+import sys,os,machine
+u=os.uname()
+print(sys.implementation.name+' '+'.'.join(str(x) for x in sys.implementation.version))
+print(u.machine)
+print(str(machine.freq()//1000000)+' MHz')
+"""
+
+def _fetch_brief(port: str) -> str:
+    mp = MicroPython(port=port)
+    try:
+        mp.connect()
+        out = mp.run(_BRIEF_CODE)
+    except Exception:
+        return ""
+    finally:
+        mp.disconnect()
+    lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+    return "  " + "  ".join(lines) if lines else ""
+
+
 @app.command()
 def scan(
     vid: Optional[int] = typer.Option(None, "--vid", help="按 VID 过滤（十进制）"),
     pid: Optional[int] = typer.Option(None, "--pid", help="按 PID 过滤（十进制）"),
     keyword: Optional[str] = typer.Option(None, "--keyword", "-k", help="按描述关键字过滤"),
     all: bool = typer.Option(False, "--all", "-a", help="显示所有设备（包括无 VID/PID 的）"),
+    with_info: bool = typer.Option(False, "--with-info", "-i", help="连接设备并显示简略板子信息"),
 ):
     """扫描所有可用串口设备"""
     ports = MicroPython.scan_ports(vid=vid, pid=pid, keyword=keyword, require_vid=not all)
@@ -32,6 +54,10 @@ def scan(
         tag_str = f" ({', '.join(tags)}{sn})" if tags else ""
         print(f"  {p['device']}{tag_str}")
         print(f"    {p['description']}")
+        if with_info:
+            brief = _fetch_brief(p["device"])
+            if brief:
+                typer.secho(brief, fg=typer.colors.BRIGHT_BLACK)
 
 
 @app.command()

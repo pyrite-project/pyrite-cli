@@ -75,18 +75,20 @@ def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None)
     """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
     tmp_dir = tempfile.mkdtemp()
     out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
-    cmd = ["mpy-cross", local_path, "-o", out_path]
-    if bytecode_ver is not None:
-        cmd += ["-b", str(bytecode_ver)]
+    args = [local_path, "-o", out_path]
     if arch is not None:
-        cmd += ["-march", arch]
+        args += [f"-march={arch}"]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        import mpy_cross
+        if bytecode_ver is not None:
+            mpy_cross.set_version(micropython=None, bytecode=str(bytecode_ver))
+        r = mpy_cross.run(*args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        r.wait(timeout=30)
         if r.returncode == 0:
             return out_path, tmp_dir
         print(f"  [警告] mpy-cross 编译失败，回退到 .py\n"
-              f"         {r.stderr.decode(errors='replace').strip()}")
-    except FileNotFoundError:
+              f"         {r.stderr.read().decode(errors='replace').strip()}")
+    except ImportError:
         print("  [提示] 未找到 mpy-cross，跳过编译")
     except Exception as e:
         print(f"  [警告] 编译异常: {e}，回退到 .py")

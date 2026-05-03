@@ -70,12 +70,14 @@ def flash(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译，刷入原始 .py"),
 ):
     """刷入单个文件到设备"""
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
-        mp.flash_file(file, remote)
+        ver = mp.get_mpy_version() if not no_compile else None
+        mp.flash_file(file, remote, compile=not no_compile, bytecode_ver=ver)
     finally:
         mp.disconnect()
 
@@ -106,12 +108,16 @@ def flash_program(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译"),
 ):
     """刷入整个目录到设备"""
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
-        results = mp.flash_program(directory, prefix or "")
+        if no_compile:
+            mp.config["auto_compile"] = False
+        ver = mp.get_mpy_version() if not no_compile else None
+        results = mp.flash_program(directory, prefix or "", bytecode_ver=ver)
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)
         print(f"\n完成: {ok} 成功, {fail} 失败")

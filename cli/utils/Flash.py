@@ -6,6 +6,9 @@ MicroPython 设备刷入工具 - 通过串口原始 REPL 上传文件到设备
 import os
 import time
 import json
+import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 import serial
 import serial.tools.list_ports
@@ -23,6 +26,7 @@ def _load_config():
     cfg = {
         "chunk_size": DEFAULT_CHUNK_SIZE,
         "download_threads": 4,
+        "auto_compile": True,
     }
     cwd = Path.cwd()
     for parent in [cwd] + list(cwd.parents):
@@ -35,10 +39,33 @@ def _load_config():
                 t = data.get("download_threads", 4)
                 if isinstance(t, int) and t > 0:
                     cfg["download_threads"] = min(t, 12)
+                if isinstance(data.get("auto_compile"), bool):
+                    cfg["auto_compile"] = data["auto_compile"]
             except (json.JSONDecodeError, OSError):
                 pass
             break
     return cfg
+
+
+def _compile_to_mpy(local_path: str, bytecode_ver: int = None):
+    """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
+    tmp_dir = tempfile.mkdtemp()
+    out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
+    cmd = ["mpy-cross", local_path, "-o", out_path]
+    if bytecode_ver is not None:
+        cmd += ["-b", str(bytecode_ver)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if r.returncode == 0:
+            return out_path, tmp_dir
+        print(f"  [警告] mpy-cross 编译失败，回退到 .py\n"
+              f"         {r.stderr.decode(errors='replace').strip()}")
+    except FileNotFoundError:
+        print("  [提示] 未找到 mpy-cross，跳过编译")
+    except Exception as e:
+        print(f"  [警告] 编译异常: {e}，回退到 .py")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return None, None
 
 class MicroPython:
     """通过串口原始 REPL 与 MicroPython 设备交互。
@@ -476,24 +503,22 @@ class MicroPython:
         if "Traceback" in text:
             raise RuntimeError(f"设备写入错误:\n{text}")
 
-    def flash_file(self, local_path, remote_path=None):
-        """将本地文件刷入 MicroPython 设备。
-
-        流程: 进入原始 REPL → 设置 kbd_intr(-1)
-              → 分块原始字节传输（sys.stdin.buffer.read）→ 恢复 kbd_intr
-
-        Args:
-            local_path: 本地文件路径
-            remote_path: 设备上的目标路径（默认使用文件名）
-
-        Returns:
-            True 表示成功
-        """
+    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None):
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
 
-        remote_path = (remote_path or os.path.basename(local_path)).replace("\\", "/")
-        file_size = os.path.getsize(local_path)
+        should_compile = self.config["auto_compile"] if compile is None else compile
+        tmp_dir = None
+        actual_local = local_path
+        actual_remote = (remote_path or os.path.basename(local_path)).replace("\\", "/")
+
+        if should_compile and local_path.endswith(".py"):
+            mpy_path, tmp_dir = _compile_to_mpy(local_path, bytecode_ver)
+            if mpy_path:
+                actual_local = mpy_path
+                actual_remote = actual_remote[:-3] + ".mpy"
+
+        file_size = os.path.getsize(actual_local)
         chunk_size = self.config["chunk_size"]
 
         if not self._in_raw:
@@ -501,13 +526,12 @@ class MicroPython:
         if not self._kbd_set:
             self._setup_kbd_intr()
 
-        print(f"  刷入: {local_path} -> {remote_path} ({file_size} 字节, "
-              f"块大小={chunk_size})")
+        print(f"  刷入: {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
 
         try:
-            self._execute(f"f=open({repr(remote_path)},'wb')")
+            self._execute(f"f=open({repr(actual_remote)},'wb')")
 
-            with open(local_path, "rb") as lf:
+            with open(actual_local, "rb") as lf:
                 while True:
                     chunk = lf.read(chunk_size)
                     if not chunk:
@@ -515,7 +539,7 @@ class MicroPython:
                     self._write_raw_chunk(chunk)
 
             self._execute("f.close()\ndel f")
-            print(f"  ✓ {remote_path}")
+            print(f"  ✓ {actual_remote}")
             return True
 
         except Exception:
@@ -524,10 +548,13 @@ class MicroPython:
             except Exception:
                 pass
             raise
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 
-    def flash_program(self, local_dir, remote_prefix=""):
+    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None):
         """刷入整个目录树到设备。
 
         Args:
@@ -577,13 +604,21 @@ class MicroPython:
         results = []
         for lp, rp in entries:
             try:
-                self.flash_file(lp, rp)
+                self.flash_file(lp, rp, bytecode_ver=bytecode_ver)
                 results.append((lp, rp, True))
             except Exception as e:
                 print(f"  ✗ {rp}: {e}")
                 results.append((lp, rp, False))
 
         return results
+
+    def get_mpy_version(self) -> int | None:
+        """从设备读取 mpy 字节码版本号（sys.implementation._mpy >> 8）。"""
+        try:
+            out = self.run("import sys; print(sys.implementation._mpy >> 8)")
+            return int(out.strip())
+        except Exception:
+            return None
 
     def run(self, code):
         """在设备上执行任意 Python 代码并返回输出。"""
@@ -614,10 +649,12 @@ def create_default_config():
         json.dumps({
             "chunk_size": DEFAULT_CHUNK_SIZE,
             "download_threads": 4,
+            "auto_compile": True,
         }, indent=2),
         encoding="utf-8",
     )
     print(f"默认配置文件已创建: {cfg_path}")
     print(f"  chunk_size = {DEFAULT_CHUNK_SIZE} 字节（修改后需重启本工具）")
     print("  download_threads = 4（存根下载线程数，范围 1~12）")
+    print("  auto_compile = true（自动编译 .py -> .mpy，设为 false 可关闭）")
     return cfg_path

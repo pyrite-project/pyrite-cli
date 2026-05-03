@@ -182,14 +182,23 @@ class MicroPython:
         if self._in_raw:
             return
 
-        # 先发 Ctrl+C 中断可能正在运行的程序
-        self._write(SET_RESET)
-        time.sleep(0.15)
+        # 连发两次 Ctrl+C 中断正在运行的程序
+        for _ in range(2):
+            self._write(SET_RESET)
+            time.sleep(0.1)
         self.ser.reset_input_buffer() # type: ignore
 
         # Ctrl+A 进入原始 REPL
         self._write(ENTER_RAW_REPL)
         data = self._read_until(b">", timeout=2)
+
+        if b">" not in data:
+            # Ctrl+C 未能中断，尝试 Ctrl+D 软重启后再进入
+            self._write(SET_EXECUTE)  # Ctrl+D
+            time.sleep(0.8)
+            self.ser.reset_input_buffer() # type: ignore
+            self._write(ENTER_RAW_REPL)
+            data = self._read_until(b">", timeout=3)
 
         if b">" not in data:
             raise RuntimeError(f"无法进入原始 REPL 模式，设备响应: {data[:100]!r}")

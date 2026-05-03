@@ -164,20 +164,26 @@ def reset(
 
 @app.command()
 def new(
-    project_name: str = typer.Argument(..., help = "创建项目名称")
+    project_name: str = typer.Argument(..., help="创建项目名称"),
+    platform: Optional[str] = typer.Option(None, "--platform",
+                                           help="串口号，如 COM3 或 /dev/ttyUSB0，自动检测硬件并下载对应 stubs"),
 ):
-    '''创建新MicroPython项目'''
-    new_project_interactive(project_name)
+    """创建新 MicroPython 项目"""
+    new_project_interactive(project_name, platform=platform)
 
 @app.command()
 def init(
-    hardware: str = typer.Argument(..., help = "使用的MicroPython名称"),
-    version: str = typer.Argument(..., help = "硬件所使用MicroPython固件版本，形式同'1.20.0'"),
+    hardware: Optional[str] = typer.Argument(None,
+                                             help="使用的 MicroPython 硬件名称（使用 --platform 时可不指定）"),
+    version: Optional[str] = typer.Argument(None,
+                                            help="硬件所使用 MicroPython 固件版本，如 '1.20.0'（使用 --platform 时可不指定）"),
     variant: Optional[str] = typer.Option(None, "--variant", "-V",
-                                          help = "具体硬件变体，如 ESP32_GENERIC、PICO_W")
+                                          help="具体硬件变体，如 ESP32_GENERIC、PICO_W"),
+    platform: Optional[str] = typer.Option(None, "--platform",
+                                           help="串口号，如 COM3 或 /dev/ttyUSB0，自动检测硬件并下载对应 stubs"),
 ):
-    """在已创建项目中初始化MicroPython环境"""
-    init_stubs(hardware, version, variant)
+    """在已创建项目中初始化 MicroPython 环境"""
+    init_stubs(hardware, version, variant, platform)
 
 @app.command()
 def config():

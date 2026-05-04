@@ -3,7 +3,10 @@ import time
 import json
 import subprocess
 import tempfile
+import re
 import shutil
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 import serial
 import serial.tools.list_ports
@@ -53,19 +56,23 @@ with open("FILE", 'wb') as f:
 micropython.kbd_intr(3)
 """
 
-FLASH_PROGRAM = """\
-import sys,micropython
+FLASH_PROGRAM = """import sys, micropython
+
+# 禁用 Ctrl+C 中断，防止数据流中的 0x03 字节误触发设备重启
 micropython.kbd_intr(-1)
-usb=sys.stdin.buffer
-_files_=FILES
-for _sz_,_fp_ in _files_:
-    with open(_fp_,'wb') as _f_:
-        _n_=_sz_
-        while _n_:
-            _d_=usb.read(min(_n_,BFSIZE))
-            if _d_:
-                _f_.write(_d_)
-                _n_-=len(_d_)
+usb = sys.stdin.buffer
+
+# FILES 格式: [(size, remote_path), ...]，运行前由 PC 端替换
+entries = FILES
+for file_size, file_path in entries:
+    with open(file_path, 'wb') as f:
+        remaining = file_size
+        while remaining:
+            chunk = usb.read(min(remaining, BFSIZE))
+            if chunk:
+                f.write(chunk)
+                remaining -= len(chunk)
+# 恢复 Ctrl+C 中断
 micropython.kbd_intr(3)
 """
 
@@ -129,6 +136,34 @@ def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None)
         print(f"  {_YELLOW}[警告]{_RESET} 编译异常: {e}，回退到 .py")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return None, None
+
+
+def _colorize_repl_output(text, in_error):
+    """给 REPL 输出中的 Traceback/Error 添加红色高亮。
+
+    Returns:
+        (处理后文本, 是否仍在错误块中)
+    """
+    if "Traceback" in text:
+        idx = text.index("Traceback")
+        after = text[idx:]
+        m = re.search(r"(?:Error|Exception):[^\r\n]*", after)
+        if m:
+            colored = after[: m.end()]
+            rest = after[m.end() :]
+            return text[:idx] + _RED + colored + _RESET + rest, False
+        else:
+            return text[:idx] + _RED + after, True
+    if in_error:
+        m = re.search(r"(?:Error|Exception):[^\r\n]*", text)
+        if m:
+            colored = text[: m.end()]
+            rest = text[m.end() :]
+            return _RED + colored + _RESET + rest, False
+        else:
+            return _RED + text + _RESET, True
+    return text, False
+
 
 class MicroPython:
     """通过串口原始 REPL 与 MicroPython 设备交互。
@@ -273,6 +308,19 @@ class MicroPython:
             self._repl_log_file.close()
             self._repl_log_file = None
 
+    @contextmanager
+    def _repl_log_ctx(self):
+        """日志上下文：无日志文件时自动创建，退出时自动关闭。"""
+        if self._repl_log_file:
+            yield
+        else:
+            log_path = self._open_repl_log()
+            print(f"  {_GREEN}日志:{_RESET} {log_path}")
+            try:
+                yield
+            finally:
+                self._close_repl_log()
+
     def _drain_rx_log(self):
         """非阻塞读取串口 RX 缓冲中所有数据并记录到日志。"""
         if not self.ser or not self.ser.is_open:
@@ -323,134 +371,100 @@ class MicroPython:
         return buf
 
     def repl_(self):
-        """用户友好的交互式 MicroPython REPL（串口透传模式）。"""
-        import sys
-        import re
-
+        """交互式 MicroPython REPL（串口透传模式）。"""
         # 跨平台非阻塞键盘输入
         try:
             import msvcrt
-            _WIN = True
+            win = True
         except ImportError:
             import select
             import termios
             import tty
-            _WIN = False
+            win = False
 
-        # 中断正在运行的程序，切换到普通 REPL 模式
+        # 中断运行程序，切换到普通 REPL
         for _ in range(2):
             self._write(SET_RESET)
             time.sleep(0.1)
-        self.ser.reset_input_buffer() # type: ignore
+        self.ser.reset_input_buffer()
         self._write(EXIT_RAW_REPL)
         time.sleep(0.3)
-        self.ser.reset_input_buffer() # type: ignore
+        self.ser.reset_input_buffer()
 
-        print("=== MicroPython REPL 退出) ===")
+        print("=== MicroPython REPL ===")
         print()
 
-        # Windows 扫描码 → ANSI 转义序列映射
-        if _WIN:
-            _EXT_KEYS = {
-                b'H': b'\x1b[A',   # Up
-                b'P': b'\x1b[B',   # Down
-                b'M': b'\x1b[C',   # Right
-                b'K': b'\x1b[D',   # Left
-                b'G': b'\x1b[H',   # Home
-                b'O': b'\x1b[F',   # End
-                b'S': b'\x1b[3~',  # Delete
-                b'R': b'\x1b[2~',  # Insert
-                b'I': b'\x1b[5~',  # Page Up
-                b'Q': b'\x1b[6~',  # Page Down
-            }
-
         old_tty = None
-        if not _WIN:
+        if not win:
             fd = sys.stdin.fileno()
-            old_tty = termios.tcgetattr(fd) # type: ignore
-            mode = termios.tcgetattr(fd) # type: ignore
-            mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.ISIG) # type: ignore
-            mode[tty.CC][termios.VMIN] = 1 # type: ignore
-            mode[tty.CC][termios.VTIME] = 0 # type: ignore
-            termios.tcsetattr(fd, termios.TCSAFLUSH, mode) # type: ignore
+            old_tty = termios.tcgetattr(fd)
+            mode = old_tty[:]
+            mode[tty.CC] = mode[tty.CC][:]  # 拷贝 cc 列表避免共享修改
+            mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+            mode[tty.CC][termios.VMIN] = 1
+            mode[tty.CC][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
 
-        _in_error = False
-        _RED = "\033[31m"
-        _RST = "\033[0m"
+        in_error = False
 
         try:
             while self.is_connected:
-                # 串口 -> 终端（含 Traceback 错误高亮）
-                try:
-                    while self.ser.in_waiting: # type: ignore
-                        chunk = self.ser.read(self.ser.in_waiting) # type: ignore
-                        if not chunk:
-                            continue
-                        text = chunk.decode("utf-8", errors="replace")
-                        if not text:
-                            continue
+                # ── 串口 → 终端 ──
+                while self.ser.in_waiting:
+                    chunk = self.ser.read(self.ser.in_waiting)
+                    if not chunk:
+                        continue
+                    text = chunk.decode("utf-8", errors="replace")
+                    if not text:
+                        continue
+                    output, in_error = _colorize_repl_output(text, in_error)
+                    sys.stdout.write(output)
+                    sys.stdout.flush()
 
-                        if _in_error:
-                            m = re.search(r"(?:Error|Exception):[^\r\n]*", text)
-                            if m:
-                                colored = text[: m.end()]
-                                rest = text[m.end() :]
-                                sys.stdout.write(_RED + colored + _RST + rest)
-                                _in_error = False
-                            else:
-                                sys.stdout.write(_RED + text + _RST)
-                        elif "Traceback" in text:
-                            idx = text.index("Traceback")
-                            sys.stdout.write(text[:idx])
-                            after = text[idx:]
-                            m = re.search(r"(?:Error|Exception):[^\r\n]*", after)
-                            if m:
-                                colored = after[: m.end()]
-                                rest = after[m.end() :]
-                                sys.stdout.write(_RED + colored + _RST + rest)
-                            else:
-                                sys.stdout.write(_RED + after)
-                                _in_error = True
+                # ── 键盘 → 串口 ──
+                if win:
+                    _EXT_KEYS = {
+                        b'H': b'\x1b[A',   # Up
+                        b'P': b'\x1b[B',   # Down
+                        b'M': b'\x1b[C',   # Right
+                        b'K': b'\x1b[D',   # Left
+                        b'G': b'\x1b[H',   # Home
+                        b'O': b'\x1b[F',   # End
+                        b'S': b'\x1b[3~',  # Delete
+                        b'R': b'\x1b[2~',  # Insert
+                        b'I': b'\x1b[5~',  # Page Up
+                        b'Q': b'\x1b[6~',  # Page Down
+                    }
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch == b'\xe0':  # 扩展键（方向键/编辑键）
+                            ch2 = msvcrt.getch()
+                            seq = _EXT_KEYS.get(ch2)
+                            if seq:
+                                self._write(seq)
+                        elif ch == b'\x00':  # 功能键（F1-F12 等）
+                            msvcrt.getch()
                         else:
-                            sys.stdout.write(text)
-                        sys.stdout.flush()
-                except Exception:
-                    break
-
-                # 键盘 -> 串口
-                try:
-                    if _WIN:
-                        if msvcrt.kbhit():
-                            ch = msvcrt.getch()
-                            if ch == b'\xe0':  # 扩展键（方向键/编辑键）
-                                ch2 = msvcrt.getch()
-                                seq = _EXT_KEYS.get(ch2)
-                                if seq:
-                                    self._write(seq)
-                            elif ch == b'\x00':  # 功能键（F1-F12 等）
-                                msvcrt.getch()  # 消费第二个字节，忽略
-                            else:
-                                self._write(ch)
-                    else:
-                        if select.select([sys.stdin], [], [], 0)[0]:
-                            buf = os.read(sys.stdin.fileno(), 1)
-                            if not buf or buf == b'\x1d':  # Ctrl+] 退出
-                                break
-                            # ESC 开头可能是转义序列，完整读取后一次性发送
-                            if buf == b'\x1b':
-                                for _ in range(16):
-                                    if select.select([sys.stdin], [], [], 0.02)[0]:
-                                        b = os.read(sys.stdin.fileno(), 1)
-                                        if not b:
-                                            break
-                                        buf += b
-                                        if b in (b'~',) or (len(buf) >= 2 and b in b'ABCDHPQRS'):
-                                            break
-                                    else:
+                            self._write(ch)
+                else:
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        buf = os.read(sys.stdin.fileno(), 1)
+                        if not buf:
+                            break
+                        if buf == b'\x03':  # Ctrl+C 退出 REPL
+                            break
+                        if buf == b'\x1b':  # ESC 开头可能为转义序列
+                            for _ in range(16):
+                                if select.select([sys.stdin], [], [], 0.02)[0]:
+                                    b = os.read(sys.stdin.fileno(), 1)
+                                    if not b:
                                         break
-                            self._write(buf)
-                except Exception:
-                    break
+                                    buf += b
+                                    if b in (b'~',) or (len(buf) >= 2 and b in b'ABCDHPQRS'):
+                                        break
+                                else:
+                                    break
+                        self._write(buf)
 
                 time.sleep(0.01)
         except KeyboardInterrupt:
@@ -460,7 +474,7 @@ class MicroPython:
             sys.stdout.buffer.flush()
             if old_tty is not None:
                 try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty) # type: ignore
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
                 except Exception:
                     pass
 
@@ -576,55 +590,38 @@ class MicroPython:
 
         print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
 
-        should_close_log = False
-        if not self._repl_log_file:
-            log_path = self._open_repl_log()
-            should_close_log = True
-            print(f"  {_GREEN}日志:{_RESET} {log_path}")
-
-        try:
-            # 连发两次 Ctrl+C 中断正在运行的程序
-            for _ in range(2):
-                self._write(SET_RESET)
-                time.sleep(0.1)
-            self.ser.reset_input_buffer() # type: ignore
-
-            self._write(ENTER_RAW_REPL)
-            time.sleep(0.1)
-            self._drain_rx_log()
-
-            self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE",str(DEFAULT_CHUNK_SIZE)).replace("FSIZE",str(file_size)))
-            self._write(SET_EXECUTE)
-            time.sleep(0.3)
-            self._drain_rx_log()
-
-            with open(local_path, 'rb') as f:
-                while True:
-                    buf = f.read(DEFAULT_CHUNK_SIZE)
-                    self._write(buf)
-                    if len(buf) < DEFAULT_CHUNK_SIZE:
-                        break
-
-            self._drain_rx_log()
-
-            print(f"  {_GREEN}✓ 刷入成功{_RESET}")
-
-        except Exception:
+        with self._repl_log_ctx():
             try:
-                self._execute("f.close()", timeout=2)
+                self._enter_raw_repl()
+
+                self._drain_rx_log()
+                self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE)).replace("FSIZE", str(file_size)))
+                self._write(SET_EXECUTE)
+                time.sleep(0.3)
+                self._drain_rx_log()
+
+                with open(actual_local, 'rb') as f:
+                    for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
+                        self._write(f.read(DEFAULT_CHUNK_SIZE))
+
+                self._drain_rx_log()
+                print(f"  {_GREEN}✓ 刷入成功{_RESET}")
+
             except Exception:
-                pass
-            raise
-        finally:
-            if should_close_log:
-                self._close_repl_log()
-            for d in tmp_dirs:
-                shutil.rmtree(d, ignore_errors=True)
+                try:
+                    self._execute("f.close()", timeout=2)
+                except Exception:
+                    pass
+                raise
+            finally:
+                for d in tmp_dirs:
+                    shutil.rmtree(d, ignore_errors=True)
 
     def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None):
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
+        # ── 收集文件清单 ──
         if manifest_path:
             from .manifest_loader import load_manifest
             entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
@@ -638,17 +635,14 @@ class MicroPython:
                     rp = os.path.join(remote_prefix, os.path.relpath(lp, local_dir)).replace("\\", "/")
                     entries.append((lp, rp))
 
-        # ── 预处理、预编译所有文件 ──
+        # ── 预处理、预编译、读取内容（一轮遍历） ──
         tmp_dirs = []
-        file_list = []  # [(remote_path, local_compiled_path, size)]
+        file_list = []    # [(remote_path, local_compiled_path, size)]
+        file_meta = []    # [(size, remote_path), ...] → 替换到 FLASH_PROGRAM
+        all_data = b""
 
         for lp, rp in entries:
-            # manifest.py 不上传
-            if Path(rp).name == "manifest.py":
-                print(f"  {_YELLOW}[WARN]{_RESET} '{rp}' 是编译所需文件，已跳过刷入")
-                continue
-            # .pyi 不处理
-            if lp.endswith(".pyi"):
+            if Path(rp).name == "manifest.py" or lp.endswith(".pyi"):
                 continue
 
             actual_local = lp
@@ -666,20 +660,21 @@ class MicroPython:
                 )
                 actual_local = pp_path
 
-            # main.py / boot.py 不编译
-            should_compile = self.config["auto_compile"]
-            if Path(actual_remote).name in ("main.py", "boot.py"):
-                should_compile = False
-
-            # 编译 .py → .mpy
+            # 编译 .py → .mpy（跳过启动文件）
+            basename = Path(actual_remote).name
+            should_compile = self.config["auto_compile"] and basename not in ("main.py", "boot.py")
             if should_compile and actual_local.endswith(".py"):
-                mpy_path, mpy_tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch)
+                mpy_path, mpy_tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch) # type: ignore
                 if mpy_path:
                     tmp_dirs.append(mpy_tmp_dir)
                     actual_local = mpy_path
                     actual_remote = actual_remote[:-3] + ".mpy"
 
-            file_list.append((actual_remote, actual_local, os.path.getsize(actual_local)))
+            with open(actual_local, "rb") as f:
+                content = f.read()
+            file_list.append((actual_remote, actual_local, len(content)))
+            all_data += content
+            file_meta.append((len(content), actual_remote))
 
         if not file_list:
             print("  没有需要刷入的文件。")
@@ -689,78 +684,47 @@ class MicroPython:
         if not self._in_raw:
             self._enter_raw_repl()
 
-        # ── 在设备上创建目录 ──
+        # ── 批量创建设备目录（一次执行，N-1 次往返节省） ──
         dirs = sorted({os.path.dirname(rp) for rp, _, _ in file_list if os.path.dirname(rp)})
-        for d in dirs:
-            try:
-                self._execute(
-                    "import os\n"
-                    "try:\n"
-                    f" os.mkdir({repr(d)})\n"
-                    "except OSError:\n"
-                    " pass"
-                )
-            except Exception:
-                pass
+        if dirs:
+            mkdir_cmds = (
+                "import os\n"
+                f"for d in {dirs!r}:\n"
+                "    try:\n"
+                "        os.mkdir(d)\n"
+                "    except OSError:\n"
+                "        pass\n"
+            )
+            self._execute(mkdir_cmds)
 
-        # ── 读取所有文件内容，构建元数据 ──
-        all_data = b""
-        file_meta = []  # [(size, remote_path), ...] — 替换到 FLASH_PROGRAM 中
-        for rp, lp, sz in file_list:
-            with open(lp, "rb") as f:
-                all_data += f.read()
-            file_meta.append((sz, rp))
-
+        # ── 发送刷入脚本 ──
         script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
 
-        should_close_log = False
-        if not self._repl_log_file:
-            log_path = self._open_repl_log()
-            should_close_log = True
-            print(f"  {_GREEN}日志:{_RESET} {log_path}")
+        with self._repl_log_ctx():
+            print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
+            for rp, lp, sz in file_list:
+                print(f"    {lp} -> {rp} ({sz} 字节)")
 
-        print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
-        for rp, lp, sz in file_list:
-            print(f"    {lp} -> {rp} ({sz} 字节)")
+            try:
+                self._write(script.encode() + SET_EXECUTE)
+                time.sleep(0.3)
+                self._drain_rx_log()
 
-        try:
-            # 中断正在运行的程序
-            for _ in range(2):
-                self._write(SET_RESET)
-                time.sleep(0.1)
-            self.ser.reset_input_buffer()
+                for offset in range(0, len(all_data), DEFAULT_CHUNK_SIZE):
+                    self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
 
-            self._write(ENTER_RAW_REPL)
-            time.sleep(0.1)
-            self._drain_rx_log()
+                self._drain_rx_log()
 
-            # 发送批量刷入脚本（包含所有文件大小与路径列表）
-            self._write(script.encode() + SET_EXECUTE)
-            time.sleep(0.3)
-            self._drain_rx_log()
+                total_size = len(all_data)
+                print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
+                return [(lp, rp, True) for (rp, lp, sz) in file_list]
 
-            # 按顺序发送所有文件内容
-            # 小文件自动合并到同一缓冲区，减少串口往返
-            total_size = len(all_data)
-            offset = 0
-            while offset < total_size:
-                chunk = all_data[offset:offset + DEFAULT_CHUNK_SIZE]
-                self._write(chunk)
-                offset += len(chunk)
-
-            self._drain_rx_log()
-
-            print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
-            return [(lp, rp, True) for (rp, lp, sz) in file_list]
-
-        except Exception as e:
-            print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
-            return [(lp, rp, False) for (rp, lp, sz) in file_list]
-        finally:
-            if should_close_log:
-                self._close_repl_log()
-            for d in tmp_dirs:
-                shutil.rmtree(d, ignore_errors=True)
+            except Exception as e:
+                print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
+                return [(lp, rp, False) for (rp, lp, sz) in file_list]
+            finally:
+                for d in tmp_dirs:
+                    shutil.rmtree(d, ignore_errors=True)
 
     def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
         """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""
@@ -774,7 +738,7 @@ class MicroPython:
             parts = out.strip().split()
             ver = int(parts[0])
             arch = parts[1] if len(parts) > 1 and parts[1] else None
-            return ver, arch
+            return ver, arch # type: ignore
         except Exception:
             return None, None
 

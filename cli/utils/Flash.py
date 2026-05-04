@@ -346,7 +346,7 @@ class MicroPython:
         time.sleep(0.3)
         self.ser.reset_input_buffer() # type: ignore
 
-        print("=== MicroPython REPL (Ctrl+] 退出) ===")
+        print("=== MicroPython REPL 退出) ===")
         print()
 
         # Windows 扫描码 → ANSI 转义序列映射

@@ -5,7 +5,7 @@ import os
 import math
 import time
 import gc
-
+import machine
 
 def test_system_info():
     """输出设备系统信息。"""

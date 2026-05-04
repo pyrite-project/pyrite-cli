@@ -1,8 +1,3 @@
-"""
-MicroPython 设备刷入工具 - 通过串口原始 REPL 上传文件到设备
-依赖: pyserial (pip install pyserial)
-"""
-
 import os
 import time
 import json
@@ -55,6 +50,22 @@ with open("FILE", 'wb') as f:
             f.write(ln)
             f_size -= len(ln)
             print(f_size)
+micropython.kbd_intr(3)
+"""
+
+FLASH_PROGRAM = """\
+import sys,micropython
+micropython.kbd_intr(-1)
+usb=sys.stdin.buffer
+_files_=FILES
+for _sz_,_fp_ in _files_:
+    with open(_fp_,'wb') as _f_:
+        _n_=_sz_
+        while _n_:
+            _d_=usb.read(min(_n_,BFSIZE))
+            if _d_:
+                _f_.write(_d_)
+                _n_-=len(_d_)
 micropython.kbd_intr(3)
 """
 
@@ -312,8 +323,9 @@ class MicroPython:
         return buf
 
     def repl_(self):
+        """用户友好的交互式 MicroPython REPL（串口透传模式）。"""
         import sys
-        import re as _re
+        import re
 
         # 跨平台非阻塞键盘输入
         try:
@@ -325,45 +337,32 @@ class MicroPython:
             import tty
             _WIN = False
 
-        if _WIN:
-            def _kbhit():
-                return msvcrt.kbhit()
-            def _getch():
-                return msvcrt.getch()
-        else:
-            fd = sys.stdin.fileno()
-            def _kbhit():
-                return select.select([fd], [], [], 0) == ([fd], [], [])
-            def _getch():
-                return os.read(fd, 1)
-
-        # ANSI 转义序列
-        RST = "\033[0m"
-        RED = "\033[31m"
-
-        self._write(SET_RESET)
-        time.sleep(0.1)
+        # 中断正在运行的程序，切换到普通 REPL 模式
+        for _ in range(2):
+            self._write(SET_RESET)
+            time.sleep(0.1)
+        self.ser.reset_input_buffer() # type: ignore
+        self._write(EXIT_RAW_REPL)
+        time.sleep(0.3)
         self.ser.reset_input_buffer() # type: ignore
 
-        try:
-            self._enter_raw_repl()
-        except RuntimeError as e:
-            print(f"REPL 初始化失败: {e}")
-            return
-        sys.stdout.write("> ")
-        sys.stdout.flush()
-
-        self.close_monitor = False
-        input_buffer = ""
-        history = []
-        history_pos = -1
-        saved_input = ""
-        _in_error = False
-        _expect_ok = False       # 是否期待下一条响应的首个OK
-
-        print("=== MicroPython REPL ===")
-        print("Ctrl+D 退出 | Ctrl+C 中断")
+        print("=== MicroPython REPL (Ctrl+] 退出) ===")
         print()
+
+        # Windows 扫描码 → ANSI 转义序列映射
+        if _WIN:
+            _EXT_KEYS = {
+                b'H': b'\x1b[A',   # Up
+                b'P': b'\x1b[B',   # Down
+                b'M': b'\x1b[C',   # Right
+                b'K': b'\x1b[D',   # Left
+                b'G': b'\x1b[H',   # Home
+                b'O': b'\x1b[F',   # End
+                b'S': b'\x1b[3~',  # Delete
+                b'R': b'\x1b[2~',  # Insert
+                b'I': b'\x1b[5~',  # Page Up
+                b'Q': b'\x1b[6~',  # Page Down
+            }
 
         old_tty = None
         if not _WIN:
@@ -375,161 +374,90 @@ class MicroPython:
             mode[tty.CC][termios.VTIME] = 0 # type: ignore
             termios.tcsetattr(fd, termios.TCSAFLUSH, mode) # type: ignore
 
-        try:
-            while not self.close_monitor and self.is_connected:
-                # ── 读取并显示设备输出 ──
-                try:
-                    got_serial = False
-                    while self.ser.in_waiting: # type: ignore
-                        got_serial = True
-                        chunk = self.ser.read(self.ser.in_waiting) # type: ignore
-                        text = chunk.decode("utf-8", errors="replace")
-                        for c in ("\x01", "\x02", "\x04"):
-                            text = text.replace(c, "")
-                        if text.startswith("OK") and _expect_ok:
-                            text = text[2:].lstrip("\r\n")
-                            _expect_ok = False
+        _in_error = False
+        _RED = "\033[31m"
+        _RST = "\033[0m"
 
+        try:
+            while self.is_connected:
+                # 串口 -> 终端（含 Traceback 错误高亮）
+                try:
+                    while self.ser.in_waiting: # type: ignore
+                        chunk = self.ser.read(self.ser.in_waiting) # type: ignore
+                        if not chunk:
+                            continue
+                        text = chunk.decode("utf-8", errors="replace")
                         if not text:
                             continue
 
-                        # 错误高亮逻辑
                         if _in_error:
-                            m = _re.search(r"(?:Error|Exception):[^\r\n]*", text)
+                            m = re.search(r"(?:Error|Exception):[^\r\n]*", text)
                             if m:
-                                # 红色覆盖到错误行末尾，之后恢复正常
                                 colored = text[: m.end()]
                                 rest = text[m.end() :]
-                                sys.stdout.write(RED + colored + RST + rest)
+                                sys.stdout.write(_RED + colored + _RST + rest)
                                 _in_error = False
                             else:
-                                sys.stdout.write(RED + text + RST)
+                                sys.stdout.write(_RED + text + _RST)
                         elif "Traceback" in text:
                             idx = text.index("Traceback")
                             sys.stdout.write(text[:idx])
                             after = text[idx:]
-                            m = _re.search(r"(?:Error|Exception):[^\r\n]*", after)
+                            m = re.search(r"(?:Error|Exception):[^\r\n]*", after)
                             if m:
                                 colored = after[: m.end()]
                                 rest = after[m.end() :]
-                                sys.stdout.write(RED + colored + RST + rest)
+                                sys.stdout.write(_RED + colored + _RST + rest)
                             else:
-                                sys.stdout.write(RED + after)
+                                sys.stdout.write(_RED + after)
                                 _in_error = True
                         else:
                             sys.stdout.write(text)
                         sys.stdout.flush()
-
-                    if got_serial and input_buffer:
-                        sys.stdout.write("\r\033[K> " + input_buffer)
-                        sys.stdout.flush()
                 except Exception:
                     break
 
-                # ── 非阻塞键盘输入 ──
-                if _kbhit():
-                    ch = _getch()
-
-                    if ch == b"\r":  # Enter - 发送命令执行
-                        sys.stdout.write(RST)
-                        print()
-                        if input_buffer:
-                            self._write(input_buffer.encode() + SET_EXECUTE)
-                            _expect_ok = True
-                            if not history or history[-1] != input_buffer:
-                                history.append(input_buffer)
-                        input_buffer = ""
-                        history_pos = -1
-                        saved_input = ""
-
-                    elif ch == b"\x03":  # Ctrl+C - 中断
-                        self._write(SET_RESET)
-                        input_buffer = ""
-                        history_pos = -1
-                        saved_input = ""
-                        sys.stdout.write(RST)
-                        print("^C")
-                        sys.stdout.flush()
-
-                    elif ch == b"\x04":  # Ctrl+D - 退出 REPL
-                        self.close_monitor = True
-                        sys.stdout.write(RST)
-                        print("^D")
-                        break
-
-                    elif ch in (b"\x08", b"\x7f"):  # 退格
-                        if input_buffer:
-                            input_buffer = input_buffer[:-1]
-                            sys.stdout.write("\b \b")
-                            sys.stdout.flush()
-
-                    elif ch == b"\xe0":  # 方向键 (Windows)
-                        ch2 = _getch()
-                        if ch2 == b"H" and history:  # Up
-                            if history_pos == -1:
-                                saved_input = input_buffer
-                            if history_pos == -1:
-                                history_pos = len(history) - 1
-                            elif history_pos > 0:
-                                history_pos -= 1
-                            sys.stdout.write("\r\033[K> ")
-                            input_buffer = history[history_pos]
-                            sys.stdout.write(input_buffer)
-                            sys.stdout.flush()
-                        elif ch2 == b"P" and history_pos >= 0:  # Down
-                            sys.stdout.write("\r\033[K> ")
-                            if history_pos < len(history) - 1:
-                                history_pos += 1
-                                input_buffer = history[history_pos]
+                # 键盘 -> 串口
+                try:
+                    if _WIN:
+                        if msvcrt.kbhit():
+                            ch = msvcrt.getch()
+                            if ch == b'\xe0':  # 扩展键（方向键/编辑键）
+                                ch2 = msvcrt.getch()
+                                seq = _EXT_KEYS.get(ch2)
+                                if seq:
+                                    self._write(seq)
+                            elif ch == b'\x00':  # 功能键（F1-F12 等）
+                                msvcrt.getch()  # 消费第二个字节，忽略
                             else:
-                                history_pos = -1
-                                input_buffer = saved_input
-                            sys.stdout.write(input_buffer)
-                            sys.stdout.flush()
-
-                    elif ch == b"\x1b":  # 方向键 (Unix)
-                        if _kbhit() and _getch() == b"[" and _kbhit():
-                            ch3 = _getch()
-                            if ch3 == b"A" and history:  # Up
-                                if history_pos == -1:
-                                    saved_input = input_buffer
-                                if history_pos == -1:
-                                    history_pos = len(history) - 1
-                                elif history_pos > 0:
-                                    history_pos -= 1
-                                sys.stdout.write("\r\033[K> ")
-                                input_buffer = history[history_pos]
-                                sys.stdout.write(input_buffer)
-                                sys.stdout.flush()
-                            elif ch3 == b"B" and history_pos >= 0:  # Down
-                                sys.stdout.write("\r\033[K> ")
-                                if history_pos < len(history) - 1:
-                                    history_pos += 1
-                                    input_buffer = history[history_pos]
-                                else:
-                                    history_pos = -1
-                                    input_buffer = saved_input
-                                sys.stdout.write(input_buffer)
-                                sys.stdout.flush()
-
-                    else:  # 可打印字符
-                        try:
-                            c = ch.decode("utf-8")
-                            if c.isprintable() or c == "\t":
-                                input_buffer += c
-                                sys.stdout.write(c)
-                                sys.stdout.flush()
-                        except UnicodeDecodeError:
-                            pass
+                                self._write(ch)
+                    else:
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            buf = os.read(sys.stdin.fileno(), 1)
+                            if not buf or buf == b'\x1d':  # Ctrl+] 退出
+                                break
+                            # ESC 开头可能是转义序列，完整读取后一次性发送
+                            if buf == b'\x1b':
+                                for _ in range(16):
+                                    if select.select([sys.stdin], [], [], 0.02)[0]:
+                                        b = os.read(sys.stdin.fileno(), 1)
+                                        if not b:
+                                            break
+                                        buf += b
+                                        if b in (b'~',) or (len(buf) >= 2 and b in b'ABCDHPQRS'):
+                                            break
+                                    else:
+                                        break
+                            self._write(buf)
+                except Exception:
+                    break
 
                 time.sleep(0.01)
-
         except KeyboardInterrupt:
             pass
         finally:
-            self.close_monitor = True
-            sys.stdout.write(RST)
-            print()
+            sys.stdout.buffer.write(b'\r\n')
+            sys.stdout.buffer.flush()
             if old_tty is not None:
                 try:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_tty) # type: ignore
@@ -697,9 +625,6 @@ class MicroPython:
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
-        if not self._in_raw:
-            self._enter_raw_repl()
-
         if manifest_path:
             from .manifest_loader import load_manifest
             entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
@@ -713,9 +638,80 @@ class MicroPython:
                     rp = os.path.join(remote_prefix, os.path.relpath(lp, local_dir)).replace("\\", "/")
                     entries.append((lp, rp))
 
-        if not entries:
+        # ── 预处理、预编译所有文件 ──
+        tmp_dirs = []
+        file_list = []  # [(remote_path, local_compiled_path, size)]
+
+        for lp, rp in entries:
+            # manifest.py 不上传
+            if Path(rp).name == "manifest.py":
+                print(f"  {_YELLOW}[WARN]{_RESET} '{rp}' 是编译所需文件，已跳过刷入")
+                continue
+            # .pyi 不处理
+            if lp.endswith(".pyi"):
+                continue
+
+            actual_local = lp
+            actual_remote = rp
+
+            # 条件编译预处理
+            if active_tags and actual_local.endswith(".py"):
+                from .preprocessor import preprocess
+                pp_dir = tempfile.mkdtemp()
+                tmp_dirs.append(pp_dir)
+                pp_path = os.path.join(pp_dir, Path(actual_local).name)
+                Path(pp_path).write_text(
+                    preprocess(Path(actual_local).read_text(encoding="utf-8"), active_tags, actual_local),
+                    encoding="utf-8",
+                )
+                actual_local = pp_path
+
+            # main.py / boot.py 不编译
+            should_compile = self.config["auto_compile"]
+            if Path(actual_remote).name in ("main.py", "boot.py"):
+                should_compile = False
+
+            # 编译 .py → .mpy
+            if should_compile and actual_local.endswith(".py"):
+                mpy_path, mpy_tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch)
+                if mpy_path:
+                    tmp_dirs.append(mpy_tmp_dir)
+                    actual_local = mpy_path
+                    actual_remote = actual_remote[:-3] + ".mpy"
+
+            file_list.append((actual_remote, actual_local, os.path.getsize(actual_local)))
+
+        if not file_list:
             print("  没有需要刷入的文件。")
             return []
+
+        # ── 进入原始 REPL ──
+        if not self._in_raw:
+            self._enter_raw_repl()
+
+        # ── 在设备上创建目录 ──
+        dirs = sorted({os.path.dirname(rp) for rp, _, _ in file_list if os.path.dirname(rp)})
+        for d in dirs:
+            try:
+                self._execute(
+                    "import os\n"
+                    "try:\n"
+                    f" os.mkdir({repr(d)})\n"
+                    "except OSError:\n"
+                    " pass"
+                )
+            except Exception:
+                pass
+
+        # ── 读取所有文件内容，构建元数据 ──
+        all_data = b""
+        file_meta = []  # [(size, remote_path), ...] — 替换到 FLASH_PROGRAM 中
+        for rp, lp, sz in file_list:
+            with open(lp, "rb") as f:
+                all_data += f.read()
+            file_meta.append((sz, rp))
+
+        script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
 
         should_close_log = False
         if not self._repl_log_file:
@@ -723,39 +719,48 @@ class MicroPython:
             should_close_log = True
             print(f"  {_GREEN}日志:{_RESET} {log_path}")
 
+        print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
+        for rp, lp, sz in file_list:
+            print(f"    {lp} -> {rp} ({sz} 字节)")
+
         try:
-            # 在设备上创建远程目录结构
-            dirs = sorted({
-                os.path.dirname(rp) for _, rp in entries if os.path.dirname(rp)
-            })
-            for d in dirs:
-                try:
-                    self._execute(
-                        "import os\n"
-                        "try:\n"
-                        f" os.mkdir({repr(d)})\n"
-                        "except OSError:\n"
-                        " pass"
-                    )
-                except Exception:
-                    pass
+            # 中断正在运行的程序
+            for _ in range(2):
+                self._write(SET_RESET)
+                time.sleep(0.1)
+            self.ser.reset_input_buffer()
 
-            # 逐个刷入
-            results = []
-            for lp, rp in entries:
-                try:
-                    if lp.endswith(".pyi"):
-                        continue
-                    self.flash_file(lp, rp, bytecode_ver=bytecode_ver, arch=arch, active_tags=active_tags)
-                    results.append((lp, rp, True))
-                except Exception as e:
-                    print(f"  {_RED}✗ {rp}: {e}{_RESET}")
-                    results.append((lp, rp, False))
+            self._write(ENTER_RAW_REPL)
+            time.sleep(0.1)
+            self._drain_rx_log()
 
-            return results
+            # 发送批量刷入脚本（包含所有文件大小与路径列表）
+            self._write(script.encode() + SET_EXECUTE)
+            time.sleep(0.3)
+            self._drain_rx_log()
+
+            # 按顺序发送所有文件内容
+            # 小文件自动合并到同一缓冲区，减少串口往返
+            total_size = len(all_data)
+            offset = 0
+            while offset < total_size:
+                chunk = all_data[offset:offset + DEFAULT_CHUNK_SIZE]
+                self._write(chunk)
+                offset += len(chunk)
+
+            self._drain_rx_log()
+
+            print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
+            return [(lp, rp, True) for (rp, lp, sz) in file_list]
+
+        except Exception as e:
+            print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
+            return [(lp, rp, False) for (rp, lp, sz) in file_list]
         finally:
             if should_close_log:
                 self._close_repl_log()
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
 
     def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
         """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""

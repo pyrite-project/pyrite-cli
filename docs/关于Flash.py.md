@@ -107,6 +107,7 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 | `timeout` | `int` | 超时 |
 | `_in_raw` | `bool` | 是否处于原始 REPL 模式 |
 | `_kbd_set` | `bool` | 是否已设置 `kbd_intr(-1)` |
+| `_repl_log_file` | `TextIO` 或 `None` | REPL 原始数据日志文件句柄 |
 
 ---
 
@@ -218,6 +219,43 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 
 ---
 
+### REPL 串口日志系统
+
+用于调试和排查刷入问题，自动记录所有串口收发数据到 `./log/` 目录。
+
+#### `_open_repl_log()`
+
+在 `./log/` 目录下创建以时间戳命名的日志文件（`flash_YYYYMMDD_HHMMSS.log`），以写模式打开。
+
+- 返回: `Path` — 日志文件路径
+
+#### `_close_repl_log()`
+
+关闭当前日志文件句柄（如果打开）。
+
+#### `_repl_log_ctx()`（上下文管理器）
+
+自动管理日志生命周期：进入时打开日志（如果尚未打开），退出时自动关闭。日志文件首次创建时打印文件路径。
+
+#### `_drain_rx_log()`
+
+非阻塞读取串口 RX 缓冲区中所有剩余数据并记录到日志。用于清空不必要的残留数据同时保留日志记录。
+
+#### `_log_repl_data(direction, data)`
+
+记录单次串口收发数据到日志文件。
+
+| 参数 | 说明 |
+|------|------|
+| `direction` | `"tx"` 表示写入，`"rx"` 表示读取 |
+| `data` | 原始 `bytes` 数据 |
+
+- 日志格式：`[HH:MM:SS] >>（tx）或 <<（rx）文本内容`
+- 控制字符（`\x01`–`\x05`）替换为可读名称 `<RAW>`、`<B>`、`<C>`、`<D>`、`<E>`
+- 纯控制字符/空白行额外输出 hex 表示
+
+---
+
 ### kbd_intr 保护
 
 刷入过程中，数据流中可能出现字节 `0x03`（Ctrl+C 字符）。默认情况下 MicroPython 收到 `\x03` 会触发 `KeyboardInterrupt` 并重启设备，导致刷入失败。
@@ -256,23 +294,22 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 1. 如果 `active_tags` 非空且文件为 `.py`，调用预处理器进行条件编译
 2. `manifest.py` 跳过上传；`main.py`/`boot.py` 以及 `.pyi` 文件不编译
 3. 若启用了编译且为 `.py`，调用 `_compile_to_mpy()`，成功则改刷 `.mpy`
-4. 发送两遍 `Ctrl+C` 中断设备
-5. 发送 `FLASH` 模板脚本（在设备端 `open(FILE, 'wb')` 并循环读取 stdin）
-6. 按 `DEFAULT_CHUNK_SIZE` 分块发送原始字节，以 `[fuck!]\n` 标记结束
-7. 打印刷入结果
+4. 发送 `FLASH` 模板脚本（含 `FSIZE` 文件大小占位符），设备端代为 `open(FILE, 'wb')` 并循环 `read(BFSIZE)` 直到收齐指定字节数
+5. 按 `DEFAULT_CHUNK_SIZE` 分块发送原始字节
+6. 打印刷入结果
 
-刷入流程（新）：
+刷入流程：
 
 ```
-连接 → 进入原始REPL → 预处理(条件编译) → 编译(可选) → 发送FLASH模板脚本
-→ 分块发送原始字节 → 设备端写入文件 → 完成
+连接 → 进入原始REPL → 预处理(条件编译) → 编译(可选) → 发送FLASH模板脚本(含文件大小)
+→ 分块发送原始字节 → 设备端计数接收并写入 → 完成
 ```
 
 - 引发: `FileNotFoundError` — 本地文件不存在
 
 #### `flash_program(local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None)`
 
-将整个目录树递归上传到 MicroPython 设备。
+将整个目录树批量上传到 MicroPython 设备（一次脚本注入 + 一次数据流，而非逐个文件刷入）。
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
@@ -284,10 +321,11 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 | `manifest_path` | 否 | manifest.py 路径（控制哪些文件刷入） |
 
 流程：
-1. 如提供 `manifest_path`，通过 `manifest_loader` 解析刷入清单
-2. 否则扫描目录，收集所有 `.py` 文件
-3. 在设备上创建所需的所有子目录（`os.mkdir()`）
-4. 逐个文件调用 `flash_file()`
+1. **收集文件清单** — 如提供 `manifest_path`，通过 `manifest_loader` 解析；否则递归扫描目录收集所有 `.py` 文件
+2. **一站式预处理** — 对所有文件进行条件编译预处理和 `.py → .mpy` 编译（一轮遍历，跳过 manifest.py 和 .pyi）
+3. **批量创建目录** — 在设备上通过一次 `_execute()` 调用创建所有需要的子目录（减少 N-1 次串口往返）
+4. **发送 FLASH_PROGRAM 模板** — 注入 `FLASH_PROGRAM` 脚本，其中 `FILES` 替换为 `[(size, remote_path), ...]` 元组列表，设备端按序逐个文件 `open()` + `read()` 写入
+5. **一次流式传输** — 将所有文件内容拼接后，按 `DEFAULT_CHUNK_SIZE` 分块一次发送完毕
 
 - 返回: `list[tuple(local_path, remote_path, success)]` — 每个文件的刷入结果
 
@@ -339,11 +377,11 @@ mp.run("import machine; print(machine.freq())")
 
 #### `repl_()`
 
-连接到 MicroPython 设备的交互式终端。将串口输出实时显示到终端，同时支持非阻塞键盘输入命令。
+连接到 MicroPython 设备的交互式终端（串口透传模式）。将串口输出实时显示到终端，键盘输入透传到设备。
 
-**设计特点**：单循环架构，不依赖独立读线程/写线程，无 `input()` 调用。
+**设计特点**：单循环架构，不依赖独立读线程/写线程。一次串口循环内同时处理设备→终端和键盘→串口两个方向的数据流。
 
-**跨平台键盘输入**：
+**跨平台非阻塞键盘输入**：
 
 | 平台 | 非阻塞检测 | 读键 |
 |------|-----------|------|
@@ -352,38 +390,36 @@ mp.run("import machine; print(machine.freq())")
 
 - Unix 下临时切换终端为 cbreak 模式（关闭 `ECHO`/`ICANON`/`ISIG`），退出时自动恢复
 
-**ANSI 高亮**：
+**ANSI 错误高亮**：
+
+调用 `_colorize_repl_output()` 实时扫描串口输出：
 
 | 场景 | 效果 |
 |------|------|
-| Traceback 到错误行 | 红色字（`\033[31m`），覆盖完整错误行（`NameError: message`） |
-| Traceback + 错误行在同一串口包 | 精准截断，仅错误区域红色 |
-| Traceback 和错误行跨多包 | 状态持续，错误行到来后自动关闭红色 |
+| 单包内包含完整的 Traceback → Error 行 | 精准截断，仅错误部分渲染红色 |
+| Traceback 和 Error 行跨多包到达 | 状态持续跟踪 `in_error` 标志，Error 行到达后自动关闭红色 |
 
-**串口输出净化**：
+**Windows 扩展键映射**：
 
-- 过滤原始 REPL 控制字符：`\x01`（Ctrl+A）、`\x02`（Ctrl+B）、`\x04`（Ctrl+D）
-- 在发送命令后等待 `OK` 响应（`_expect_ok`），将其从输出中移除
+方向键和编辑键的 `\xe0` 前缀序列映射为 ANSI 转义序列后透传：
 
-**快捷键**：
-
-| 按键 | 行为 |
-|------|------|
-| `Enter` | 发送输入缓存的代码 + `Ctrl+D` 到原始 REPL 执行 |
-| `Ctrl+C` | 向设备发送 `\x03` 中断，清空输入缓存 |
-| `Ctrl+D` | 退出 REPL 会话 |
-| `Backspace` | 删除输入缓存末尾字符 |
-| `↑ / ↓` | 历史命令导航（输入保留未提交内容） |
+| 原始键 | 映射发送 |
+|--------|---------|
+| ↑ / ↓ / → / ← | `\x1b[A` / `\x1b[B` / `\x1b[C` / `\x1b[D` |
+| Home / End | `\x1b[H` / `\x1b[F` |
+| Delete | `\x1b[3~` |
+| Insert | `\x1b[2~` |
 
 **循环逻辑**：
 
 ```
-while 已连接:
-    读取串口数据 → 净化 → 错误高亮 → 输出到终端
-    如有输入缓存 → 重绘输入行
-    非阻塞检测键盘 → 有按键则处理（Enter/Ctrl+C/字符等）
+中断设备进入普通 REPL → while 已连接:
+    串口有数据 → 读取 → 错误高亮 → 输出到终端
+    键盘有按键 → 读取 → 透传到串口
     sleep(0.01)
 ```
+
+**退出**：Unix 下 `Ctrl+C` 退出会话；Windows 下无特殊退出键，直接 `Ctrl+Break` 或关闭窗口。
 
 ---
 
@@ -412,30 +448,57 @@ with MicroPython(port="COM3") as mp:
 
 ---
 
-## FLASH 模板脚本
+## FLASH 模板脚本（单文件刷入）
 
-刷入时注入到设备的 Python 脚本，负责在设备端接收数据并写入文件：
+刷入单个文件时注入到设备的 Python 脚本，负责在设备端接收数据并写入文件：
 
 ```python
 import sys,micropython
+
 micropython.kbd_intr(-1)
 usb = sys.stdin.buffer
-buf = b''
-with open(FILE, 'wb') as f:
-    while True:
+
+f_size = FSIZE
+with open("FILE", 'wb') as f:
+    while f_size:
         ln = usb.read(BFSIZE)
         if ln:
             f.flush()
-            if (buf + ln).endswith(b'[fuck!]\n') or ln.endswith(b'[fuck!]\n'):
-                f.write(ln[:-8])
-                break
             f.write(ln)
-            buf = ln
+            f_size -= len(ln)
+            print(f_size)
 micropython.kbd_intr(3)
 ```
 
-- `BFSIZE` 替换为 `DEFAULT_CHUNK_SIZE`，`FILE` 替换为设备上目标路径
-- 以 `[fuck!]\n` 标记数据结束
+- `FSIZE` 替换为文件总字节数，`FILE` 替换为设备上目标路径，`BFSIZE` 替换为 `DEFAULT_CHUNK_SIZE`
+- 设备端精确计数接收：每收到一块数据减去长度，剩余 0 时关闭文件
+- 每块写入后打印剩余大小，PC 端可借此判断进度（当前未利用此信息）
+
+## FLASH_PROGRAM 模板脚本（批量刷入）
+
+刷入整个目录时注入的脚本，一次处理多个文件：
+
+```python
+import sys, micropython
+
+micropython.kbd_intr(-1)
+usb = sys.stdin.buffer
+
+entries = FILES
+for file_size, file_path in entries:
+    with open(file_path, 'wb') as f:
+        remaining = file_size
+        while remaining:
+            chunk = usb.read(min(remaining, BFSIZE))
+            if chunk:
+                f.write(chunk)
+                remaining -= len(chunk)
+micropython.kbd_intr(3)
+```
+
+- `FILES` 替换为 `[(size, remote_path), ...]` 元组列表
+- PC 端将所有文件内容拼接为连续字节流，设备端按 `FILES` 中的尺寸依次切分写入
+- 无需逐个文件往返，一次脚本注入 + 一次数据流即可刷完整个目录
 
 ---
 

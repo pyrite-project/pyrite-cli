@@ -45,9 +45,9 @@ micropython.kbd_intr(-1)
 usb = sys.stdin.buffer
 
 f_size = FSIZE
-with open("FILE", 'wb') as f:
+with open(FILE, 'wb') as f:
     while f_size:
-        ln = usb.read(BFSIZE)
+        ln = usb.read(min(BFSIZE, f_size))
         if ln:
             f.flush()
             f.write(ln)
@@ -82,6 +82,8 @@ def _load_config():
         "chunk_size": DEFAULT_CHUNK_SIZE,
         "download_threads": 4,
         "auto_compile": True,
+        "verify": "size",
+        "max_retries": 2,
         "board_tags": dict(_DEFAULT_BOARD_TAGS),
     }
     cwd = Path.cwd()
@@ -97,6 +99,12 @@ def _load_config():
                     cfg["download_threads"] = min(t, 12)
                 if isinstance(data.get("auto_compile"), bool):
                     cfg["auto_compile"] = data["auto_compile"]
+                v = data.get("verify", "size")
+                if v in ("off", "size", "crc32"):
+                    cfg["verify"] = v
+                r = data.get("max_retries", 2)
+                if isinstance(r, int) and r >= 0:
+                    cfg["max_retries"] = r
             except (json.JSONDecodeError, OSError):
                 pass
             break
@@ -550,6 +558,60 @@ class MicroPython:
         if "Traceback" in text:
             raise RuntimeError(f"设备写入错误:\n{text}")
 
+    @staticmethod
+    def _compute_crc32(data: bytes) -> int:
+        """计算数据的 CRC32 校验值。"""
+        import binascii
+        return binascii.crc32(data) & 0xffffffff
+
+    def _verify_file_on_device(self, remote_path: str, expected_size: int,
+                                verify_mode: str = "size",
+                                expected_crc: int | None = None) -> bool:
+        """验证设备上的文件与预期一致。
+
+        在原始 REPL 中执行验证命令，比较文件大小和可选的 CRC32。
+
+        Args:
+            remote_path: 设备上的文件路径
+            expected_size: 期望的文件大小（字节）
+            verify_mode: 校验模式 — "size" 或 "crc32"
+            expected_crc: 期望的 CRC32 值（verify_mode="crc32" 时必需）
+
+        Returns:
+            True 表示校验通过，False 表示失败
+        """
+        try:
+            remote_lit = repr(remote_path)
+            out = self._execute(
+                f"import os; print(os.stat({remote_lit})[6])", timeout=5
+            )
+            actual_size = int(out.strip().splitlines()[-1])
+        except Exception as e:
+            print(f"  {_RED}文件大小校验失败: {e}{_RESET}")
+            return False
+
+        if actual_size != expected_size:
+            print(f"  {_RED}大小不匹配: 期望 {expected_size} 字节, 实际 {actual_size} 字节{_RESET}")
+            return False
+
+        if verify_mode == "crc32" and expected_crc is not None:
+            try:
+                crc_out = self._execute(
+                    "import ubinascii\n"
+                    f"with open({remote_lit},'rb') as f:\n"
+                    " print(ubinascii.crc32(f.read()))",
+                    timeout=15,
+                )
+                actual_crc = int(crc_out.strip().splitlines()[-1]) & 0xffffffff
+                if actual_crc != expected_crc:
+                    print(f"  {_RED}CRC32 不匹配: 期望 {expected_crc:#x}, 实际 {actual_crc:#x}{_RESET}")
+                    return False
+                print(f"  {_GREEN}CRC32 校验通过{_RESET}")
+            except Exception as e:
+                print(f"  {_YELLOW}[警告]{_RESET} CRC32 校验不可用 ({e})，仅验证文件大小")
+
+        return True
+
     def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None, arch=None, active_tags=None):
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
@@ -587,35 +649,68 @@ class MicroPython:
 
         file_size = os.path.getsize(actual_local)
         chunk_size = self.config["chunk_size"]
+        verify_mode = self.config.get("verify", "size")
+        max_retries = self.config.get("max_retries", 2)
+
+        # 预计算 CRC32（如果需要）
+        expected_crc = None
+        if verify_mode == "crc32":
+            with open(actual_local, "rb") as f:
+                expected_crc = self._compute_crc32(f.read())
 
         print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
 
-        with self._repl_log_ctx():
-            try:
-                self._enter_raw_repl()
+        try:
+            with self._repl_log_ctx():
+                for attempt in range(max_retries + 1):
+                    self._enter_raw_repl()
 
-                self._drain_rx_log()
-                self._write(FLASH.replace("FILE", actual_remote).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE)).replace("FSIZE", str(file_size)))
-                self._write(SET_EXECUTE)
-                time.sleep(0.3)
-                self._drain_rx_log()
+                    if attempt > 0:
+                        print(f"  {_YELLOW}[重试 {attempt}/{max_retries}]{_RESET}")
 
-                with open(actual_local, 'rb') as f:
-                    for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
-                        self._write(f.read(DEFAULT_CHUNK_SIZE))
+                    try:
+                        self._drain_rx_log()
+                        self._write(
+                            FLASH.replace("FILE", repr(actual_remote))
+                            .replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
+                            .replace("FSIZE", str(file_size))
+                        )
+                        self._write(SET_EXECUTE)
+                        time.sleep(0.3)
+                        self._drain_rx_log()
 
-                self._drain_rx_log()
-                print(f"  {_GREEN}✓ 刷入成功{_RESET}")
+                        with open(actual_local, 'rb') as f:
+                            for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
+                                self._write(f.read(DEFAULT_CHUNK_SIZE))
 
-            except Exception:
-                try:
-                    self._execute("f.close()", timeout=2)
-                except Exception:
-                    pass
-                raise
-            finally:
-                for d in tmp_dirs:
-                    shutil.rmtree(d, ignore_errors=True)
+                        self._drain_rx_log()
+
+                        # 等待设备返回原始 REPL 提示符，确保刷入完成
+                        self._read_until(b">", timeout=5)
+
+                        # ── 刷入后校验 ──
+                        if verify_mode != "off":
+                            ok = self._verify_file_on_device(
+                                actual_remote, file_size, verify_mode, expected_crc
+                            )
+                            if not ok:
+                                raise RuntimeError("校验失败")
+                            print(f"  {_GREEN}✓ 刷入成功{_RESET}")
+                        else:
+                            print(f"  {_GREEN}✓ 刷入成功 (校验已关闭){_RESET}")
+                        return  # 成功
+
+                    except Exception as e:
+                        if attempt >= max_retries:
+                            raise
+                        print(f"  {_YELLOW}{e}，准备重试 ({attempt+1}/{max_retries})...{_RESET}")
+                        try:
+                            self._execute("f.close()", timeout=2)
+                        except Exception:
+                            pass
+        finally:
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
 
     def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None):
         if not os.path.isdir(local_dir):
@@ -640,6 +735,8 @@ class MicroPython:
         file_list = []    # [(remote_path, local_compiled_path, size)]
         file_meta = []    # [(size, remote_path), ...] → 替换到 FLASH_PROGRAM
         all_data = b""
+        verify_mode = self.config.get("verify", "size")
+        expected_crcs = {}   # {remote_path: crc32} 用于校验
 
         for lp, rp in entries:
             if Path(rp).name == "manifest.py" or lp.endswith(".pyi"):
@@ -673,6 +770,8 @@ class MicroPython:
             with open(actual_local, "rb") as f:
                 content = f.read()
             file_list.append((actual_remote, actual_local, len(content)))
+            if verify_mode == "crc32":
+                expected_crcs[actual_remote] = self._compute_crc32(content)
             all_data += content
             file_meta.append((len(content), actual_remote))
 
@@ -680,51 +779,95 @@ class MicroPython:
             print("  没有需要刷入的文件。")
             return []
 
-        # ── 进入原始 REPL ──
-        if not self._in_raw:
-            self._enter_raw_repl()
+        max_retries = self.config.get("max_retries", 2)
 
-        # ── 批量创建设备目录（一次执行，N-1 次往返节省） ──
-        dirs = sorted({os.path.dirname(rp) for rp, _, _ in file_list if os.path.dirname(rp)})
-        if dirs:
-            mkdir_cmds = (
-                "import os\n"
-                f"for d in {dirs!r}:\n"
-                "    try:\n"
-                "        os.mkdir(d)\n"
-                "    except OSError:\n"
-                "        pass\n"
-            )
-            self._execute(mkdir_cmds)
+        try:
+            for attempt in range(max_retries + 1):
+                self._enter_raw_repl()
 
-        # ── 发送刷入脚本 ──
-        script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
+                if attempt > 0:
+                    print(f"  {_YELLOW}[重试 {attempt}/{max_retries}]{_RESET}")
 
-        with self._repl_log_ctx():
-            print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
-            for rp, lp, sz in file_list:
-                print(f"    {lp} -> {rp} ({sz} 字节)")
+                # ── 批量创建设备目录（一次执行，N-1 次往返节省） ──
+                dirs = sorted({os.path.dirname(rp) for rp, _, _ in file_list if os.path.dirname(rp)})
+                if dirs:
+                    mkdir_cmds = (
+                        "import os\n"
+                        f"for d in {dirs!r}:\n"
+                        "    try:\n"
+                        "        os.mkdir(d)\n"
+                        "    except OSError:\n"
+                        "        pass\n"
+                    )
+                    self._execute(mkdir_cmds)
 
-            try:
-                self._write(script.encode() + SET_EXECUTE)
-                time.sleep(0.3)
-                self._drain_rx_log()
+                # ── 发送刷入脚本 ──
+                script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
 
-                for offset in range(0, len(all_data), DEFAULT_CHUNK_SIZE):
-                    self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
+                with self._repl_log_ctx():
+                    print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
+                    for rp, lp, sz in file_list:
+                        print(f"    {lp} -> {rp} ({sz} 字节)")
 
-                self._drain_rx_log()
+                    try:
+                        self._write(script.encode() + SET_EXECUTE)
+                        time.sleep(0.3)
+                        self._drain_rx_log()
 
-                total_size = len(all_data)
-                print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
-                return [(lp, rp, True) for (rp, lp, sz) in file_list]
+                        for offset in range(0, len(all_data), DEFAULT_CHUNK_SIZE):
+                            self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
 
-            except Exception as e:
-                print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
-                return [(lp, rp, False) for (rp, lp, sz) in file_list]
-            finally:
-                for d in tmp_dirs:
-                    shutil.rmtree(d, ignore_errors=True)
+                        self._drain_rx_log()
+
+                        # 等待设备返回原始 REPL 提示符
+                        self._read_until(b">", timeout=10)
+
+                        # ── 校验 ──
+                        if verify_mode != "off":
+                            failed_files = []
+                            for rp, lp, sz in file_list:
+                                ok = self._verify_file_on_device(
+                                    rp, sz, verify_mode, expected_crcs.get(rp)
+                                )
+                                if not ok:
+                                    failed_files.append((lp, rp))
+
+                            if failed_files:
+                                if attempt >= max_retries:
+                                    print(f"  {_RED}✗ {len(failed_files)} 个文件校验失败，重试耗尽{_RESET}")
+                                    return [(lp, rp, False) for (rp, lp, sz) in file_list]
+
+                                print(f"  {_YELLOW}{len(failed_files)} 个文件校验失败，"
+                                      f"使用单文件模式逐文件重试...{_RESET}")
+                                retry_ok = 0
+                                for lp, rp in failed_files:
+                                    try:
+                                        self.flash_file(
+                                            lp, rp, compile=None,
+                                            bytecode_ver=bytecode_ver, arch=arch,
+                                            active_tags=active_tags,
+                                        )
+                                        retry_ok += 1
+                                    except Exception as e2:
+                                        print(f"  {_RED}重试失败 {rp}: {e2}{_RESET}")
+                                if retry_ok == len(failed_files):
+                                    print(f"  {_GREEN}✓ 全部重试成功{_RESET}")
+                                    break  # 成功，退出重试循环
+                                # 仍有失败，继续外层重试
+                                continue
+
+                        total_size = len(all_data)
+                        print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
+                        return [(lp, rp, True) for (rp, lp, sz) in file_list]
+
+                    except Exception as e:
+                        if attempt >= max_retries:
+                            print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
+                            return [(lp, rp, False) for (rp, lp, sz) in file_list]
+                        print(f"  {_YELLOW}刷入过程异常，准备重试 ({attempt+1}/{max_retries})...{_RESET}")
+        finally:
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
 
     def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
         """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""
@@ -790,6 +933,8 @@ def create_default_config():
             "chunk_size": DEFAULT_CHUNK_SIZE,
             "download_threads": 4,
             "auto_compile": True,
+            "verify": "size",
+            "max_retries": 2,
         }, indent=2),
         encoding="utf-8",
     )
@@ -797,4 +942,6 @@ def create_default_config():
     print(f"  chunk_size = {DEFAULT_CHUNK_SIZE} 字节（修改后需重启本工具）")
     print("  download_threads = 4（存根下载线程数，范围 1~12）")
     print("  auto_compile = true（自动编译 .py -> .mpy，设为 false 可关闭）")
+    print('  verify = "size"（校验模式：off=不校验, size=文件大小, crc32=文件大小+CRC32）')
+    print("  max_retries = 2（校验失败时最大重试次数，设为 0 关闭重试）")
     return cfg_path

@@ -1,6 +1,6 @@
 # `Flash.py` — MicroPython 设备刷入工具
 
-通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录，并提供交互式 REPL 终端、自动编译 `.py → .mpy`、条件编译等能力。
+通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录，并提供交互式 REPL 终端、自动编译 `.py → .mpy`、条件编译、增量刷入等能力。
 
 ---
 
@@ -12,7 +12,9 @@
 {
   "chunk_size": 4096,
   "download_threads": 4,
-  "auto_compile": true
+  "auto_compile": true,
+  "verify": "size",
+  "max_retries": 2
 }
 ```
 
@@ -21,6 +23,8 @@
 | `chunk_size` | `4096` | 每次写入的最大数据量（字节），越大 REPL 往返越少，但单次缓冲区压力越大 |
 | `download_threads` | `4` | 存根下载并发线程数，范围 1–12 |
 | `auto_compile` | `true` | 是否自动编译 `.py` → `.mpy`，设为 `false` 可关闭 |
+| `verify` | `"size"` | 刷入后校验模式: `off`=不校验, `size`=文件大小, `crc32`=文件大小+CRC32 |
+| `max_retries` | `2` | 校验失败时最大重试次数，设为 `0` 关闭重试 |
 
 不创建此文件也可正常使用，会使用默认值。
 
@@ -42,6 +46,8 @@ C3 = ["ESP32", "wifi"]
 |------|-----|------|
 | `CONFIG_FILE` | `".pyrite_config.json"` | 配置文件名 |
 | `DEFAULT_CHUNK_SIZE` | `4096` | 默认块大小（字节） |
+| `HASH_CONFIG_FILE` | `"pyrite_file_config.json"` | 哈希配置文件名 |
+| `_HASH_VERSION` | `1` | 哈希配置文件格式版本 |
 | `_DEFAULT_BOARD_TAGS` | 内置字典 | 默认板级标签映射 |
 | `ENTER_RAW_REPL` | `b'\x01'` | Ctrl+A — 进入原始 REPL |
 | `EXIT_RAW_REPL` | `b'\x02'` | Ctrl+B — 退出原始 REPL |
@@ -57,7 +63,7 @@ C3 = ["ESP32", "wifi"]
 
 从当前目录及上级目录查找并加载 `.pyrite_config.json`，同时扫描 `pyproject.toml` 中的 `[tool.pyrite.board_tags]` 并合并到内置标签。
 
-- 返回: `dict`，包含 `chunk_size`、`download_threads`、`auto_compile`、`board_tags`
+- 返回: `dict`，包含 `chunk_size`、`download_threads`、`auto_compile`、`verify`、`max_retries`、`board_tags`
 
 ### `_compile_to_mpy(local_path, bytecode_ver=None, arch=None)`
 
@@ -72,15 +78,40 @@ C3 = ["ESP32", "wifi"]
 - 返回: `(tmp_mpy_path, tmp_dir)`，失败返回 `(None, None)`
 - 回退策略：编译失败时静默打印警告并回退到原始 `.py`
 
+### `_compile_files_parallel(local_paths, bytecode_ver=None, arch=None, max_workers=4)`
+
+并行编译多个 `.py` → `.mpy`（`ThreadPoolExecutor`）。在 `flash_program` 中使用以加速批量刷入前的编译阶段。
+
+| 参数 | 说明 |
+|------|------|
+| `local_paths` | 本地 `.py` 路径列表 |
+| `bytecode_ver` | mpy 字节码版本 |
+| `arch` | 目标架构 |
+| `max_workers` | 最大并行数 |
+
+- 返回: `dict {local_path: (mpy_path, tmp_dir)}`，编译失败值为 `(None, None)`
+
+### `_grep_size_after_ok(buf)`
+
+从串口原始字节流中查找 `OK<size>\n` 并解析文件大小。用于 bytes 协议下载。
+
+### `_grep_raw_start(buf)`
+
+返回原始数据在字节流中的起始下标（跳过 `OK<size>\n` 协议前缀）。
+
+### `_extract_raw_bytes(buf, expected_size)`
+
+从串口字节流中提取原始文件数据，去除协议前缀和尾部 `\x04` 标记。
+
 ### `create_default_config()`
 
-在工作目录创建一个默认的 `.pyrite_config.json`（含 `chunk_size`、`download_threads`、`auto_compile`）。
+在工作目录创建一个默认的 `.pyrite_config.json`（含 `chunk_size`、`download_threads`、`auto_compile`、`verify`、`max_retries`）。
 
 ---
 
 ## `class MicroPython`
 
-MicroPython 设备操作类。封装了串口扫描、连接、原始 REPL 通信、kbd_intr 保护、文件刷入、REPL 交互终端等全部功能。
+MicroPython 设备操作类。封装了串口扫描、连接、原始 REPL 通信、kbd_intr 保护、文件刷入、REPL 交互终端、增量刷入、设备文件管理等全部功能。
 
 ### 构造方法
 
@@ -94,14 +125,14 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 | `baudrate` | `int` | `115200` | 波特率 |
 | `timeout` | `int` | `10` | 串口读写超时（秒） |
 
-构造时自动加载配置（`_load_config`）。
+构造时自动加载配置（`_load_config`），`ser` 初始化为未打开的 `serial.Serial()` 对象。
 
 **实例属性**：
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
 | `config` | `dict` | 合并后的配置 |
-| `ser` | `Serial` 或 `None` | pySerial 串口对象 |
+| `ser` | `Serial` | pySerial 串口对象（始终有效，`is_open` 判断是否已连接） |
 | `port` | `str` | 串口号 |
 | `baudrate` | `int` | 波特率 |
 | `timeout` | `int` | 超时 |
@@ -152,7 +183,7 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 
 #### `is_connected`（属性）
 
-`bool` — 是否已连接且串口已打开。
+`bool` — 串口对象 `ser.is_open` 的快捷访问。
 
 ---
 
@@ -275,6 +306,22 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 
 ---
 
+### 哈希工具（内部）
+
+#### `_compute_file_hash(filepath)`（static）
+
+计算文件的 SHA256 哈希值（1MB 分块读取）。
+
+- 返回: `str` — 十六进制哈希字符串
+
+#### `_collect_project_files(local_dir, active_tags=None, manifest_path=None)`
+
+收集项目中可刷入的文件列表（与 `flash_program` 规则一致）。支持 manifest 和目录递归两种模式，自动过滤 `manifest.py` 和 `.pyi` 文件。
+
+- 返回: `list[(local_abs_path, remote_path)]`
+
+---
+
 ### 文件刷入
 
 #### `flash_file(local_path, remote_path=None, compile=None, bytecode_ver=None, arch=None, active_tags=None)`
@@ -296,20 +343,20 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 3. 若启用了编译且为 `.py`，调用 `_compile_to_mpy()`，成功则改刷 `.mpy`
 4. 发送 `FLASH` 模板脚本（含 `FSIZE` 文件大小占位符），设备端代为 `open(FILE, 'wb')` 并循环 `read(BFSIZE)` 直到收齐指定字节数
 5. 按 `DEFAULT_CHUNK_SIZE` 分块发送原始字节
-6. 打印刷入结果
+6. 刷入后校验（依据 `verify` 配置）
 
 刷入流程：
 
 ```
 连接 → 进入原始REPL → 预处理(条件编译) → 编译(可选) → 发送FLASH模板脚本(含文件大小)
-→ 分块发送原始字节 → 设备端计数接收并写入 → 完成
+→ 分块发送原始字节 → 设备端计数接收并写入 → 校验 → 完成
 ```
 
 - 引发: `FileNotFoundError` — 本地文件不存在
 
 #### `flash_program(local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None)`
 
-将整个目录树批量上传到 MicroPython 设备（一次脚本注入 + 一次数据流，而非逐个文件刷入）。
+将整个目录树批量上传到 MicroPython 设备（一次脚本注入 + 一次数据流）。
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
@@ -320,14 +367,106 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 | `active_tags` | 否 | 条件编译 tags 集合 |
 | `manifest_path` | 否 | manifest.py 路径（控制哪些文件刷入） |
 
-流程：
-1. **收集文件清单** — 如提供 `manifest_path`，通过 `manifest_loader` 解析；否则递归扫描目录收集所有 `.py` 文件
-2. **一站式预处理** — 对所有文件进行条件编译预处理和 `.py → .mpy` 编译（一轮遍历，跳过 manifest.py 和 .pyi）
-3. **批量创建目录** — 在设备上通过一次 `_execute()` 调用创建所有需要的子目录（减少 N-1 次串口往返）
-4. **发送 FLASH_PROGRAM 模板** — 注入 `FLASH_PROGRAM` 脚本，其中 `FILES` 替换为 `[(size, remote_path), ...]` 元组列表，设备端按序逐个文件 `open()` + `read()` 写入
-5. **一次流式传输** — 将所有文件内容拼接后，按 `DEFAULT_CHUNK_SIZE` 分块一次发送完毕
+流程（三阶段）：
+1. **收集与预处理** — 收集 `.py` 文件清单，条件编译预处理
+2. **并行编译** — 使用 `_compile_files_parallel()` 多线程并发 `mpy-cross`
+3. **批量写入** — 批量创建目录 → 发送 `FLASH_PROGRAM` 脚本 → 一次流式传输所有文件
 
 - 返回: `list[tuple(local_path, remote_path, success)]` — 每个文件的刷入结果
+
+---
+
+### 增量刷入（project 功能）
+
+#### `project_scan(local_dir, hash_config_path=None, active_tags=None, manifest_path=None)`
+
+扫描项目目录，计算所有可刷入文件的 SHA256 哈希并保存到 `pyrite_file_config.json`。无需串口连接。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `local_dir` | — | 项目目录路径 |
+| `hash_config_path` | `local_dir/pyrite_file_config.json` | 哈希配置文件输出路径 |
+| `active_tags` | `None` | 条件编译 tags |
+| `manifest_path` | `None` | manifest.py 路径 |
+
+- 返回: 配置文件路径
+
+配置文件格式：
+
+```json
+{
+  "version": 1,
+  "hash_algorithm": "sha256",
+  "files": {
+    "main.py": "e3b0c44298fc...",
+    "lib/utils.py": "01ba4719c80b..."
+  }
+}
+```
+
+#### `project_flash(local_dir, remote_prefix, hash_config_path=None, bytecode_ver=None, arch=None, active_tags=None, manifest_path=None)`
+
+加载哈希配置，比对当前哈希，仅刷入新增或已更改的文件。需先 `connect()`。
+
+流程：
+1. 加载配置 → 扫描当前项目 → 计算哈希并比对
+2. 标记 [新增] 或 [已更改] 的文件
+3. 逐文件调用 `flash_file()` 刷入
+4. 更新哈希配置（仅记录成功刷入的文件）
+
+- 返回: `list[tuple(local_path, remote_path, success)]`
+
+#### `project_status(local_dir, remote_prefix, hash_config_path=None, active_tags=None, manifest_path=None)`
+
+比对本地哈希和设备端文件大小，显示差异清单（不刷入）。需先 `connect()`。
+
+显示状态：`[新增]`（本地有/设备无）、`[变更]`（本地哈希变化）、`[删除]`（配置中有/项目中已移除）。
+
+#### `project_pull(local_dir, remote_prefix, hash_config_path=None, active_tags=None, manifest_path=None, dry_run=False)`
+
+从设备下载所有项目文件到本地（在线备份）。通过 bytes 协议传输，兼容二进制文件。
+
+支持 `dry_run=True` 预览模式（仅列出，不下载）。
+
+---
+
+### 设备文件管理
+
+以下方法用于操作设备上的文件系统。
+
+#### `_read_device_file(remote_path)`
+
+从设备读取文件内容（原始字节传输）。协议：设备先输出文件大小（文本行），再通过 `stdout.buffer` 输出原始字节。PC 端读取全部串口数据后解析。
+
+- 返回: `bytes` — 完整的文件内容
+
+#### `_check_device_files(remote_paths)`
+
+批量检查设备文件存在性和大小。
+
+- 返回: `dict {remote_path: size}`，不存在的文件 `size = -1`
+
+#### `fs_ls(remote_path="/")`
+
+列出设备目录下的文件和子目录，返回包含 `name`、`type`（`F`/`D`）、`size` 的字典列表。
+
+#### `fs_rm(remote_path)`
+
+删除设备上的文件或空目录。
+
+- 返回: `bool` — 是否成功
+
+#### `fs_cat(remote_path)`
+
+读取设备上文本文件的内容。
+
+- 返回: `str`
+
+#### `fs_get(remote_path, local_path)`
+
+从设备下载文件到本地路径。调用 `_read_device_file()` 获取原始字节后写入本地。
+
+- 返回: `int` — 文件大小（字节）
 
 ---
 
@@ -445,6 +584,7 @@ with MicroPython(port="COM3") as mp:
 | 本地文件不存在 | `FileNotFoundError` |
 | 目录无效 | `NotADirectoryError` |
 | 无法进入原始 REPL | `RuntimeError`，含设备原始响应 |
+| 设备文件读取超时/不完整 | `RuntimeError`，含已接收字节数 |
 
 ---
 
@@ -523,3 +663,7 @@ pyrcli scan
 **Q: 支持哪些 MicroPython 设备？**
 
 任何支持原始 REPL（Ctrl+A）并通过串口连接的 MicroPython 设备均可，包括但不限于 ESP32、ESP8266、RP2040 (Raspberry Pi Pico)、PYBoard 等。
+
+**Q: `ser` 为什么不再初始化为 `None`？**
+
+VSCode 类型检查会将 `self.ser = None` 推导为 `Optional[Serial]`，后续所有 `self.ser.xxx` 调用都需要判空或 `# type: ignore`。改用 `self.ser = serial.Serial()`（未打开的串口对象）后类型恒为 `Serial`，消除冗余的类型标注。

@@ -1,7 +1,10 @@
 import os
 import time
 import json
+import binascii
+import hashlib
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import re
 import shutil
@@ -24,6 +27,9 @@ except ImportError:
 
 CONFIG_FILE = ".pyrite_config.json"
 DEFAULT_CHUNK_SIZE = 4096  # 单位:字节
+
+HASH_CONFIG_FILE = "pyrite_file_config.json"
+_HASH_VERSION = 1
 
 _DEFAULT_BOARD_TAGS = {
     "ESP32":  ["ESP32", "wifi"],
@@ -52,7 +58,6 @@ with open(FILE, 'wb') as f:
             f.flush()
             f.write(ln)
             f_size -= len(ln)
-            print(f_size)
 micropython.kbd_intr(3)
 """
 
@@ -146,6 +151,84 @@ def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None)
     return None, None
 
 
+def _compile_files_parallel(local_paths: list, bytecode_ver: int = None,
+                            arch: str = None, max_workers: int = 4):
+    """并行编译多个 .py → .mpy。
+
+    Args:
+        local_paths: 本地 .py 路径列表
+        bytecode_ver: mpy 字节码版本
+        arch: 目标架构
+        max_workers: 最大并行数
+
+    Returns:
+        dict: {local_path: (mpy_path, tmp_dir)}，编译失败则值为 (None, None)
+    """
+    if not local_paths:
+        return {}
+    results = {}
+    workers = min(max_workers, len(local_paths))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_compile_to_mpy, lp, bytecode_ver, arch): lp
+                   for lp in local_paths}
+        for future in as_completed(futures):
+            lp = futures[future]
+            try:
+                results[lp] = future.result()
+            except Exception:
+                results[lp] = (None, None)
+    return results
+
+
+# ── bytes 协议辅助函数（模块级，供 _read_device_file 使用） ─────
+
+def _grep_size_after_ok(buf: bytes) -> int:
+    """在 buf 中查找 OK<size>\\r?\\n 并解析文件大小。"""
+    ok = buf.find(b"OK")
+    if ok < 0:
+        return -1
+    after = buf[ok + 2:]
+    nl = after.find(b"\n")
+    if nl < 0:
+        return -1
+    try:
+        return int(after[:nl].decode().strip())
+    except ValueError:
+        return -1
+
+
+def _grep_raw_start(buf: bytes) -> int:
+    """返回原始数据在 buf 中的起始下标（跳过 OK<size>\\n）。"""
+    ok = buf.find(b"OK")
+    if ok < 0:
+        return -1
+    after = buf[ok + 2:]
+    nl = after.find(b"\n")
+    if nl < 0:
+        return -1
+    return ok + 2 + nl + 1
+
+
+def _extract_raw_bytes(buf: bytes, expected_size: int) -> bytes:
+    """从 buf 中提取原始文件数据，去除协议前缀和尾部标记。"""
+    raw_start = _grep_raw_start(buf)
+    if raw_start < 0:
+        raise RuntimeError(f"响应格式错误（未找到 OK）: {buf[:200]!r}")
+    if expected_size < 0:
+        expected_size = _grep_size_after_ok(buf)
+        if expected_size < 0:
+            raise RuntimeError(f"无法解析文件大小: {buf[:200]!r}")
+    data = buf[raw_start:]
+    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
+        if data.endswith(trailer):
+            data = data[:-len(trailer)]
+    if len(data) < expected_size:
+        raise RuntimeError(
+            f"数据不完整: 期望 {expected_size} 字节, 收到 {len(data)} 字节"
+        )
+    return data[:expected_size]
+
+
 def _colorize_repl_output(text, in_error):
     """给 REPL 输出中的 Traceback/Error 添加红色高亮。
 
@@ -185,7 +268,7 @@ class MicroPython:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self.ser = None          # pySerial 对象
+        self.ser = serial.Serial()  # 未打开的空串口对象
         self._in_raw = False     # 是否处于原始 REPL 模式
         self._kbd_set = False    # 是否已设置 kbd_intr(-1)
         self._repl_log_file = None   # REPL 原始数据日志文件
@@ -223,7 +306,7 @@ class MicroPython:
         Returns:
             True 表示连接成功
         """
-        if self.ser and self.ser.is_open:
+        if self.ser.is_open:
             self.disconnect()
 
         self.port = port or self.port
@@ -248,17 +331,16 @@ class MicroPython:
         """断开串口连接，恢复设备 kbd_intr 设置并退出原始 REPL。"""
         self._restore_kbd_intr()
         self._exit_raw_repl()
-        if self.ser and self.ser.is_open:
+        if self.ser.is_open:
             try:
                 self.ser.close()
             except Exception:
                 pass
-        self.ser = None
 
     @property
     def is_connected(self):
         """是否已连接。"""
-        return self.ser is not None and self.ser.is_open
+        return self.ser.is_open
 
     def _enter_raw_repl(self):
         """切换到原始 REPL 模式（Ctrl+A）。"""
@@ -269,7 +351,7 @@ class MicroPython:
         for _ in range(2):
             self._write(SET_RESET)
             time.sleep(0.1)
-        self.ser.reset_input_buffer() # type: ignore
+        self.ser.reset_input_buffer()
 
         # Ctrl+A 进入原始 REPL
         self._write(ENTER_RAW_REPL)
@@ -279,7 +361,7 @@ class MicroPython:
             # Ctrl+C 未能中断，尝试 Ctrl+D 软重启后再进入
             self._write(SET_EXECUTE)  # Ctrl+D
             time.sleep(0.8)
-            self.ser.reset_input_buffer() # type: ignore
+            self.ser.reset_input_buffer()
             self._write(ENTER_RAW_REPL)
             data = self._read_until(b">", timeout=3)
 
@@ -295,7 +377,7 @@ class MicroPython:
         try:
             self._write(EXIT_RAW_REPL)
             time.sleep(0.1)
-            self.ser.reset_input_buffer() # type: ignore
+            self.ser.reset_input_buffer()
         except Exception:
             pass
         finally:
@@ -331,7 +413,7 @@ class MicroPython:
 
     def _drain_rx_log(self):
         """非阻塞读取串口 RX 缓冲中所有数据并记录到日志。"""
-        if not self.ser or not self.ser.is_open:
+        if not self.ser.is_open:
             return
         while self.ser.in_waiting:
             chunk = self.ser.read(self.ser.in_waiting)
@@ -360,15 +442,15 @@ class MicroPython:
         if isinstance(data, str):
             data = data.encode("utf-8")
         self._log_repl_data("tx", data)
-        self.ser.write(data) # type: ignore
+        self.ser.write(data)
 
     def _read_until(self, terminator=b"\x04", timeout=None):
         timeout = timeout or self.timeout
         buf = b""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.ser.in_waiting: # type: ignore
-                chunk = self.ser.read(self.ser.in_waiting) # type: ignore
+            if self.ser.in_waiting:
+                chunk = self.ser.read(self.ser.in_waiting)
                 buf += chunk
                 self._log_repl_data("rx", chunk)
                 idx = buf.find(terminator)
@@ -730,7 +812,7 @@ class MicroPython:
                     rp = os.path.join(remote_prefix, os.path.relpath(lp, local_dir)).replace("\\", "/")
                     entries.append((lp, rp))
 
-        # ── 预处理、预编译、读取内容（一轮遍历） ──
+        # ── 预处理、编译、读取内容 ──
         tmp_dirs = []
         file_list = []    # [(remote_path, local_compiled_path, size)]
         file_meta = []    # [(size, remote_path), ...] → 替换到 FLASH_PROGRAM
@@ -738,13 +820,13 @@ class MicroPython:
         verify_mode = self.config.get("verify", "size")
         expected_crcs = {}   # {remote_path: crc32} 用于校验
 
+        # 第一轮：预处理，收集编译候选
+        prep = []  # [(actual_local, actual_remote, needs_compile)]
         for lp, rp in entries:
             if Path(rp).name == "manifest.py" or lp.endswith(".pyi"):
                 continue
-
             actual_local = lp
             actual_remote = rp
-
             # 条件编译预处理
             if active_tags and actual_local.endswith(".py"):
                 from .preprocessor import preprocess
@@ -756,12 +838,22 @@ class MicroPython:
                     encoding="utf-8",
                 )
                 actual_local = pp_path
-
-            # 编译 .py → .mpy（跳过启动文件）
             basename = Path(actual_remote).name
-            should_compile = self.config["auto_compile"] and basename not in ("main.py", "boot.py")
-            if should_compile and actual_local.endswith(".py"):
-                mpy_path, mpy_tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch) # type: ignore
+            needs_compile = (
+                self.config["auto_compile"]
+                and basename not in ("main.py", "boot.py")
+                and actual_local.endswith(".py")
+            )
+            prep.append((actual_local, actual_remote, needs_compile))
+
+        # 第二轮：并行编译
+        compile_jobs = [al for al, _, needs in prep if needs]
+        compiled = _compile_files_parallel(compile_jobs, bytecode_ver, arch)
+
+        # 第三轮：读取编译结果并构建文件列表
+        for actual_local, actual_remote, needs_compile in prep:
+            if needs_compile and actual_local in compiled:
+                mpy_path, mpy_tmp_dir = compiled[actual_local]
                 if mpy_path:
                     tmp_dirs.append(mpy_tmp_dir)
                     actual_local = mpy_path
@@ -918,6 +1010,467 @@ class MicroPython:
             self._execute("import machine; machine.reset()", timeout=2)
         except Exception:
             pass
+
+    # ── 哈希与增量刷入 ──────────────────────────────────────────
+
+    @staticmethod
+    def _compute_file_hash(filepath: str) -> str:
+        """计算文件的 SHA256 哈希值。"""
+        h = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(1048576)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _collect_project_files(self, local_dir: str, active_tags: set = None,
+                                manifest_path: str = None):
+        """收集项目中可刷入的文件列表（与 flash_program 规则一致）。
+
+        Returns:
+            list of (local_abs_path, local_rel_remote)
+            无 manifest 时第二项为相对于 local_dir 的路径；
+            有 manifest 时第二项为 manifest 中指定的 remote 路径（或无 remote 时取文件名）。
+        """
+        if manifest_path:
+            from .manifest_loader import load_manifest
+            entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
+        else:
+            entries = []
+            for root, _dirs, files in os.walk(local_dir):
+                for fn in files:
+                    if not fn.endswith(".py"):
+                        continue
+                    lp = os.path.join(root, fn)
+                    rp = os.path.relpath(lp, local_dir).replace("\\", "/")
+                    entries.append((lp, rp))
+        # 过滤 manifest.py 和 .pyi
+        return [(lp, rp) for lp, rp in entries
+                if Path(rp).name != "manifest.py" and not lp.endswith(".pyi")]
+
+    def project_scan(self, local_dir: str, hash_config_path: str = None,
+                     active_tags: set = None, manifest_path: str = None):
+        """扫描项目，计算所有可刷入文件的 SHA256 哈希并保存到配置文件。
+
+        Args:
+            local_dir: 项目目录路径
+            hash_config_path: 哈希配置文件路径，默认 local_dir/pyrite_file_config.json
+            active_tags: 条件编译 tags
+            manifest_path: manifest.py 路径
+
+        Returns:
+            配置文件路径
+        """
+        if hash_config_path is None:
+            hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
+
+        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+
+        file_hashes = {}
+        for lp, _rp in entries:
+            rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
+            file_hashes[rel_path] = self._compute_file_hash(lp)
+
+        config = {
+            "version": _HASH_VERSION,
+            "hash_algorithm": "sha256",
+            "files": file_hashes,
+        }
+        with open(hash_config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+        print(f"  {_GREEN}项目文件哈希已保存:{_RESET} {hash_config_path}")
+        print(f"  {_GREEN}共 {len(file_hashes)} 个文件{_RESET}")
+        for rel_path in sorted(file_hashes):
+            print(f"    {rel_path}")
+        return hash_config_path
+
+    def project_flash(self, local_dir: str, remote_prefix: str,
+                      hash_config_path: str = None,
+                      bytecode_ver: int = None, arch: str = None,
+                      active_tags: set = None, manifest_path: str = None):
+        """根据哈希配置，仅刷入新增或已更改的文件。
+
+        需先调用 connect() 建立串口连接。
+
+        Args:
+            local_dir: 本地项目目录
+            remote_prefix: 设备上的远程路径前缀
+            hash_config_path: 哈希配置路径，默认 local_dir/pyrite_file_config.json
+            bytecode_ver: mpy 字节码版本（自动检测）
+            arch: 目标架构（自动检测）
+            active_tags: 条件编译 tags
+            manifest_path: manifest.py 路径
+
+        Returns:
+            list of (local_path, remote_path, success)
+        """
+        if hash_config_path is None:
+            hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
+
+        # 加载已有哈希配置
+        if os.path.exists(hash_config_path):
+            with open(hash_config_path, "r", encoding="utf-8") as f:
+                stored_config = json.load(f)
+            stored_hashes = stored_config.get("files", {})
+        else:
+            print(f"  {_YELLOW}[警告]{_RESET} 未找到哈希配置文件，将全量刷入")
+            stored_hashes = {}
+
+        # 扫描当前项目文件
+        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        if not entries:
+            print("  没有需要刷入的文件。")
+            return []
+
+        # 计算当前哈希并比对
+        changed = []        # [(local_abs_path, remote_path)]
+        unchanged_count = 0
+        current_hashes = {}
+
+        for lp, rp_part in entries:
+            rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
+            cur_hash = self._compute_file_hash(lp)
+            current_hashes[rel_path] = cur_hash
+
+            remote_path = os.path.join(remote_prefix, rp_part).replace("\\", "/")
+
+            stored = stored_hashes.get(rel_path)
+            if stored is None:
+                changed.append((lp, remote_path, "新增"))
+            elif stored != cur_hash:
+                changed.append((lp, remote_path, "已更改"))
+            else:
+                unchanged_count += 1
+
+        # 报告已删除文件
+        removed = [k for k in stored_hashes if k not in current_hashes]
+        if removed:
+            print(f"  {_YELLOW}[提示]{_RESET} {len(removed)} 个文件已从项目中移除（将从配置中清除）")
+            for rf in sorted(removed):
+                print(f"    - {rf}")
+
+        if not changed:
+            print(f"  {_GREEN}所有文件均未更改 ({unchanged_count} 个文件)，无需刷入{_RESET}")
+            return [(lp, os.path.join(remote_prefix, rp_part).replace("\\", "/"), True)
+                    for lp, rp_part in entries]
+
+        print(f"  {_GREEN}需要刷入 {len(changed)} 个文件:{_RESET}")
+        for lp, rp, reason in changed:
+            print(f"    [{reason}] {os.path.relpath(lp, local_dir)} -> {rp}")
+        if unchanged_count:
+            print(f"  {_GREEN}{unchanged_count} 个文件未更改，跳过{_RESET}")
+
+        # 逐个刷入变更文件
+        results = []
+        ok = 0
+        fail = 0
+
+        for lp, remote_path, _reason in changed:
+            print("")
+            try:
+                self.flash_file(
+                    lp, remote_path,
+                    compile=None,
+                    bytecode_ver=bytecode_ver,
+                    arch=arch,
+                    active_tags=active_tags,
+                )
+                results.append((lp, remote_path, True))
+                ok += 1
+            except Exception as e:
+                print(f"  {_RED}刷入失败: {e}{_RESET}")
+                results.append((lp, remote_path, False))
+                fail += 1
+
+        # 更新哈希配置（仅成功刷入的文件）
+        if ok > 0:
+            updated = {}
+            for lp, rp_part in entries:
+                rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
+                # 仅当文件成功刷入或用的是旧哈希（未变更文件）时保留
+                was_flashed_ok = any(
+                    lp == flp and success
+                    for flp, _frp, success in results
+                )
+                if was_flashed_ok:
+                    updated[rel_path] = current_hashes[rel_path]
+                elif rel_path in stored_hashes:
+                    updated[rel_path] = stored_hashes[rel_path]
+                elif rel_path in current_hashes:
+                    updated[rel_path] = current_hashes[rel_path]
+
+            with open(hash_config_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "version": _HASH_VERSION,
+                    "hash_algorithm": "sha256",
+                    "files": updated,
+                }, f, indent=2, ensure_ascii=False)
+
+            print(f"\n  {_GREEN}哈希配置已更新:{_RESET} {hash_config_path}")
+
+        parts = []
+        if ok:
+            parts.append(f"\033[32m{ok} 成功\033[0m")
+        if fail:
+            parts.append(f"\033[31m{fail} 失败\033[0m")
+        print(f"\n增量刷入完成: {', '.join(parts)}")
+        return results
+
+    # ── 设备文件读取（bytes 协议） ───────────────────────────────
+    def _read_device_file(self, remote_path: str) -> bytes:
+        """从设备读取文件内容（原始字节传输，兼容二进制）。
+
+        协议：设备先输出文件大小（文本行），再通过 stdout.buffer 输出原始字节。
+        PC 端读取全部串口数据后解析，不受 \\x04 等字节干扰。
+        """
+        self._enter_raw_repl()
+        # 用 sys.stdout.buffer 直接输出字节（避免 TextIOWrapper 兼容问题）
+        # _out 缓存引用跳过 sys.stdout 的 TextIOWrapper
+        script = (
+            "import os,sys\n"
+            f"p={remote_path!r}\n"
+            "sz=os.stat(p)[6]\n"
+            "_out=sys.stdout.buffer\n"
+            "_out.write(str(sz).encode()+b'\\n')\n"
+            "with open(p,'rb') as f:\n"
+            " while True:\n"
+            "  c=f.read(512)\n"
+            "  if not c:break\n"
+            "  _out.write(c)\n"
+        )
+        self._write(script.encode() + SET_EXECUTE)
+        time.sleep(0.3)
+
+        # MicroPython 原始 REPL 输出格式: "OK<size>\\r\\n<raw_bytes>\\x04\\x04>"
+        # OK 后没有换行，直接跟 size 数字
+        buf = b""
+        deadline = time.time() + 30
+        size = -1
+        while time.time() < deadline:
+            if self.ser.in_waiting:
+                buf += self.ser.read(self.ser.in_waiting)
+                if size < 0:
+                    size = _grep_size_after_ok(buf)
+                if size >= 0:
+                    raw_start = _grep_raw_start(buf)
+                    if raw_start >= 0 and len(buf) - raw_start >= size:
+                        time.sleep(0.05)
+                        buf += self.ser.read(self.ser.in_waiting)
+                        break
+            else:
+                time.sleep(0.02)
+
+        return _extract_raw_bytes(buf, size)
+
+    def _check_device_files(self, remote_paths: list) -> dict:
+        """批量检查设备文件存在性和大小。
+
+        Returns:
+            dict: {remote_path: size}，不存在的文件 size 为 -1
+        """
+        if not remote_paths:
+            return {}
+        paths_repr = repr(remote_paths)
+        script = (
+            "import os\n"
+            "r=[]\n"
+            f"for p in {paths_repr}:\n"
+            " try:\n"
+            "  r.append(str(os.stat(p)[6]))\n"
+            " except OSError:\n"
+            "  r.append('-')\n"
+            "print(','.join(r))\n"
+        )
+        out = self.run(script)
+        sizes = out.strip().split(',')
+        result = {}
+        for i, rp in enumerate(remote_paths):
+            if i < len(sizes) and sizes[i] != '-':
+                result[rp] = int(sizes[i])
+            else:
+                result[rp] = -1
+        return result
+
+    # ── project status / pull ────────────────────────────────────
+
+    def project_status(self, local_dir: str, remote_prefix: str,
+                       hash_config_path: str = None,
+                       active_tags: set = None, manifest_path: str = None):
+        """比对本地哈希和设备端文件，显示差异清单（不刷入）。
+
+        需先调用 connect() 建立串口连接。
+        """
+        if hash_config_path is None:
+            hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
+
+        # 加载哈希配置
+        if os.path.exists(hash_config_path):
+            with open(hash_config_path, "r", encoding="utf-8") as f:
+                stored = json.load(f).get("files", {})
+        else:
+            stored = {}
+
+        # 扫描本地文件
+        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        if not entries:
+            print("  没有可刷入的文件。")
+            return
+
+        current_hashes = {}
+        remote_paths = []
+        local_map = {}  # {remote_path: local_rel_path}
+        for lp, rp_part in entries:
+            rel = os.path.relpath(lp, local_dir).replace("\\", "/")
+            remote = os.path.join(remote_prefix, rp_part).replace("\\", "/")
+            current_hashes[remote] = self._compute_file_hash(lp)
+            remote_paths.append(remote)
+            local_map[remote] = rel
+
+        # 查询设备端文件
+        dev_sizes = self._check_device_files(remote_paths)
+
+        # 构建差异列表
+        added = []       # 本地有，设备无
+        changed = []     # 哈希不同
+        removed = []     # 配置有，本地无
+        ok_count = 0
+
+        for rp in remote_paths:
+            rel = local_map[rp]
+            cur_hash = current_hashes.get(rp)
+            old_hash = stored.get(rel)
+            dev_size = dev_sizes.get(rp, -1)
+            if dev_size < 0:
+                added.append((rel, rp))
+            elif old_hash is not None and cur_hash != old_hash:
+                changed.append((rel, rp))
+            elif old_hash is None:
+                added.append((rel, rp))
+            else:
+                ok_count += 1
+
+        for rel in stored:
+            if rel not in current_hashes.values() and rel not in [local_map[r] for r in remote_paths]:
+                # Actually check local_map by rel
+                pass
+        for rel in stored:
+            if rel not in [local_map[r] for r in remote_paths]:
+                removed.append(rel)
+
+        # 打印差异清单
+        header = f"{'状态':6}  {'本地文件':40}  {'设备路径':40}"
+        sep = f"{'──':6}  {'─'*40}  {'─'*40}"
+        print(f"\n  {header}")
+        print(f"  {sep}")
+
+        for rel, rp in added:
+            print(f"  {_YELLOW}[新增]{_RESET}  {rel:<40}  {rp:<40}")
+        for rel, rp in changed:
+            print(f"  {_YELLOW}[变更]{_RESET}  {rel:<40}  {rp:<40}")
+        for rel in removed:
+            print(f"  {_RED}[删除]{_RESET}  {rel:<40}  {'(不在项目中)':40}")
+
+        if not added and not changed and not removed:
+            print(f"  {_GREEN}所有文件一致 ({ok_count} 个文件){_RESET}")
+        else:
+            print(f"  {_GREEN}一致: {ok_count}{_RESET}  "
+                  f"{_YELLOW}新增: {len(added)}{_RESET}  "
+                  f"{_YELLOW}变更: {len(changed)}{_RESET}  "
+                  f"{_RED}删除: {len(removed)}{_RESET}")
+        print()
+
+    def project_pull(self, local_dir: str, remote_prefix: str,
+                     hash_config_path: str = None,
+                     active_tags: set = None, manifest_path: str = None,
+                     dry_run: bool = False):
+        """从设备下载文件到本地（全量备份）。
+
+        扫描本地项目，从设备端读取对应文件写入本地。
+        需先调用 connect() 建立串口连接。
+        """
+        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        if not entries:
+            print("  没有可下载的文件。")
+            return
+
+        total = 0
+        ok = 0
+        fail = 0
+        for lp, rp_part in entries:
+            remote = os.path.join(remote_prefix, rp_part).replace("\\", "/")
+            if dry_run:
+                print(f"  [预览] {remote} -> {lp}")
+                total += 1
+                continue
+            try:
+                print(f"  下载: {remote} -> {lp}", end=" ")
+                data = self._read_device_file(remote)
+                os.makedirs(os.path.dirname(lp), exist_ok=True)
+                with open(lp, "wb") as f:
+                    f.write(data)
+                print(f"{_GREEN}({len(data)} 字节){_RESET}")
+                total += 1
+                ok += 1
+            except Exception as e:
+                print(f"{_RED}失败: {e}{_RESET}")
+                total += 1
+                fail += 1
+
+        print(f"\n  下载完成: {_GREEN}{ok} 成功{_RESET}", end="")
+        if fail:
+            print(f"  {_RED}{fail} 失败{_RESET}", end="")
+        print()
+
+    # ── 设备文件管理 (fs) ─────────────────────────────────────────
+
+    def fs_ls(self, remote_path: str = "/") -> list:
+        """列出设备目录下的文件和子目录。"""
+        script = (
+            "import os\n"
+            f"p={remote_path!r}\n"
+            "for n in sorted(os.listdir(p or '/')):\n"
+            " try:\n"
+            "  s=os.stat((p+'/'+n).replace('//','/'))\n"
+            "  print(str(s[6])+'|'+('D' if s[0]&0x4000 else 'F')+'|'+n)\n"
+            " except OSError:\n"
+            "  print('?|?|'+n)\n"
+        )
+        out = self.run(script)
+        items = []
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('|', 2)
+            if len(parts) == 3:
+                items.append({'size': parts[0], 'type': parts[1], 'name': parts[2]})
+        return items
+
+    def fs_rm(self, remote_path: str) -> bool:
+        """删除设备上的文件或空目录。"""
+        script = (
+            "import os\n"
+            f"os.remove({remote_path!r})\n"
+            "print('OK')\n"
+        )
+        out = self.run(script)
+        return 'OK' in out
+
+    def fs_cat(self, remote_path: str) -> str:
+        """读取设备上文本文件的内容。"""
+        script = f"print(open({remote_path!r}).read())\n"
+        return self.run(script)
+
+    def fs_get(self, remote_path: str, local_path: str) -> int:
+        """从设备下载文件到本地路径。返回文件大小（字节）。"""
+        data = self._read_device_file(remote_path)
+        os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(data)
+        return len(data)
 
     def __enter__(self):
         return self

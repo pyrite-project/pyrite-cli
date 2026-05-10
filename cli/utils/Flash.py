@@ -141,12 +141,12 @@ def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None)
         r.wait(timeout=30)
         if r.returncode == 0:
             return out_path, tmp_dir
-        print(f"  {_YELLOW}[警告]{_RESET} mpy-cross 编译失败，回退到 .py\n"
+        print(f"  {_YELLOW}[WARN]{_RESET} mpy-cross 编译失败，回退到 .py\n"
               f"         {r.stderr.read().decode(errors='replace').strip()}") # type: ignore
     except ImportError:
-        print(f"  {_YELLOW}[提示]{_RESET} 未找到 mpy-cross，跳过编译")
+        print(f"  {_YELLOW}[INFO]{_RESET} 未找到 mpy-cross，跳过编译")
     except Exception as e:
-        print(f"  {_YELLOW}[警告]{_RESET} 编译异常: {e}，回退到 .py")
+        print(f"  {_YELLOW}[WARN]{_RESET} 编译异常: {e}，回退到 .py")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return None, None
 
@@ -690,7 +690,7 @@ class MicroPython:
                     return False
                 print(f"  {_GREEN}CRC32 校验通过{_RESET}")
             except Exception as e:
-                print(f"  {_YELLOW}[警告]{_RESET} CRC32 校验不可用 ({e})，仅验证文件大小")
+                print(f"  {_YELLOW}[WARN]{_RESET} CRC32 校验不可用 ({e})，仅验证文件大小")
 
         return True
 
@@ -748,7 +748,7 @@ class MicroPython:
                     self._enter_raw_repl()
 
                     if attempt > 0:
-                        print(f"  {_YELLOW}[重试 {attempt}/{max_retries}]{_RESET}")
+                        print(f"  {_YELLOW}[RETRY {attempt}/{max_retries}]{_RESET}")
 
                     try:
                         self._drain_rx_log()
@@ -878,7 +878,7 @@ class MicroPython:
                 self._enter_raw_repl()
 
                 if attempt > 0:
-                    print(f"  {_YELLOW}[重试 {attempt}/{max_retries}]{_RESET}")
+                    print(f"  {_YELLOW}[RETRY {attempt}/{max_retries}]{_RESET}")
 
                 # ── 批量创建设备目录（一次执行，N-1 次往返节省） ──
                 dirs = sorted({os.path.dirname(rp) for rp, _, _ in file_list if os.path.dirname(rp)})
@@ -1116,7 +1116,7 @@ class MicroPython:
                 stored_config = json.load(f)
             stored_hashes = stored_config.get("files", {})
         else:
-            print(f"  {_YELLOW}[警告]{_RESET} 未找到哈希配置文件，将全量刷入")
+            print(f"  {_YELLOW}[WARN]{_RESET} 未找到哈希配置文件，将全量刷入")
             stored_hashes = {}
 
         # 扫描当前项目文件
@@ -1148,7 +1148,7 @@ class MicroPython:
         # 报告已删除文件
         removed = [k for k in stored_hashes if k not in current_hashes]
         if removed:
-            print(f"  {_YELLOW}[提示]{_RESET} {len(removed)} 个文件已从项目中移除（将从配置中清除）")
+            print(f"  {_YELLOW}[INFO]{_RESET} {len(removed)} 个文件已从项目中移除（将从配置中清除）")
             for rf in sorted(removed):
                 print(f"    - {rf}")
 
@@ -1367,11 +1367,11 @@ class MicroPython:
         print(f"  {sep}")
 
         for rel, rp in added:
-            print(f"  {_YELLOW}[新增]{_RESET}  {rel:<40}  {rp:<40}")
+            print(f"  {_YELLOW}[ADD]{_RESET}  {rel:<40}  {rp:<40}")
         for rel, rp in changed:
-            print(f"  {_YELLOW}[变更]{_RESET}  {rel:<40}  {rp:<40}")
+            print(f"  {_YELLOW}[MOD]{_RESET}  {rel:<40}  {rp:<40}")
         for rel in removed:
-            print(f"  {_RED}[删除]{_RESET}  {rel:<40}  {'(不在项目中)':40}")
+            print(f"  {_RED}[DEL]{_RESET}  {rel:<40}  {'(不在项目中)':40}")
 
         if not added and not changed and not removed:
             print(f"  {_GREEN}所有文件一致 ({ok_count} 个文件){_RESET}")
@@ -1382,44 +1382,176 @@ class MicroPython:
                   f"{_RED}删除: {len(removed)}{_RESET}")
         print()
 
+    def _discover_device_files(self, remote_prefix: str) -> list:
+        """递归发现设备上的所有文件，返回 [(full_remote_path, size), ...]。
+
+        设备端逐行输出 size|path，主机端按行解析，避免 eval。
+        """
+        script = (
+            "import os\n"
+            "def _walk(d):\n"
+            " for n in os.listdir(d):\n"
+            "  fp=(d+'/'+n).replace('//','/')\n"
+            "  try:s=os.stat(fp)\n"
+            "  except:continue\n"
+            "  if s[0]&0x4000:\n"
+            "   _walk(fp)\n"
+            "  else:\n"
+            "   print(str(s[6])+'|'+fp)\n"
+            f"_walk({remote_prefix!r})\n"
+        )
+        out = self.run(script)
+        files = []
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if '|' in line:
+                sz, _, fp = line.partition('|')
+                if sz.isdigit():
+                    files.append((fp, int(sz)))
+        return files
+
     def project_pull(self, local_dir: str, remote_prefix: str,
                      hash_config_path: str = None,
                      active_tags: set = None, manifest_path: str = None,
                      dry_run: bool = False):
-        """从设备下载文件到本地（全量备份）。
+        """从设备下载文件到本地（批量传输）。
 
-        扫描本地项目，从设备端读取对应文件写入本地。
+        类似 flash_program 的批处理逻辑：
+        一次收集所有文件大小，设备将全部文件内容拼接输出，
+        主机端按文件大小分割并写入本地文件。
+
+        如果本地目录为空或不存在，自动从设备递归发现文件。
         需先调用 connect() 建立串口连接。
         """
+        # 尝试从本地项目收集文件清单
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
-        if not entries:
-            print("  没有可下载的文件。")
-            return
+        from_device = False
 
-        total = 0
-        ok = 0
-        fail = 0
+        if not entries:
+            # 本地无文件清单 → 从设备递归发现
+            print(f"  {_YELLOW}[INFO]{_RESET} 本地目录为空，从设备发现文件...")
+            dev_files = self._discover_device_files(remote_prefix)
+            if not dev_files:
+                print(f"  {_YELLOW}[INFO]{_RESET} 设备上未发现文件。")
+                return
+            from_device = True
+            entries = []
+            for rp, sz in dev_files:
+                # 计算本地相对路径：去掉 remote_prefix 前缀
+                rel = rp[len(remote_prefix):].lstrip('/') if rp.startswith(remote_prefix) else rp.lstrip('/')
+                lp = os.path.join(local_dir, rel).replace("\\", "/")
+                entries.append((lp, rel))
+
+        # 构建远程文件路径列表
+        remote_files = []
+        local_paths = []
         for lp, rp_part in entries:
             remote = os.path.join(remote_prefix, rp_part).replace("\\", "/")
-            if dry_run:
-                print(f"  [预览] {remote} -> {lp}")
-                total += 1
+            remote_files.append(remote)
+            local_paths.append(lp)
+
+        if dry_run:
+            print(f"  {_YELLOW}[PREVIEW]{_RESET} 将下载 {len(remote_files)} 个文件:")
+            for rp, lp in zip(remote_files, local_paths):
+                print(f"    {rp} -> {lp}")
+            return
+
+        # ── 批量获取：一次性发送脚本，设备输出所有文件大小 + 拼接内容 ──
+        self._enter_raw_repl()
+        script = (
+            "import os,sys\n"
+            "_out=sys.stdout.buffer\n"
+            f"files={remote_files!r}\n"
+            "sizes=[]\n"
+            "for f in files:\n"
+            " try:\n"
+            "  sizes.append(os.stat(f)[6])\n"
+            " except:\n"
+            "  sizes.append(-1)\n"
+            "_out.write(b'SZ:'+repr(sizes).encode()+b'\\n')\n"
+            "for i,f in enumerate(files):\n"
+            " if sizes[i]>=0:\n"
+            "  with open(f,'rb') as fp:\n"
+            "   while True:\n"
+            "    c=fp.read(512)\n"
+            "    if not c:break\n"
+            "    _out.write(c)\n"
+        )
+        self._write(script.encode() + SET_EXECUTE)
+        time.sleep(0.3)
+
+        # ── 读取设备返回 ──
+        buf = b""
+        deadline = time.time() + max(30, len(remote_files) * 8)
+        sizes = []
+        expected_total = -1
+        raw_start = -1
+
+        while time.time() < deadline:
+            if self.ser.in_waiting:
+                buf += self.ser.read(self.ser.in_waiting)
+                if expected_total < 0:
+                    sz_marker = buf.find(b"SZ:")
+                    if sz_marker >= 0:
+                        nl = buf.find(b"\n", sz_marker)
+                        if nl >= 0:
+                            try:
+                                sizes = eval(buf[sz_marker + 3:nl])
+                                expected_total = sum(s for s in sizes if s >= 0)
+                                raw_start = nl + 1
+                            except Exception:
+                                pass
+                if expected_total >= 0:
+                    raw_len = len(buf) - raw_start
+                    # 去除尾部协议标记后判断是否收足
+                    raw = buf[raw_start:]
+                    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
+                        if raw.endswith(trailer):
+                            raw = raw[:-len(trailer)]
+                    if len(raw) >= expected_total:
+                        time.sleep(0.05)
+                        buf += self.ser.read(self.ser.in_waiting)
+                        break
+            else:
+                time.sleep(0.02)
+
+        if expected_total < 0:
+            print(f"  {_RED}[ERROR]{_RESET} 无法获取文件大小信息")
+            return
+
+        # ── 解析原始数据 ──
+        raw = buf[raw_start:]
+        for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
+            if raw.endswith(trailer):
+                raw = raw[:-len(trailer)]
+
+        if len(raw) < expected_total:
+            print(f"  {_RED}[ERROR]{_RESET} 数据不完整: 期望 {expected_total} 字节, 收到 {len(raw)} 字节")
+            return
+
+        raw = raw[:expected_total]
+
+        # ── 按大小分割并写入本地文件 ──
+        ok = fail = 0
+        offset = 0
+        for i, (lp, size) in enumerate(zip(local_paths, sizes)):
+            if size < 0:
+                print(f"  {_YELLOW}[SKIP]{_RESET} {remote_files[i]} (设备上不存在)")
+                fail += 1
                 continue
+            file_data = raw[offset:offset + size]
+            offset += size
             try:
-                print(f"  下载: {remote} -> {lp}", end=" ")
-                data = self._read_device_file(remote)
-                os.makedirs(os.path.dirname(lp), exist_ok=True)
+                os.makedirs(os.path.dirname(lp) or '.', exist_ok=True)
                 with open(lp, "wb") as f:
-                    f.write(data)
-                print(f"{_GREEN}({len(data)} 字节){_RESET}")
-                total += 1
+                    f.write(file_data)
+                print(f"  {_GREEN}✓{_RESET} {remote_files[i]} -> {lp} ({size} 字节)")
                 ok += 1
             except Exception as e:
-                print(f"{_RED}失败: {e}{_RESET}")
-                total += 1
+                print(f"  {_RED}✗{_RESET} {remote_files[i]} -> {lp}: {e}")
                 fail += 1
 
-        print(f"\n  下载完成: {_GREEN}{ok} 成功{_RESET}", end="")
+        print(f"\n  {_GREEN}下载完成: {ok} 成功{_RESET}", end="")
         if fail:
             print(f"  {_RED}{fail} 失败{_RESET}", end="")
         print()
@@ -1430,10 +1562,13 @@ class MicroPython:
         """列出设备目录下的文件和子目录。"""
         script = (
             "import os\n"
+            "def _st(p):\n"
+            " s=os.stat(p); s=os.stat(p)\n"
+            " return s\n"
             f"p={remote_path!r}\n"
             "for n in sorted(os.listdir(p or '/')):\n"
             " try:\n"
-            "  s=os.stat((p+'/'+n).replace('//','/'))\n"
+            "  s=_st((p+'/'+n).replace('//','/'))\n"
             "  print(str(s[6])+'|'+('D' if s[0]&0x4000 else 'F')+'|'+n)\n"
             " except OSError:\n"
             "  print('?|?|'+n)\n"
@@ -1448,6 +1583,25 @@ class MicroPython:
             if len(parts) == 3:
                 items.append({'size': parts[0], 'type': parts[1], 'name': parts[2]})
         return items
+
+    def fs_df(self) -> dict:
+        """获取设备文件系统使用情况。"""
+        script = (
+            "import os\n"
+            "s=os.statvfs('/')\n"
+            "print(str(s[0]*s[2])+'|'+str(s[0]*(s[2]-s[3]))+'|'+str(s[0]*s[3]))\n"
+        )
+        out = self.run(script)
+        for line in out.strip().splitlines():
+            line = line.strip()
+            parts = line.split('|')
+            if len(parts) == 3:
+                return {
+                    'total': int(parts[0]),
+                    'used': int(parts[1]),
+                    'free': int(parts[2]),
+                }
+        return {'total': 0, 'used': 0, 'free': 0}
 
     def fs_rm(self, remote_path: str) -> bool:
         """删除设备上的文件或空目录。"""

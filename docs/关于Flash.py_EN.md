@@ -447,6 +447,38 @@ with MicroPython(port="COM3") as mp:
 
 ---
 
+### Device File Management
+
+#### `fs_ls(remote_path="/")`
+
+List files and directories on the device. Calls `os.stat()` twice per entry to ensure stable directory sizes on some MicroPython ports.
+
+- Returns: `list[dict]` with keys `name`, `type` (`F`/`D`), `size`
+
+#### `fs_df()`
+
+Get device filesystem usage via `os.statvfs('/')`.
+
+- Returns: `dict {'total': int, 'used': int, 'free': int}`
+
+#### `project_pull(local_dir, remote_prefix, ..., dry_run=False)`
+
+Download project files from device (batch transfer, similar to `flash_program`):
+
+1. Collect all file paths (auto-discover from device if local dir is empty)
+2. Send one script: device stats all files, outputs sizes + concatenated raw bytes
+3. Host splits by size and writes each file locally
+
+Markers: `[INFO]` `[PREVIEW]` `[SKIP]` `[ERROR]` — status: `✓` green / `✗` red
+
+#### `_discover_device_files(remote_prefix)`
+
+Recursively discover all files on the device. Device outputs `size|path` per line, host parses line by line.
+
+- Returns: `list[(full_remote_path, size)]`
+
+---
+
 ## FLASH Template Script (Single File)
 
 Python script injected into the device for single-file flashing, responsible for receiving data and writing to file:

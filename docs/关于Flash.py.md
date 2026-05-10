@@ -420,13 +420,34 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 
 比对本地哈希和设备端文件大小，显示差异清单（不刷入）。需先 `connect()`。
 
-显示状态：`[新增]`（本地有/设备无）、`[变更]`（本地哈希变化）、`[删除]`（配置中有/项目中已移除）。
+显示状态：`[ADD]`（本地有/设备无）、`[MOD]`（本地哈希变化）、`[DEL]`（配置中有/项目中已移除）。
 
 #### `project_pull(local_dir, remote_prefix, hash_config_path=None, active_tags=None, manifest_path=None, dry_run=False)`
 
-从设备下载所有项目文件到本地（在线备份）。通过 bytes 协议传输，兼容二进制文件。
+从设备下载项目文件到本地（批量传输）。类似 `flash_program` 的批处理逻辑：
 
-支持 `dry_run=True` 预览模式（仅列出，不下载）。
+1. 收集所有文件路径
+2. 发送一个脚本到设备，设备一次性 stat 所有文件，输出 `SZ:[...]` + 全部文件内容拼接
+3. 主机端按文件大小分割数据块，逐个写入本地文件
+
+如果本地目录为空或不存在，自动调用 `_discover_device_files()` 从设备递归发现文件清单。
+
+支持 `dry_run=True` 预览模式。
+
+- 输出标记: `[INFO]` `[PREVIEW]` `[SKIP]` `[ERROR]`
+- 成功/失败状态: `✓` 绿色 / `✗` 红色
+
+#### `_discover_device_files(remote_prefix)`
+
+递归发现设备上的所有文件。设备端逐行输出 `size|path`，主机端按行解析。
+
+- 返回: `list[(full_remote_path, size)]`
+
+#### `fs_df()`
+
+获取设备文件系统使用情况。通过 `os.statvfs('/')` 获取 total/used/free 字节数。
+
+- 返回: `dict {'total': int, 'used': int, 'free': int}`
 
 ---
 
@@ -449,6 +470,8 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 #### `fs_ls(remote_path="/")`
 
 列出设备目录下的文件和子目录，返回包含 `name`、`type`（`F`/`D`）、`size` 的字典列表。
+
+- 对每个条目连续两次 `os.stat()`，解决 MicroPython 部分端口首次读取目录大小不稳定的问题。
 
 #### `fs_rm(remote_path)`
 

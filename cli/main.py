@@ -1,7 +1,57 @@
+import os
 import typer
+import sys
+import re
 from typing import Optional
 from .utils.Flash import MicroPython, create_default_config
 from .project.project import init_project, init_stubs, new_project_interactive
+
+
+def _norm_path(p: str) -> str:
+    """修复 MSYS2（Git Bash）路径转换问题。
+
+    Git Bash 会将 Unix 风格 /xxx 参数自动转换为 Windows 绝对路径
+    （如 /lib → D:/Program Files/Git/lib），导致 MicroPython 设备路径错误。
+    检测到被转换的路径时，恢复原始设备路径。
+    """
+    if not isinstance(p, str) or not re.match(r'^[A-Za-z]:[/\\]', p):
+        return p
+
+    # 从 PATH 中推断 MSYS2 根目录（如 D:\Program Files\Git）
+    msys_root = None
+    for entry in os.environ.get('PATH', '').split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        norm = entry.replace('/', os.sep)
+        # MSYS2 的 bin 目录特征：mingw64/bin, usr/bin 等
+        if norm.rstrip('\\').endswith('mingw64\\bin') or norm.rstrip('\\').endswith('usr\\bin'):
+            # 取父目录的父目录作为根
+            parent = os.path.dirname(os.path.dirname(norm))
+            if re.match(r'^[A-Za-z]:[/\\]', parent):
+                msys_root = parent
+                break
+
+    if msys_root is None:
+        # 无法确定 MSYS2 根，保守处理：只针对裸驱动器路径
+        if re.match(r'^[A-Za-z]:[/\\]$', p):
+            typer.secho(f"  [WARN] 路径 '{p}' 被 MSYS2 转换，已恢复为 '/'",
+                        fg=typer.colors.YELLOW)
+            return '/'
+        return p
+
+    # 去掉 MSYS2 根前缀，恢复原始 /xxx 路径
+    p_norm = p.replace('/', '\\')
+    prefix = msys_root.rstrip('\\') + '\\'
+    if p_norm.startswith(prefix):
+        rest = p_norm[len(prefix):].replace('\\', '/')
+        recovered = '/' + rest
+        if recovered != p:
+            typer.secho(f"  [WARN] 路径 '{p}' 被 MSYS2 转换，已恢复为 '{recovered}'",
+                        fg=typer.colors.YELLOW)
+        return recovered
+
+    return p
 
 app = typer.Typer(
     name="pyrite-cli",
@@ -75,6 +125,7 @@ def flash(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
 ):
     """刷入单个文件到设备"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -128,6 +179,7 @@ def flash_program(
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
 ):
     """刷入整个目录到设备（需指定远程路径前缀）"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -380,6 +432,7 @@ def project_flash(
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
 ):
     """根据哈希配置仅刷入新增或已更改的文件"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -419,6 +472,7 @@ def project_status(
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
 ):
     """比对本地哈希和设备端文件大小，显示差异清单（不刷入）"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -440,8 +494,10 @@ def project_status(
 @project_app.command("pull")
 def project_pull(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
-    directory: str = typer.Argument(..., help="本地项目目录路径"),
-    remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
+    directory: str = typer.Argument(help="本地项目目录路径（如 . 或 ./bak）"),
+    remote_path: str = typer.Argument("/",
+                                      help="设备上的远程路径前缀",
+                                      show_default=False),
     baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -450,7 +506,8 @@ def project_pull(
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式，仅列出，不实际下载"),
 ):
-    """从设备下载项目文件到本地（在线备份）"""
+    """从设备下载项目文件到本地"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -458,13 +515,15 @@ def project_pull(
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
             active_tags.add(target.upper())
         else:
-            active_tags = mp.detect_tags()
+            active_tags = None
         if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
+            active_tags = set(t.strip() for t in feature.split(","))
         if no_feature:
+            if active_tags is None:
+                active_tags = set()
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
         mp.project_pull(directory, remote_path,
-                        active_tags=active_tags or None, manifest_path=manifest,
+                        active_tags=active_tags, manifest_path=manifest,
                         dry_run=dry_run)
     finally:
         mp.disconnect()
@@ -498,18 +557,40 @@ def fs_ls(
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
 ):
     """列出设备目录内容"""
+    path = _norm_path(path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
         items = mp.fs_ls(path)
         if not items:
             print("  (空目录)")
-            return
-        for item in items:
-            tag = f"[{item['type']}]"
-            sz = item['size'] if item['size'].isdigit() else '?'
-            sz_kb = f" {int(sz)//1024:>6} KB" if sz.isdigit() else f" {sz:>7}"
-            print(f"  {tag} {item['name']:<30} {sz_kb}")
+        else:
+            for item in items:
+                name = item['name'] + '/' if item['type'] == 'D' else item['name']
+                tag = f"[{item['type']}]"
+                sz = item['size'] if item['size'].isdigit() else '?'
+                if sz.isdigit():
+                    sz_int = int(sz)
+                    if sz_int < 1024:
+                        sz_str = f"{sz_int:>7} bytes"
+                    else:
+                        sz_str = f" {sz_int//1024:>6} KB"
+                else:
+                    sz_str = f" {sz:>7}"
+                print(f"  {tag} {name:<31} {sz_str}")
+        # 仅在列根目录时显示 Flash 占用进度条
+        if path.strip() in ("", ".", "./", "/"):
+            df = mp.fs_df()
+            if df['total'] > 0:
+                pct = df['used'] / df['total']
+                bar_w = 30
+                filled = int(bar_w * pct)
+                bar = '█' * filled + '░' * (bar_w - filled)
+                total_mb = df['total'] / 1024 / 1024
+                used_mb = df['used'] / 1024 / 1024
+                free_mb = df['free'] / 1024 / 1024
+                typer.secho(f"\n  Flash: [{bar}] {pct*100:.1f}%", fg=typer.colors.BRIGHT_BLACK)
+                print(f"         {used_mb:.1f} MB used / {free_mb:.1f} MB free / {total_mb:.1f} MB total")
     finally:
         mp.disconnect()
 
@@ -522,6 +603,7 @@ def fs_rm(
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
 ):
     """删除设备上的文件"""
+    path = _norm_path(path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -541,6 +623,7 @@ def fs_cat(
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
 ):
     """打印设备上文本文件的内容"""
+    path = _norm_path(path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -562,6 +645,7 @@ def fs_put(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags"),
 ):
     """上传文件到设备"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -585,6 +669,7 @@ def fs_get(
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
 ):
     """从设备下载文件到本地"""
+    remote_path = _norm_path(remote_path)
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -595,11 +680,10 @@ def fs_get(
         mp.disconnect()
 
 
-# Need os for default local_path in fs_get
-import os
-
 
 def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
     app()
 
 

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyi
+Claude.md
 
 *.egg-info/
 .egg-info/

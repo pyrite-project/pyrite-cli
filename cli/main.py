@@ -422,12 +422,14 @@ def project_flash(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译"),
-    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
-    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags"),
-    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target（离线时使用）"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
 ):
@@ -463,11 +465,13 @@ def project_status(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
-    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
-    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags"),
-    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target（离线时使用）"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
 ):
@@ -551,10 +555,12 @@ def _build_tag_args(mp, target, feature, no_feature):
 
 @fs_app.command("ls")
 def fs_ls(
-    port: str = typer.Argument(..., help="串口号"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     path: str = typer.Argument("/", help="设备上的目录路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
 ):
     """列出设备目录内容"""
     path = _norm_path(path)
@@ -566,7 +572,8 @@ def fs_ls(
             print("  (空目录)")
         else:
             for item in items:
-                name = item['name'] + '/' if item['type'] == 'D' else item['name']
+                is_dir = item['type'] == 'D'
+                name = item['name'] + '/' if is_dir else item['name']
                 tag = f"[{item['type']}]"
                 sz = item['size'] if item['size'].isdigit() else '?'
                 if sz.isdigit():
@@ -577,7 +584,11 @@ def fs_ls(
                         sz_str = f" {sz_int//1024:>6} KB"
                 else:
                     sz_str = f" {sz:>7}"
-                print(f"  {tag} {name:<31} {sz_str}")
+                line = f"  {tag} {name:<31} {sz_str}"
+                if is_dir:
+                    typer.secho(line, fg=typer.colors.YELLOW)
+                else:
+                    print(line)
         # 仅在列根目录时显示 Flash 占用进度条
         if path.strip() in ("", ".", "./", "/"):
             df = mp.fs_df()
@@ -597,10 +608,12 @@ def fs_ls(
 
 @fs_app.command("rm")
 def fs_rm(
-    port: str = typer.Argument(..., help="串口号"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     path: str = typer.Argument(..., help="设备上要删除的文件路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
 ):
     """删除设备上的文件"""
     path = _norm_path(path)
@@ -617,10 +630,12 @@ def fs_rm(
 
 @fs_app.command("cat")
 def fs_cat(
-    port: str = typer.Argument(..., help="串口号"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     path: str = typer.Argument(..., help="设备上的文件路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
 ):
     """打印设备上文本文件的内容"""
     path = _norm_path(path)
@@ -634,15 +649,17 @@ def fs_cat(
 
 @fs_app.command("put")
 def fs_put(
-    port: str = typer.Argument(..., help="串口号"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     local_path: str = typer.Argument(..., help="本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
-    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags"),
-    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
 ):
     """上传文件到设备"""
     remote_path = _norm_path(remote_path)
@@ -662,11 +679,13 @@ def fs_put(
 
 @fs_app.command("get")
 def fs_get(
-    port: str = typer.Argument(..., help="串口号"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     remote_path: str = typer.Argument(..., help="设备上的文件路径"),
     local_path: str = typer.Argument(None, help="本地保存路径（默认使用远程文件名）"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
 ):
     """从设备下载文件到本地"""
     remote_path = _norm_path(remote_path)

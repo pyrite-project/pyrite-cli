@@ -37,6 +37,10 @@ def _parse_call(call: ast.Call, lineno: int):
         raise ValueError(f"manifest.py line {lineno}: {func_name}() accepts only one positional argument")
 
     filename = _parse_str(call.args[0], f"{func_name}() first argument")
+    if ".." in Path(filename).parts:
+        raise ValueError(
+            f"manifest.py line {lineno}: path traversal ('..') is not allowed in filename: {filename!r}"
+        )
 
     kwargs: dict[str, ast.AST] = {}
     for kw in call.keywords:
@@ -52,15 +56,33 @@ def _parse_call(call: ast.Call, lineno: int):
 
     parsed_kwargs: dict[str, object] = {}
     if "remote" in kwargs:
-        parsed_kwargs["remote"] = _parse_str(kwargs["remote"], "remote")
+        remote_str = _parse_str(kwargs["remote"], "remote")
+        if ".." in Path(remote_str).parts:
+            raise ValueError(
+                f"manifest.py line {kw.lineno}: path traversal ('..') is not allowed in remote: {remote_str!r}"
+            )
+        parsed_kwargs["remote"] = remote_str
     if "features" in kwargs:
         parsed_kwargs["features"] = _parse_list_of_str(kwargs["features"], "features")
 
     return func_name, filename, parsed_kwargs
 
 
+_MAX_MANIFEST_DEPTH = 15
+_MAX_MANIFEST_ENTRIES = 500
+
+
+def _check_depth(node: ast.AST, depth: int = 0):
+    """递归检查 AST 深度，防止恶意深层嵌套耗尽 CPython 递归栈。"""
+    if depth > _MAX_MANIFEST_DEPTH:
+        raise ValueError(f"manifest.py 嵌套过深（超过 {_MAX_MANIFEST_DEPTH} 层），已拒绝")
+    for child in ast.iter_child_nodes(node):
+        _check_depth(child, depth + 1)
+
+
 def _check_unsafe_nodes(tree: ast.Module):
     """Reject statements other than top-level expression calls."""
+    _check_depth(tree)
     for node in tree.body:
         if isinstance(
             node,
@@ -127,5 +149,14 @@ def load_manifest(manifest_path: str, active_tags: Set[str], base_dir: str = Non
                 else:
                     rp = rel
                 entries.append((str(f), rp))
+                if len(entries) > _MAX_MANIFEST_ENTRIES:
+                    raise ValueError(
+                        f"manifest.py: 条目数超过上限 ({_MAX_MANIFEST_ENTRIES})，已拒绝"
+                    )
+
+        if len(entries) > _MAX_MANIFEST_ENTRIES:
+            raise ValueError(
+                f"manifest.py: 条目数超过上限 ({_MAX_MANIFEST_ENTRIES})，已拒绝"
+            )
 
     return entries

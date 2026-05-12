@@ -129,6 +129,7 @@ def _load_config():
 def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None): # type: ignore
     """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
     tmp_dir = tempfile.mkdtemp()
+    os.chmod(tmp_dir, 0o700)
     out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
     args = [local_path, "-o", out_path]
     if arch is not None:
@@ -218,15 +219,20 @@ def _extract_raw_bytes(buf: bytes, expected_size: int) -> bytes:
         expected_size = _grep_size_after_ok(buf)
         if expected_size < 0:
             raise RuntimeError(f"无法解析文件大小: {buf[:200]!r}")
-    data = buf[raw_start:]
-    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
-        if data.endswith(trailer):
-            data = data[:-len(trailer)]
+    data = _strip_repl_trailer(buf[raw_start:])
     if len(data) < expected_size:
         raise RuntimeError(
             f"数据不完整: 期望 {expected_size} 字节, 收到 {len(data)} 字节"
         )
     return data[:expected_size]
+
+
+def _strip_repl_trailer(buf: bytes) -> bytes:
+    """去除原始 REPL 响应尾部的 \\x04\\x04>、\\x04\\x04、\\x04 等协议标记。"""
+    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
+        if buf.endswith(trailer):
+            buf = buf[:-len(trailer)]
+    return buf
 
 
 def _colorize_repl_output(text, in_error):
@@ -237,22 +243,16 @@ def _colorize_repl_output(text, in_error):
     """
     if "Traceback" in text:
         idx = text.index("Traceback")
-        after = text[idx:]
-        m = re.search(r"(?:Error|Exception):[^\r\n]*", after)
+        prefix, search_in = text[:idx], text[idx:]
+        m = re.search(r"(?:Error|Exception):[^\r\n]*", search_in)
         if m:
-            colored = after[: m.end()]
-            rest = after[m.end() :]
-            return text[:idx] + _RED + colored + _RESET + rest, False
-        else:
-            return text[:idx] + _RED + after, True
+            return prefix + _RED + search_in[:m.end()] + _RESET + search_in[m.end():], False
+        return prefix + _RED + search_in, True
     if in_error:
         m = re.search(r"(?:Error|Exception):[^\r\n]*", text)
         if m:
-            colored = text[: m.end()]
-            rest = text[m.end() :]
-            return _RED + colored + _RESET + rest, False
-        else:
-            return _RED + text + _RESET, True
+            return _RED + text[:m.end()] + _RESET + text[m.end():], False
+        return _RED + text + _RESET, True
     return text, False
 
 
@@ -617,33 +617,9 @@ class MicroPython:
         finally:
             self._kbd_set = False
 
-    def _write_raw_chunk(self, data):
-        """通过系统标准输入的缓冲区直接将原始字节写入设备已打开的文件。
-
-        协议:
-          1. 发送 Python 代码，通知设备从 stdin 读取 N 个原始字节
-          2. 发送 Ctrl+D 触发编译与执行
-          3. 等待设备开始执行、阻塞在 read() 上
-          4. 发送原始字节
-          5. 等待 \x04（执行完成信号）
-        """
-        code = (
-            "import sys\n"
-            f"b=sys.stdin.buffer.read({len(data)})\n"
-            "f.write(b)\n"
-        )
-        self._write(code.encode() + b"\x04")
-        time.sleep(0.05)  # 等待设备开始执行并阻塞在 stdin 上
-        self._write(data)
-        resp = self._read_until(b"\x04", timeout=self.timeout)
-        text = resp.decode("utf-8", errors="replace").strip()
-        if "Traceback" in text:
-            raise RuntimeError(f"设备写入错误:\n{text}")
-
     @staticmethod
     def _compute_crc32(data: bytes) -> int:
         """计算数据的 CRC32 校验值。"""
-        import binascii
         return binascii.crc32(data) & 0xffffffff
 
     def _verify_file_on_device(self, remote_path: str, expected_size: int,
@@ -706,6 +682,7 @@ class MicroPython:
         if active_tags and local_path.endswith(".py"):
             from .preprocessor import preprocess
             pp_dir = tempfile.mkdtemp()
+            os.chmod(pp_dir, 0o700)
             tmp_dirs.append(pp_dir)
             pp_path = os.path.join(pp_dir, Path(local_path).name)
             Path(pp_path).write_text(
@@ -730,7 +707,6 @@ class MicroPython:
                 actual_remote = actual_remote[:-3] + ".mpy"
 
         file_size = os.path.getsize(actual_local)
-        chunk_size = self.config["chunk_size"]
         verify_mode = self.config.get("verify", "size")
         max_retries = self.config.get("max_retries", 2)
 
@@ -740,7 +716,7 @@ class MicroPython:
             with open(actual_local, "rb") as f:
                 expected_crc = self._compute_crc32(f.read())
 
-        print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={chunk_size})")
+        print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={DEFAULT_CHUNK_SIZE})")
 
         try:
             with self._repl_log_ctx():
@@ -759,7 +735,6 @@ class MicroPython:
                         )
                         self._write(SET_EXECUTE)
                         time.sleep(0.3)
-                        self._drain_rx_log()
 
                         with open(actual_local, 'rb') as f:
                             for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
@@ -831,6 +806,7 @@ class MicroPython:
             if active_tags and actual_local.endswith(".py"):
                 from .preprocessor import preprocess
                 pp_dir = tempfile.mkdtemp()
+                os.chmod(pp_dir, 0o700)
                 tmp_dirs.append(pp_dir)
                 pp_path = os.path.join(pp_dir, Path(actual_local).name)
                 Path(pp_path).write_text(
@@ -904,7 +880,6 @@ class MicroPython:
                     try:
                         self._write(script.encode() + SET_EXECUTE)
                         time.sleep(0.3)
-                        self._drain_rx_log()
 
                         for offset in range(0, len(all_data), DEFAULT_CHUNK_SIZE):
                             self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
@@ -1256,6 +1231,8 @@ class MicroPython:
                     size = _grep_size_after_ok(buf)
                 if size >= 0:
                     raw_start = _grep_raw_start(buf)
+                    if size >= 0 and len(buf) > size + 131072:
+                        break  # 数据远超预期，防异常设备耗尽内存
                     if raw_start >= 0 and len(buf) - raw_start >= size:
                         time.sleep(0.05)
                         buf += self.ser.read(self.ser.in_waiting)
@@ -1468,7 +1445,7 @@ class MicroPython:
             "  sizes.append(os.stat(f)[6])\n"
             " except:\n"
             "  sizes.append(-1)\n"
-            "_out.write(b'SZ:'+repr(sizes).encode()+b'\\n')\n"
+            "_out.write(b'SZ:'+','.join(str(s) for s in sizes).encode()+b'\\n')\n"
             "for i,f in enumerate(files):\n"
             " if sizes[i]>=0:\n"
             "  with open(f,'rb') as fp:\n"
@@ -1490,13 +1467,15 @@ class MicroPython:
         while time.time() < deadline:
             if self.ser.in_waiting:
                 buf += self.ser.read(self.ser.in_waiting)
+                if expected_total >= 0 and len(buf) > expected_total + 131072:
+                    break  # 数据远超预期，防异常设备耗尽内存
                 if expected_total < 0:
                     sz_marker = buf.find(b"SZ:")
                     if sz_marker >= 0:
                         nl = buf.find(b"\n", sz_marker)
                         if nl >= 0:
                             try:
-                                sizes = eval(buf[sz_marker + 3:nl])
+                                sizes = [int(x) for x in buf[sz_marker + 3:nl].decode().split(',')]
                                 expected_total = sum(s for s in sizes if s >= 0)
                                 raw_start = nl + 1
                             except Exception:
@@ -1504,10 +1483,7 @@ class MicroPython:
                 if expected_total >= 0:
                     raw_len = len(buf) - raw_start
                     # 去除尾部协议标记后判断是否收足
-                    raw = buf[raw_start:]
-                    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
-                        if raw.endswith(trailer):
-                            raw = raw[:-len(trailer)]
+                    raw = _strip_repl_trailer(buf[raw_start:])
                     if len(raw) >= expected_total:
                         time.sleep(0.05)
                         buf += self.ser.read(self.ser.in_waiting)
@@ -1519,11 +1495,12 @@ class MicroPython:
             print(f"  {_RED}[ERROR]{_RESET} 无法获取文件大小信息")
             return
 
+        if len(sizes) != len(remote_files):
+            print(f"  {_RED}[ERROR]{_RESET} 设备返回文件数量不匹配（期望 {len(remote_files)}，收到 {len(sizes)}）")
+            return
+
         # ── 解析原始数据 ──
-        raw = buf[raw_start:]
-        for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
-            if raw.endswith(trailer):
-                raw = raw[:-len(trailer)]
+        raw = _strip_repl_trailer(buf[raw_start:])
 
         if len(raw) < expected_total:
             print(f"  {_RED}[ERROR]{_RESET} 数据不完整: 期望 {expected_total} 字节, 收到 {len(raw)} 字节")

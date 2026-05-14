@@ -3,7 +3,8 @@ import typer
 import sys
 import re
 from typing import Optional
-from .utils.Flash import MicroPython, create_default_config
+from .utils.Flash import MicroPython
+from .utils.config import create_default_config
 from .project.project import init_project, init_stubs, new_project_interactive
 
 
@@ -80,6 +81,14 @@ def _fetch_brief(port: str) -> str:
     return "  " + "  ".join(lines) if lines else ""
 
 
+def _mp_factory(port: str, baudrate: int, timeout: int,
+                webrepl: Optional[str] = None,
+                password: Optional[str] = None) -> MicroPython:
+    """创建 MicroPython 实例，支持串口和 WebREPL。"""
+    return MicroPython(port=port, baudrate=baudrate, timeout=timeout,
+                       webrepl_url=webrepl, password=password)
+
+
 @app.command()
 def scan(
     vid: Optional[int] = typer.Option(None, "--vid", help="按 VID 过滤（十进制）"),
@@ -123,10 +132,12 @@ def flash(
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target（离线时使用）"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """刷入单个文件到设备"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
@@ -153,9 +164,11 @@ def repl(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """连接MicroPython设备REPL"""
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         mp.repl_()
@@ -177,14 +190,16 @@ def flash_program(
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """刷入整个目录到设备（需指定远程路径前缀）"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         if no_compile:
-            mp.config["auto_compile"] = False
+            mp.config.auto_compile = False
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if target:
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
@@ -220,9 +235,11 @@ def run(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """在设备上执行 Python 代码"""
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         output = mp.run(code)
@@ -239,9 +256,11 @@ def reset(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """软重启 MicroPython 设备"""
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         mp.reset()
@@ -285,6 +304,8 @@ def board_info(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """获取设备板级信息（固件、CPU、内存、Flash 等）"""
     code = """\
@@ -315,7 +336,7 @@ try:
  print('MAC:'+':'.join('%02x'%b for b in w.config('mac')))
 except:pass
 """
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         output = mp.run(code)
@@ -432,14 +453,16 @@ def project_flash(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """根据哈希配置仅刷入新增或已更改的文件"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         if no_compile:
-            mp.config["auto_compile"] = False
+            mp.config.auto_compile = False
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if target:
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
@@ -474,10 +497,12 @@ def project_status(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """比对本地哈希和设备端文件大小，显示差异清单（不刷入）"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         if target:
@@ -509,10 +534,12 @@ def project_pull(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式，仅列出，不实际下载"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """从设备下载项目文件到本地"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         if target:
@@ -539,10 +566,11 @@ fs_app = typer.Typer(help="MicroPython 设备文件浏览器")
 app.add_typer(fs_app, name="fs")
 
 
-def _build_tag_args(mp, target, feature, no_feature):
+def _build_tag_args(mp: MicroPython, target: Optional[str],
+                    feature: Optional[str], no_feature: Optional[str]) -> set[str]:
     """构建 active_tags 公共逻辑。"""
     if target:
-        active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
+        active_tags: set[str] = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
         active_tags.add(target.upper())
     else:
         active_tags = mp.detect_tags()
@@ -561,10 +589,12 @@ def fs_ls(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """列出设备目录内容"""
     path = _norm_path(path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         items = mp.fs_ls(path)
@@ -614,10 +644,12 @@ def fs_rm(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """删除设备上的文件"""
     path = _norm_path(path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         if mp.fs_rm(path):
@@ -636,10 +668,12 @@ def fs_cat(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """打印设备上文本文件的内容"""
     path = _norm_path(path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         print(mp.fs_cat(path))
@@ -660,10 +694,12 @@ def fs_put(
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 tags，逗号分隔"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 tags，逗号分隔"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """上传文件到设备"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
@@ -686,10 +722,12 @@ def fs_get(
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
                                 help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
     """从设备下载文件到本地"""
     remote_path = _norm_path(remote_path)
-    mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         dst = local_path or os.path.basename(remote_path)

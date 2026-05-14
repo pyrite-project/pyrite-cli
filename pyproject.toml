@@ -14,7 +14,11 @@ dependencies = [
     "mpy-cross",
     "libcst>=1.1.0",
     "tomli>=2.0.0; python_version < '3.11'",
+    "websocket-client>=1.6.0",
 ]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.8.0"]
 
 [project.scripts]
 pyrcli = "cli.main:main"
@@ -24,3 +28,12 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 
 [tool.setuptools.package-data]
 "cli.project" = ["feature_stub.pyi"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true

@@ -3,41 +3,28 @@ import time
 import json
 import binascii
 import hashlib
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import re
 import shutil
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 import serial
 import serial.tools.list_ports
 
-# ANSI 颜色
-_GREEN = "\033[32m"
-_YELLOW = "\033[33m"
-_RED = "\033[31m"
-_RESET = "\033[0m"
+from .ansi import _GREEN, _YELLOW, _RED, _RESET
+from .config import _load_config, DEFAULT_CHUNK_SIZE, HASH_CONFIG_FILE, _HASH_VERSION
+from .types import PyriteConfig
+from .transport import Transport
+from .serial_transport import SerialTransport
+from .webrepl_transport import WebREPLTransport
+from .compiler import _compile_to_mpy, _compile_files_parallel
 
 try:
-    import tomllib # type: ignore
+    from tqdm import tqdm
 except ImportError:
-    import tomli as tomllib  # type: ignore
-
-CONFIG_FILE = ".pyrite_config.json"
-DEFAULT_CHUNK_SIZE = 4096  # 单位:字节
-
-HASH_CONFIG_FILE = "pyrite_file_config.json"
-_HASH_VERSION = 1
-
-_DEFAULT_BOARD_TAGS = {
-    "ESP32":  ["ESP32", "wifi"],
-    "ESP8266": ["ESP8266"],
-    "RP2040": ["RP2040"],
-    "PICO":   ["RP2040"],
-    "STM32":  ["STM32"],
-}
+    tqdm = None
 
 ENTER_RAW_REPL = b'\x01'
 EXIT_RAW_REPL = b'\x02'
@@ -80,106 +67,6 @@ for file_size, file_path in entries:
 # 恢复 Ctrl+C 中断
 micropython.kbd_intr(3)
 """
-
-def _load_config():
-    """从当前或上级目录加载配置文件，未找到则使用默认值。"""
-    cfg = {
-        "chunk_size": DEFAULT_CHUNK_SIZE,
-        "download_threads": 4,
-        "auto_compile": True,
-        "verify": "size",
-        "max_retries": 2,
-        "board_tags": dict(_DEFAULT_BOARD_TAGS),
-    }
-    cwd = Path.cwd()
-    for parent in [cwd] + list(cwd.parents):
-        p = parent / CONFIG_FILE
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data.get("chunk_size"), int) and data["chunk_size"] > 0:
-                    cfg["chunk_size"] = data["chunk_size"]
-                t = data.get("download_threads", 4)
-                if isinstance(t, int) and t > 0:
-                    cfg["download_threads"] = min(t, 12)
-                if isinstance(data.get("auto_compile"), bool):
-                    cfg["auto_compile"] = data["auto_compile"]
-                v = data.get("verify", "size")
-                if v in ("off", "size", "crc32"):
-                    cfg["verify"] = v
-                r = data.get("max_retries", 2)
-                if isinstance(r, int) and r >= 0:
-                    cfg["max_retries"] = r
-            except (json.JSONDecodeError, OSError):
-                pass
-            break
-    for parent in [cwd] + list(cwd.parents):
-        p = parent / "pyproject.toml"
-        if p.exists():
-            try:
-                data = tomllib.loads(p.read_text(encoding="utf-8"))
-                bt = data.get("tool", {}).get("pyrite", {}).get("board_tags", {})
-                cfg["board_tags"].update({k.upper(): v for k, v in bt.items()})
-            except Exception:
-                pass
-            break
-    return cfg
-
-
-def _compile_to_mpy(local_path: str, bytecode_ver: int = None, arch: str = None): # type: ignore
-    """编译 .py -> .mpy，返回 (tmp_mpy_path, tmp_dir)；失败返回 (None, None)。"""
-    tmp_dir = tempfile.mkdtemp()
-    os.chmod(tmp_dir, 0o700)
-    out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
-    args = [local_path, "-o", out_path]
-    if arch is not None:
-        args += [f"-march={arch}"]
-    try:
-        import mpy_cross
-        if bytecode_ver is not None:
-            mpy_cross.set_version(micropython=None, bytecode=str(bytecode_ver))
-        r = mpy_cross.run(*args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        r.wait(timeout=30)
-        if r.returncode == 0:
-            return out_path, tmp_dir
-        print(f"  {_YELLOW}[WARN]{_RESET} mpy-cross 编译失败，回退到 .py\n"
-              f"         {r.stderr.read().decode(errors='replace').strip()}") # type: ignore
-    except ImportError:
-        print(f"  {_YELLOW}[INFO]{_RESET} 未找到 mpy-cross，跳过编译")
-    except Exception as e:
-        print(f"  {_YELLOW}[WARN]{_RESET} 编译异常: {e}，回退到 .py")
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return None, None
-
-
-def _compile_files_parallel(local_paths: list, bytecode_ver: int = None,
-                            arch: str = None, max_workers: int = 4):
-    """并行编译多个 .py → .mpy。
-
-    Args:
-        local_paths: 本地 .py 路径列表
-        bytecode_ver: mpy 字节码版本
-        arch: 目标架构
-        max_workers: 最大并行数
-
-    Returns:
-        dict: {local_path: (mpy_path, tmp_dir)}，编译失败则值为 (None, None)
-    """
-    if not local_paths:
-        return {}
-    results = {}
-    workers = min(max_workers, len(local_paths))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_compile_to_mpy, lp, bytecode_ver, arch): lp
-                   for lp in local_paths}
-        for future in as_completed(futures):
-            lp = futures[future]
-            try:
-                results[lp] = future.result()
-            except Exception:
-                results[lp] = (None, None)
-    return results
-
 
 # ── bytes 协议辅助函数（模块级，供 _read_device_file 使用） ─────
 
@@ -263,20 +150,32 @@ class MicroPython:
     上传时自动设置 kbd_intr(-1) 防止数据流中的 0x03 字节重启设备。
     """
 
-    def __init__(self, port=None, baudrate=115200, timeout=10):
-        self.config = _load_config()
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baudrate: int = 115200,
+        timeout: int = 10,
+        transport: Optional['Transport'] = None,
+        webrepl_url: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> None:
+        self.config = _load_config()  # type: PyriteConfig
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self.ser = serial.Serial()  # 未打开的空串口对象
-        self._in_raw = False     # 是否处于原始 REPL 模式
-        self._kbd_set = False    # 是否已设置 kbd_intr(-1)
-        self._repl_log_file = None   # REPL 原始数据日志文件
+        if transport:
+            self.transport = transport
+        elif webrepl_url:
+            self.transport = WebREPLTransport(webrepl_url, password)
+        else:
+            self.transport = SerialTransport(port, baudrate, timeout)  # type: ignore
+        self._repl_log_file: Optional[Any] = None   # REPL 原始数据日志文件
 
     @staticmethod
-    def scan_ports(vid=None, pid=None, keyword=None, require_vid=True):
+    def scan_ports(vid: Optional[int] = None, pid: Optional[int] = None,
+                   keyword: Optional[str] = None, require_vid: bool = True) -> List[Dict[str, Any]]:
         """扫描可用串口，可按 VID/PID/描述关键字过滤。默认过滤掉无 VID 的设备。"""
-        ports = []
+        ports: List[Dict[str, Any]] = []
         for p in serial.tools.list_ports.comports():
             if require_vid and p.vid is None:
                 continue
@@ -296,7 +195,7 @@ class MicroPython:
             })
         return ports
 
-    def connect(self, port=None, baudrate=None):
+    def connect(self, port: Optional[str] = None, baudrate: Optional[int] = None) -> bool:
         """打开串口连接到设备。
 
         Args:
@@ -306,7 +205,7 @@ class MicroPython:
         Returns:
             True 表示连接成功
         """
-        if self.ser.is_open:
+        if self.is_connected:
             self.disconnect()
 
         self.port = port or self.port
@@ -315,73 +214,80 @@ class MicroPython:
 
         baud = baudrate or self.baudrate
 
-        self.ser = serial.Serial(
-            port=self.port,
-            baudrate=baud,
-            timeout=self.timeout,
-            write_timeout=self.timeout,
-        )
-        # 等待设备串口就绪
-        time.sleep(0.3)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
+        if isinstance(self.transport, SerialTransport):
+            self.transport.port = self.port
+            self.transport.baudrate = baud
+        self.transport.connect()
         return True
 
-    def disconnect(self):
-        """断开串口连接，恢复设备 kbd_intr 设置并退出原始 REPL。"""
-        self._restore_kbd_intr()
-        self._exit_raw_repl()
-        if self.ser.is_open:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-
-    @property
-    def is_connected(self):
-        """是否已连接。"""
-        return self.ser.is_open
-
-    def _enter_raw_repl(self):
-        """切换到原始 REPL 模式（Ctrl+A）。"""
-        if self._in_raw:
+    def _ensure_connected(self) -> None:
+        """确保串口已连接，断线时自动重连并初始化设备状态。"""
+        if self.is_connected:
             return
+        max_retries = self.config.max_retries
+        for attempt in range(max_retries + 1):
+            try:
+                print(f"  {_YELLOW}[RECONNECT]{_RESET} 串口已断开，尝试重新连接 ({attempt + 1}/{max_retries + 1})...")
+                self.connect()
+                return
+            except Exception as e:
+                if attempt >= max_retries:
+                    raise ConnectionError(f"重连失败 ({max_retries + 1} 次): {e}")
+                time.sleep(1)
 
-        # 连发两次 Ctrl+C 中断正在运行的程序
+    def _init_device_state(self) -> None:
+        """初始化设备到原始 REPL 模式并设置 kbd_intr(-1)。
+
+        在原始 REPL 模式中执行完整序列：
+        Ctrl+C × 2 → Ctrl+A → fallback Ctrl+D → Ctrl+A → kbd_intr(-1)
+        """
         for _ in range(2):
             self._write(SET_RESET)
             time.sleep(0.1)
-        self.ser.reset_input_buffer()
+        self.transport.reset_input_buffer()
 
-        # Ctrl+A 进入原始 REPL
         self._write(ENTER_RAW_REPL)
         data = self._read_until(b">", timeout=2)
 
         if b">" not in data:
-            # Ctrl+C 未能中断，尝试 Ctrl+D 软重启后再进入
-            self._write(SET_EXECUTE)  # Ctrl+D
+            self._write(SET_EXECUTE)
             time.sleep(0.8)
-            self.ser.reset_input_buffer()
+            self.transport.reset_input_buffer()
             self._write(ENTER_RAW_REPL)
             data = self._read_until(b">", timeout=3)
 
         if b">" not in data:
             raise RuntimeError(f"无法进入原始 REPL 模式，设备响应: {data[:100]!r}")
 
-        self._in_raw = True
+        self._execute("import micropython; micropython.kbd_intr(-1)", timeout=3)
+
+    def disconnect(self) -> None:
+        """断开串口连接，退出原始 REPL 并关闭串口。"""
+        self._exit_raw_repl()
+        if self.transport.is_connected:
+            try:
+                self.transport.disconnect()
+            except Exception:
+                pass
+
+    @property
+    def is_connected(self) -> bool:
+        """是否已连接。"""
+        return self.transport.is_connected
+
+    def _enter_raw_repl(self) -> None:
+        """确保连接并进入原始 REPL 模式。"""
+        self._ensure_connected()
+        self._init_device_state()
 
     def _exit_raw_repl(self):
         """退出原始 REPL 回到普通 REPL（Ctrl+B）。"""
-        if not self._in_raw:
-            return
         try:
             self._write(EXIT_RAW_REPL)
             time.sleep(0.1)
-            self.ser.reset_input_buffer()
+            self.transport.reset_input_buffer()
         except Exception:
             pass
-        finally:
-            self._in_raw = False
 
     # ── REPL 原始日志 ──────────────────────────────────────────────
     def _open_repl_log(self):
@@ -413,10 +319,10 @@ class MicroPython:
 
     def _drain_rx_log(self):
         """非阻塞读取串口 RX 缓冲中所有数据并记录到日志。"""
-        if not self.ser.is_open:
+        if not self.transport.is_connected:
             return
-        while self.ser.in_waiting:
-            chunk = self.ser.read(self.ser.in_waiting)
+        while self.transport.in_waiting:
+            chunk = self.transport.read(self.transport.in_waiting)
             if chunk:
                 self._log_repl_data("rx", chunk)
 
@@ -437,20 +343,20 @@ class MicroPython:
             self._repl_log_file.write(f"[{ts}] {marker} [hex] {data.hex(' ')}\n")
         self._repl_log_file.flush()
 
-    def _write(self, data):
+    def _write(self, data: bytes | str) -> None:
         """写入数据到串口。"""
         if isinstance(data, str):
             data = data.encode("utf-8")
         self._log_repl_data("tx", data)
-        self.ser.write(data)
+        self.transport.write(data)
 
-    def _read_until(self, terminator=b"\x04", timeout=None):
+    def _read_until(self, terminator: bytes = b"\x04", timeout: Optional[int] = None) -> bytes:
         timeout = timeout or self.timeout
         buf = b""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.ser.in_waiting:
-                chunk = self.ser.read(self.ser.in_waiting)
+            if self.transport.in_waiting:
+                chunk = self.transport.read(self.transport.in_waiting)
                 buf += chunk
                 self._log_repl_data("rx", chunk)
                 idx = buf.find(terminator)
@@ -460,7 +366,7 @@ class MicroPython:
             time.sleep(0.02)
         return buf
 
-    def repl_(self):
+    def repl_(self) -> None:
         """交互式 MicroPython REPL（串口透传模式）。"""
         # 跨平台非阻塞键盘输入
         try:
@@ -476,10 +382,10 @@ class MicroPython:
         for _ in range(2):
             self._write(SET_RESET)
             time.sleep(0.1)
-        self.ser.reset_input_buffer()
+        self.transport.reset_input_buffer()
         self._write(EXIT_RAW_REPL)
         time.sleep(0.3)
-        self.ser.reset_input_buffer()
+        self.transport.reset_input_buffer()
 
         print("=== MicroPython REPL ===")
         print()
@@ -500,8 +406,8 @@ class MicroPython:
         try:
             while self.is_connected:
                 # ── 串口 → 终端 ──
-                while self.ser.in_waiting:
-                    chunk = self.ser.read(self.ser.in_waiting)
+                while self.transport.in_waiting:
+                    chunk = self.transport.read(self.transport.in_waiting)
                     if not chunk:
                         continue
                     text = chunk.decode("utf-8", errors="replace")
@@ -568,7 +474,7 @@ class MicroPython:
                 except Exception:
                     pass
 
-    def _execute(self, code, timeout=10):
+    def _execute(self, code: str | bytes, timeout: int = 10) -> str:
         """在原始 REPL 中执行 Python 代码并返回设备输出。
 
         Args:
@@ -578,9 +484,6 @@ class MicroPython:
         Returns:
             设备输出的 stdout 文本
         """
-        if not self._in_raw:
-            raise RuntimeError("不在原始 REPL 模式，请先调用 _enter_raw_repl()")
-
         if isinstance(code, str):
             code = code.encode("utf-8")
 
@@ -600,23 +503,6 @@ class MicroPython:
 
         return text
 
-    def _setup_kbd_intr(self):
-        """设置 kbd_intr(-1)，禁用 Ctrl+C 中断（防止数据中 0x03 重启设备）。"""
-        self._execute("import micropython; micropython.kbd_intr(-1)")
-        self._kbd_set = True
-
-    def _restore_kbd_intr(self):
-        """恢复 kbd_intr(3)，重新启用 Ctrl+C 中断。"""
-        if not self._kbd_set:
-            return
-        try:
-            if self.is_connected and self._in_raw:
-                self._execute("import micropython; micropython.kbd_intr(3)", timeout=3)
-        except Exception:
-            pass
-        finally:
-            self._kbd_set = False
-
     @staticmethod
     def _compute_crc32(data: bytes) -> int:
         """计算数据的 CRC32 校验值。"""
@@ -624,7 +510,7 @@ class MicroPython:
 
     def _verify_file_on_device(self, remote_path: str, expected_size: int,
                                 verify_mode: str = "size",
-                                expected_crc: int | None = None) -> bool:
+                                expected_crc: Optional[int] = None) -> bool:
         """验证设备上的文件与预期一致。
 
         在原始 REPL 中执行验证命令，比较文件大小和可选的 CRC32。
@@ -670,11 +556,15 @@ class MicroPython:
 
         return True
 
-    def flash_file(self, local_path, remote_path=None, compile=None, bytecode_ver=None, arch=None, active_tags=None):
+    def flash_file(self, local_path: str, remote_path: Optional[str] = None,
+                   compile: Optional[bool] = None,
+                   bytecode_ver: Optional[int] = None,
+                   arch: Optional[str] = None,
+                   active_tags: Optional[Set[str]] = None) -> None:
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
 
-        should_compile = self.config["auto_compile"] if compile is None else compile
+        should_compile = self.config.auto_compile if compile is None else compile
         tmp_dirs = []
         actual_local = local_path
         actual_remote = (remote_path or os.path.basename(local_path)).replace("\\", "/")
@@ -707,8 +597,8 @@ class MicroPython:
                 actual_remote = actual_remote[:-3] + ".mpy"
 
         file_size = os.path.getsize(actual_local)
-        verify_mode = self.config.get("verify", "size")
-        max_retries = self.config.get("max_retries", 2)
+        verify_mode = self.config.verify
+        max_retries = self.config.max_retries
 
         # 预计算 CRC32（如果需要）
         expected_crc = None
@@ -737,8 +627,16 @@ class MicroPython:
                         time.sleep(0.3)
 
                         with open(actual_local, 'rb') as f:
-                            for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
-                                self._write(f.read(DEFAULT_CHUNK_SIZE))
+                            if tqdm:
+                                with tqdm(total=file_size, desc="传输中", unit="B",
+                                          unit_scale=True, leave=False) as pbar:
+                                    for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
+                                        chunk = f.read(DEFAULT_CHUNK_SIZE)
+                                        self._write(chunk)
+                                        pbar.update(len(chunk))
+                            else:
+                                for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
+                                    self._write(f.read(DEFAULT_CHUNK_SIZE))
 
                         self._drain_rx_log()
 
@@ -757,7 +655,7 @@ class MicroPython:
                             print(f"  {_GREEN}✓ 刷入成功 (校验已关闭){_RESET}")
                         return  # 成功
 
-                    except Exception as e:
+                    except (serial.SerialException, Exception) as e:
                         if attempt >= max_retries:
                             raise
                         print(f"  {_YELLOW}{e}，准备重试 ({attempt+1}/{max_retries})...{_RESET}")
@@ -769,7 +667,10 @@ class MicroPython:
             for d in tmp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
 
-    def flash_program(self, local_dir, remote_prefix="", bytecode_ver=None, arch=None, active_tags=None, manifest_path=None):
+    def flash_program(self, local_dir: str, remote_prefix: str = "",
+                      bytecode_ver: Optional[int] = None, arch: Optional[str] = None,
+                      active_tags: Optional[Set[str]] = None,
+                      manifest_path: Optional[str] = None) -> List[Tuple[str, str, bool]]:
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
@@ -792,7 +693,7 @@ class MicroPython:
         file_list = []    # [(remote_path, local_compiled_path, size)]
         file_meta = []    # [(size, remote_path), ...] → 替换到 FLASH_PROGRAM
         all_data = b""
-        verify_mode = self.config.get("verify", "size")
+        verify_mode = self.config.verify
         expected_crcs = {}   # {remote_path: crc32} 用于校验
 
         # 第一轮：预处理，收集编译候选
@@ -816,7 +717,7 @@ class MicroPython:
                 actual_local = pp_path
             basename = Path(actual_remote).name
             needs_compile = (
-                self.config["auto_compile"]
+                self.config.auto_compile
                 and basename not in ("main.py", "boot.py")
                 and actual_local.endswith(".py")
             )
@@ -847,7 +748,7 @@ class MicroPython:
             print("  没有需要刷入的文件。")
             return []
 
-        max_retries = self.config.get("max_retries", 2)
+        max_retries = self.config.max_retries
 
         try:
             for attempt in range(max_retries + 1):
@@ -881,8 +782,17 @@ class MicroPython:
                         self._write(script.encode() + SET_EXECUTE)
                         time.sleep(0.3)
 
-                        for offset in range(0, len(all_data), DEFAULT_CHUNK_SIZE):
-                            self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
+                        total_data_size = len(all_data)
+                        if tqdm:
+                            with tqdm(total=total_data_size, desc="传输中", unit="B",
+                                      unit_scale=True, leave=False) as pbar:
+                                for offset in range(0, total_data_size, DEFAULT_CHUNK_SIZE):
+                                    chunk = all_data[offset:offset + DEFAULT_CHUNK_SIZE]
+                                    self._write(chunk)
+                                    pbar.update(len(chunk))
+                        else:
+                            for offset in range(0, total_data_size, DEFAULT_CHUNK_SIZE):
+                                self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
 
                         self._drain_rx_log()
 
@@ -927,7 +837,7 @@ class MicroPython:
                         print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
                         return [(lp, rp, True) for (rp, lp, sz) in file_list]
 
-                    except Exception as e:
+                    except (serial.SerialException, Exception) as e:
                         if attempt >= max_retries:
                             print(f"  {_RED}✗ 刷入失败: {e}{_RESET}")
                             return [(lp, rp, False) for (rp, lp, sz) in file_list]
@@ -936,7 +846,7 @@ class MicroPython:
             for d in tmp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
 
-    def get_mpy_version(self) -> tuple[int, str] | tuple[None, None]:
+    def get_mpy_version(self) -> Tuple[Optional[int], Optional[str]]:
         """从设备读取 mpy 字节码版本号和架构，返回 (ver, arch) 或 (None, None)。"""
         try:
             out = self.run(
@@ -952,7 +862,7 @@ class MicroPython:
         except Exception:
             return None, None
 
-    def detect_tags(self) -> set:
+    def detect_tags(self) -> Set[str]:
         """从设备读取 board 信息，返回 active_tags 集合。"""
         try:
             out = self.run("import os,sys\nprint(os.uname().machine)\nprint(sys.platform)")
@@ -960,7 +870,7 @@ class MicroPython:
             return set()
         lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
         combined = " ".join(lines).upper()
-        board_tags = self.config["board_tags"]
+        board_tags = self.config.board_tags
         tags = set()
         for kw, tag_list in board_tags.items():
             if kw in combined:
@@ -970,17 +880,14 @@ class MicroPython:
             tags.add(lines[1].upper())
         return tags
 
-    def run(self, code):
+    def run(self, code: str) -> str:
         """在设备上执行任意 Python 代码并返回输出。"""
-        if not self._in_raw:
-            self._enter_raw_repl()
+        self._enter_raw_repl()
         return self._execute(code)
 
-    def reset(self):
+    def reset(self) -> None:
         """软重启设备 (machine.reset())。"""
-        if not self._in_raw:
-            self._enter_raw_repl()
-        self._restore_kbd_intr()
+        self._enter_raw_repl()
         try:
             self._execute("import machine; machine.reset()", timeout=2)
         except Exception:
@@ -1025,8 +932,9 @@ class MicroPython:
         return [(lp, rp) for lp, rp in entries
                 if Path(rp).name != "manifest.py" and not lp.endswith(".pyi")]
 
-    def project_scan(self, local_dir: str, hash_config_path: str = None,
-                     active_tags: set = None, manifest_path: str = None):
+    def project_scan(self, local_dir: str, hash_config_path: Optional[str] = None,
+                     active_tags: Optional[Set[str]] = None,
+                     manifest_path: Optional[str] = None) -> str:
         """扫描项目，计算所有可刷入文件的 SHA256 哈希并保存到配置文件。
 
         Args:
@@ -1063,9 +971,10 @@ class MicroPython:
         return hash_config_path
 
     def project_flash(self, local_dir: str, remote_prefix: str,
-                      hash_config_path: str = None,
-                      bytecode_ver: int = None, arch: str = None,
-                      active_tags: set = None, manifest_path: str = None):
+                      hash_config_path: Optional[str] = None,
+                      bytecode_ver: Optional[int] = None, arch: Optional[str] = None,
+                      active_tags: Optional[Set[str]] = None,
+                      manifest_path: Optional[str] = None) -> List[Tuple[str, str, bool]]:
         """根据哈希配置，仅刷入新增或已更改的文件。
 
         需先调用 connect() 建立串口连接。
@@ -1225,8 +1134,8 @@ class MicroPython:
         deadline = time.time() + 30
         size = -1
         while time.time() < deadline:
-            if self.ser.in_waiting:
-                buf += self.ser.read(self.ser.in_waiting)
+            if self.transport.in_waiting:
+                buf += self.transport.read(self.transport.in_waiting)
                 if size < 0:
                     size = _grep_size_after_ok(buf)
                 if size >= 0:
@@ -1235,7 +1144,7 @@ class MicroPython:
                         break  # 数据远超预期，防异常设备耗尽内存
                     if raw_start >= 0 and len(buf) - raw_start >= size:
                         time.sleep(0.05)
-                        buf += self.ser.read(self.ser.in_waiting)
+                        buf += self.transport.read(self.transport.in_waiting)
                         break
             else:
                 time.sleep(0.02)
@@ -1274,8 +1183,9 @@ class MicroPython:
     # ── project status / pull ────────────────────────────────────
 
     def project_status(self, local_dir: str, remote_prefix: str,
-                       hash_config_path: str = None,
-                       active_tags: set = None, manifest_path: str = None):
+                       hash_config_path: Optional[str] = None,
+                       active_tags: Optional[Set[str]] = None,
+                       manifest_path: Optional[str] = None) -> None:
         """比对本地哈希和设备端文件，显示差异清单（不刷入）。
 
         需先调用 connect() 建立串口连接。
@@ -1388,9 +1298,10 @@ class MicroPython:
         return files
 
     def project_pull(self, local_dir: str, remote_prefix: str,
-                     hash_config_path: str = None,
-                     active_tags: set = None, manifest_path: str = None,
-                     dry_run: bool = False):
+                     hash_config_path: Optional[str] = None,
+                     active_tags: Optional[Set[str]] = None,
+                     manifest_path: Optional[str] = None,
+                     dry_run: bool = False) -> None:
         """从设备下载文件到本地（批量传输）。
 
         类似 flash_program 的批处理逻辑：
@@ -1465,8 +1376,8 @@ class MicroPython:
         raw_start = -1
 
         while time.time() < deadline:
-            if self.ser.in_waiting:
-                buf += self.ser.read(self.ser.in_waiting)
+            if self.transport.in_waiting:
+                buf += self.transport.read(self.transport.in_waiting)
                 if expected_total >= 0 and len(buf) > expected_total + 131072:
                     break  # 数据远超预期，防异常设备耗尽内存
                 if expected_total < 0:
@@ -1486,7 +1397,7 @@ class MicroPython:
                     raw = _strip_repl_trailer(buf[raw_start:])
                     if len(raw) >= expected_total:
                         time.sleep(0.05)
-                        buf += self.ser.read(self.ser.in_waiting)
+                        buf += self.transport.read(self.transport.in_waiting)
                         break
             else:
                 time.sleep(0.02)
@@ -1535,7 +1446,7 @@ class MicroPython:
 
     # ── 设备文件管理 (fs) ─────────────────────────────────────────
 
-    def fs_ls(self, remote_path: str = "/") -> list:
+    def fs_ls(self, remote_path: str = "/") -> List[Dict[str, str]]:
         """列出设备目录下的文件和子目录。"""
         script = (
             "import os\n"
@@ -1561,7 +1472,7 @@ class MicroPython:
                 items.append({'size': parts[0], 'type': parts[1], 'name': parts[2]})
         return items
 
-    def fs_df(self) -> dict:
+    def fs_df(self) -> Dict[str, int]:
         """获取设备文件系统使用情况。"""
         script = (
             "import os\n"
@@ -1603,29 +1514,8 @@ class MicroPython:
             f.write(data)
         return len(data)
 
-    def __enter__(self):
+    def __enter__(self) -> 'MicroPython':
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.disconnect()
-
-def create_default_config():
-    """在工作目录创建默认配置文件。"""
-    cfg_path = Path.cwd() / CONFIG_FILE
-    cfg_path.write_text(
-        json.dumps({
-            "chunk_size": DEFAULT_CHUNK_SIZE,
-            "download_threads": 4,
-            "auto_compile": True,
-            "verify": "size",
-            "max_retries": 2,
-        }, indent=2),
-        encoding="utf-8",
-    )
-    print(f"默认配置文件已创建: {cfg_path}")
-    print(f"  chunk_size = {DEFAULT_CHUNK_SIZE} 字节（修改后需重启本工具）")
-    print("  download_threads = 4（存根下载线程数，范围 1~12）")
-    print("  auto_compile = true（自动编译 .py -> .mpy，设为 false 可关闭）")
-    print('  verify = "size"（校验模式：off=不校验, size=文件大小, crc32=文件大小+CRC32）')
-    print("  max_retries = 2（校验失败时最大重试次数，设为 0 关闭重试）")
-    return cfg_path

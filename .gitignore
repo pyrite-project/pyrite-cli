@@ -5,6 +5,7 @@ __pycache__/
 Claude.md
 .agents/
 .claude/
+pull_test/
 
 *.egg-info/
 .egg-info/

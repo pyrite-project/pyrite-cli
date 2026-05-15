@@ -4,8 +4,10 @@ import sys
 import re
 from typing import Optional
 from .utils.Flash import MicroPython
+from .utils.webrepl_micropython import WebREPLMicroPython
 from .utils.config import create_default_config
 from .project.project import init_project, init_stubs, new_project_interactive
+from .project.sync import ProjectSyncManager
 
 
 def _norm_path(p: str) -> str:
@@ -85,8 +87,9 @@ def _mp_factory(port: str, baudrate: int, timeout: int,
                 webrepl: Optional[str] = None,
                 password: Optional[str] = None) -> MicroPython:
     """创建 MicroPython 实例，支持串口和 WebREPL。"""
-    return MicroPython(port=port, baudrate=baudrate, timeout=timeout,
-                       webrepl_url=webrepl, password=password)
+    if webrepl:
+        return WebREPLMicroPython(url=webrepl, password=password, timeout=timeout)
+    return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 
 
 @app.command()
@@ -434,8 +437,8 @@ def project_hash(
         active_tags.update(t.strip() for t in feature.split(","))
     if no_feature:
         active_tags.difference_update(t.strip() for t in no_feature.split(","))
-    mp.project_scan(directory, hash_config_path=output,
-                    active_tags=active_tags or None, manifest_path=manifest)
+    ProjectSyncManager(mp).scan(directory, hash_config_path=output,
+                       active_tags=active_tags or None, manifest_path=manifest)
 
 
 @project_app.command("flash")
@@ -476,9 +479,9 @@ def project_flash(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.project_flash(directory, remote_path, hash_config_path=hash_config,
-                         bytecode_ver=ver, arch=arch,
-                         active_tags=active_tags or None, manifest_path=manifest)
+        ProjectSyncManager(mp).flash(directory, remote_path, hash_config_path=hash_config,
+                            bytecode_ver=ver, arch=arch,
+                            active_tags=active_tags or None, manifest_path=manifest)
     finally:
         mp.disconnect()
 
@@ -514,8 +517,8 @@ def project_status(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.project_status(directory, remote_path, hash_config_path=hash_config,
-                          active_tags=active_tags or None, manifest_path=manifest)
+        ProjectSyncManager(mp).status(directory, remote_path, hash_config_path=hash_config,
+                             active_tags=active_tags or None, manifest_path=manifest)
     finally:
         mp.disconnect()
 
@@ -553,9 +556,9 @@ def project_pull(
             if active_tags is None:
                 active_tags = set()
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.project_pull(directory, remote_path,
-                        active_tags=active_tags, manifest_path=manifest,
-                        dry_run=dry_run)
+        ProjectSyncManager(mp).pull(directory, remote_path,
+                           active_tags=active_tags, manifest_path=manifest,
+                           dry_run=dry_run)
     finally:
         mp.disconnect()
 

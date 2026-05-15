@@ -8,10 +8,14 @@ pyrite-cli/
 │   ├── main.py              # CLI entry (Typer command definitions)
 │   ├── py.typed             # PEP 561 type marker
 │   └── utils/
-│       ├── Flash.py         # Core: MicroPython device communication & file ops
+│       ├── Flash.py         # Core: MicroPython serial device communication
+│       │                       file flash/verify, fs browser, bytes download
+│       │                       (no project logic, no WebREPL references)
 │       ├── transport.py     # Transport layer ABC
 │       ├── serial_transport.py  # Serial transport implementation
 │       ├── webrepl_transport.py # WebREPL (WebSocket) transport
+│       ├── webrepl_micropython.py # WebREPLMicroPython — WebSocket subclass
+│       │                          inheriting all MicroPython high-level ops
 │       ├── types.py         # Type definitions (PyriteConfig dataclass)
 │       ├── config.py        # Config loading & default config generation
 │       ├── compiler.py      # mpy-cross compilation wrapper (parallel support)
@@ -20,7 +24,9 @@ pyrite-cli/
 │       └── manifest_loader.py # Secure manifest.py parser
 │   └── project/
 │       ├── project.py       # Project scaffolding, interactive hardware selection
-│       └── stubs.py         # GitHub API stub downloader
+│       ├── stubs.py         # GitHub API stub downloader
+│       └── sync.py          # ProjectSyncManager — hash-based incremental sync,
+│                              status comparison, batch pull (no device dependency)
 ├── test/
 │   ├── test_config.py       # Config loading edge-case tests
 │   ├── test_flash_utils.py  # REPL coloring, CRC32, file hash tests
@@ -187,12 +193,11 @@ Centralized `MicroPython` instance creation:
 ```python
 def _mp_factory(port, baudrate, timeout, ws, password) -> MicroPython:
     if ws:
-        transport = WebREPLTransport(ws, password)
-    else:
-        transport = SerialTransport(port, baudrate, timeout)
-    return MicroPython(transport=transport)
+        return WebREPLMicroPython(url=ws, password=password, timeout=timeout)
+    return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 ```
 
+WebREPLMicroPython is a subclass of MicroPython that internally creates a `WebREPLTransport` — `Flash.py` has no WebREPL awareness at all.
 Omitting `--ws` falls back to serial, preserving all existing behavior.
 
 ---
@@ -230,3 +235,51 @@ All `self.ser.*` operations migrated to `self.transport.*`:
 | `self.ser.is_open` | `self.transport.is_connected` |
 | `self.ser.close()` | `self.transport.disconnect()` |
 | `serial.Serial(port, ...)` | `SerialTransport(port, ...)` |
+
+### Project Logic Separation
+
+All project-level operations (hash-based incremental sync, status comparison, batch file pull) were moved out of `Flash.py` into `cli/project/sync.py`:
+
+| Moved Method (was on MicroPython) | Now on `ProjectSyncManager` |
+|-----------------------------------|----------------------------|
+| `project_scan()` | `scan()` |
+| `project_flash()` | `flash()` |
+| `project_status()` | `status()` |
+| `project_pull()` | `pull()` |
+| `_collect_project_files()` | static / `_collect_project_files()` |
+| `_check_device_files()` | `_check_device_files()` |
+| `_discover_device_files()` | `_discover_device_files()` |
+| `_compute_file_hash()` | module-level `compute_file_hash()` |
+
+`ProjectSyncManager` wraps a `MicroPython` instance and works through its public API (`run()`, `flash_file()`, `_enter_raw_repl()`, etc.):
+
+```python
+from .project.sync import ProjectSyncManager
+
+mp = MicroPython(port="COM3")
+mp.connect()
+syncer = ProjectSyncManager(mp)
+syncer.scan("./my_project")
+syncer.flash("./my_project", "/app")
+syncer.status("./my_project", "/app")
+syncer.pull("./my_project", "/")
+```
+
+`Flash.py` no longer imports `json`, `hashlib`, `HASH_CONFIG_FILE`, or `_HASH_VERSION`.
+
+---
+
+## WebREPLMicroPython (`utils/webrepl_micropython.py`)
+
+A thin subclass of `MicroPython` that uses `WebREPLTransport` instead of `SerialTransport`:
+
+```python
+class WebREPLMicroPython(MicroPython):
+    def __init__(self, url, password=None, timeout=10, transport=None):
+        t = transport or WebREPLTransport(url, password)
+        super().__init__(port=url, timeout=timeout, transport=t)
+```
+
+- Inherits all high-level operations (`flash_file`, `fs_ls`, `run`, `reset`, etc.)
+- Overrides `connect()` to WebSocket handshake (ignores serial-specific port/baudrate)
+- `Flash.py` has zero WebREPL awareness — the separation is enforced by the transport layer

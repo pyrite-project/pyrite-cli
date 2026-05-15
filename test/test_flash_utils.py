@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from cli.utils.Flash import MicroPython, _colorize_repl_output
+from cli.project.sync import compute_file_hash
 
 # ── _colorize_repl_output ───────────────────────────────────────────
 
@@ -126,20 +127,20 @@ class TestComputeFileHash:
         data = b"hello world"
         f.write_bytes(data)
 
-        result = MicroPython._compute_file_hash(str(f))
-        assert result == MicroPython._compute_file_hash(str(f))
+        result = compute_file_hash(str(f))
+        assert result == compute_file_hash(str(f))
 
     def test_different_files_different_hashes(self, tmp_path: Path):
         a = tmp_path / "a.bin"
         b = tmp_path / "b.bin"
         a.write_bytes(b"content a")
         b.write_bytes(b"content b")
-        assert MicroPython._compute_file_hash(str(a)) != MicroPython._compute_file_hash(str(b))
+        assert compute_file_hash(str(a)) != compute_file_hash(str(b))
 
     def test_empty_file(self, tmp_path: Path):
         f = tmp_path / "empty.bin"
         f.write_text("")
-        result = MicroPython._compute_file_hash(str(f))
+        result = compute_file_hash(str(f))
         assert isinstance(result, str)
         assert len(result) == 64  # SHA256 hex digest length
 
@@ -150,10 +151,10 @@ class TestComputeFileHash:
         data = b"x" * (1048576 + 100)
         f.write_bytes(data)
 
-        result = MicroPython._compute_file_hash(str(f))
+        result = compute_file_hash(str(f))
         assert isinstance(result, str)
         assert len(result) == 64
 
     def test_nonexistent_file_raises(self):
         with pytest.raises(FileNotFoundError):
-            MicroPython._compute_file_hash("/nonexistent/path/file.bin")
+            compute_file_hash("/nonexistent/path/file.bin")

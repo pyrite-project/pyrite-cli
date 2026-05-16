@@ -1,6 +1,6 @@
 from typing import Optional
 
-from .Flash import MicroPython
+from .flash import MicroPython
 from .transport import Transport
 from .webrepl_transport import WebREPLTransport
 

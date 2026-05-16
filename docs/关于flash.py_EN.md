@@ -1,4 +1,4 @@
-# `Flash.py` — MicroPython Device Flashing Tool
+# `flash.py` — MicroPython Device Flashing Tool
 
 Communicates with MicroPython devices (ESP32, ESP8266, RP2040, etc.) via serial (UART) **raw REPL mode**, supporting file upload, directory upload, interactive REPL terminal, automatic `.py → .mpy` compilation, and conditional compilation.
 

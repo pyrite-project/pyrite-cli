@@ -1,6 +1,6 @@
 import pytest
 
-from cli.utils.Flash import (
+from cli.utils.flash import (
     _strip_repl_trailer,
 )
 

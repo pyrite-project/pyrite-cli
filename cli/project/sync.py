@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from ..utils.ansi import _GREEN, _YELLOW, _RED, _RESET
-from ..utils.Flash import _strip_repl_trailer, SET_EXECUTE
+from ..utils.flash import _strip_repl_trailer, SET_EXECUTE
 from ..utils.config import _HASH_VERSION, HASH_CONFIG_FILE
 from ..utils.manifest_loader import load_manifest
 
 if TYPE_CHECKING:
-    from ..utils.Flash import MicroPython
+    from ..utils.flash import MicroPython
 
 
 def compute_file_hash(filepath: str) -> str:

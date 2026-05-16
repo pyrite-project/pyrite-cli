@@ -24,7 +24,7 @@ def detect_device_info(port: str, baudrate: int = 115200,
     Raises:
         RuntimeError: 设备连接失败或输出解析失败
     """
-    from ..utils.Flash import MicroPython
+    from ..utils.flash import MicroPython
 
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cli.utils.Flash import MicroPython, _colorize_repl_output
+from cli.utils.flash import MicroPython, _colorize_repl_output
 from cli.project.sync import compute_file_hash
 
 # ── _colorize_repl_output ───────────────────────────────────────────

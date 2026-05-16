@@ -925,6 +925,44 @@ class MicroPython:
                 items.append({'size': parts[0], 'type': parts[1], 'name': parts[2]})
         return items
 
+    def fs_ls_recursive(self, remote_path: str = "/") -> List[Dict[str, str]]:
+        """递归列出设备目录下的所有文件和子目录。
+
+        在设备端运行递归遍历脚本，一次性返回完整树状结果。
+        设备端输出格式与 fs_ls 一致：size|type|path
+        """
+        script = (
+            "import os\n"
+            "def _st(p):\n"
+            " s=os.stat(p); s=os.stat(p)\n"
+            " return s\n"
+            "def _walk(d):\n"
+            " for n in os.listdir(d):\n"
+            "  if d=='/':\n"
+            "   fp='/'+n\n"
+            "  else:\n"
+            "   fp=d+'/'+n\n"
+            "  try:\n"
+            "   s=_st(fp)\n"
+            "   is_dir=bool(s[0]&0x4000)\n"
+            "   print(str(s[6])+'|'+('D' if is_dir else 'F')+'|'+fp)\n"
+            "   if is_dir:\n"
+            "    _walk(fp)\n"
+            "  except OSError:\n"
+            "   print('?|?|'+fp)\n"
+            f"_walk({remote_path!r})\n"
+        )
+        out = self.run(script, timeout=30)
+        items = []
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('|', 2)
+            if len(parts) == 3:
+                items.append({'size': parts[0], 'type': parts[1], 'name': parts[2]})
+        return items
+
     def fs_df(self) -> Dict[str, int]:
         """获取设备文件系统使用情况。"""
         script = (

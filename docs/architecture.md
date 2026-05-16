@@ -8,9 +8,12 @@ pyrite-cli/
 │   ├── main.py              # CLI entry (Typer command definitions)
 │   ├── py.typed             # PEP 561 type marker
 │   └── utils/
-│       ├── Flash.py         # Core: MicroPython serial device communication
-│       │                       file flash/verify, fs browser, bytes download
-│       │                       (no project logic, no WebREPL references)
+│       ├── flash.py         # MicroPython serial device communication
+│       │                       file flash/verify, fs browser, bytes download,
+│       │                       recursive fs_ls_recursive
+│       ├── firmware.py      # Firmware flashing via esptool subprocess:
+│       │                       flash/erase/info/verify/read .bin firmware
+│       │                       (optional dependency: esptool)
 │       ├── transport.py     # Transport layer ABC
 │       ├── serial_transport.py  # Serial transport implementation
 │       ├── webrepl_transport.py # WebREPL (WebSocket) transport
@@ -42,7 +45,7 @@ pyrite-cli/
 
 ### Design Goal
 
-Decouple the underlying communication method from **hardcoded pyserial** to a **Transport ABC**, so `Flash.py`'s core logic does not care whether data flows over serial or WebSocket.
+Decouple the underlying communication method from **hardcoded pyserial** to a **Transport ABC**, so `flash.py`'s core logic does not care whether data flows over serial or WebSocket.
 
 ### Transport ABC (`transport.py`)
 
@@ -197,12 +200,12 @@ def _mp_factory(port, baudrate, timeout, ws, password) -> MicroPython:
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 ```
 
-WebREPLMicroPython is a subclass of MicroPython that internally creates a `WebREPLTransport` — `Flash.py` has no WebREPL awareness at all.
+WebREPLMicroPython is a subclass of MicroPython that internally creates a `WebREPLTransport` — `flash.py` has no WebREPL awareness at all.
 Omitting `--ws` falls back to serial, preserving all existing behavior.
 
 ---
 
-## Flash.py Core Refactor
+## flash.py Core Refactor
 
 ### State Machine Simplification
 
@@ -238,7 +241,7 @@ All `self.ser.*` operations migrated to `self.transport.*`:
 
 ### Project Logic Separation
 
-All project-level operations (hash-based incremental sync, status comparison, batch file pull) were moved out of `Flash.py` into `cli/project/sync.py`:
+All project-level operations (hash-based incremental sync, status comparison, batch file pull) were moved out of `flash.py` into `cli/project/sync.py`:
 
 | Moved Method (was on MicroPython) | Now on `ProjectSyncManager` |
 |-----------------------------------|----------------------------|
@@ -265,7 +268,7 @@ syncer.status("./my_project", "/app")
 syncer.pull("./my_project", "/")
 ```
 
-`Flash.py` no longer imports `json`, `hashlib`, `HASH_CONFIG_FILE`, or `_HASH_VERSION`.
+`flash.py` no longer imports `json`, `hashlib`, `HASH_CONFIG_FILE`, or `_HASH_VERSION`.
 
 ---
 
@@ -282,4 +285,54 @@ class WebREPLMicroPython(MicroPython):
 
 - Inherits all high-level operations (`flash_file`, `fs_ls`, `run`, `reset`, etc.)
 - Overrides `connect()` to WebSocket handshake (ignores serial-specific port/baudrate)
-- `Flash.py` has zero WebREPL awareness — the separation is enforced by the transport layer
+- `flash.py` has zero WebREPL awareness — the separation is enforced by the transport layer
+
+---
+
+## Firmware Module (`utils/firmware.py`)
+
+Firmware flashing via subprocess calls to `esptool` (optional dependency):
+
+| Function | Description |
+|----------|-------------|
+| `flash_firmware()` | Flash .bin firmware to device |
+| `erase_flash()` | Erase entire flash |
+| `chip_info()` | Read chip and flash information |
+| `verify_firmware()` | Verify firmware against flash contents |
+| `read_flash()` | Dump flash contents to a local file |
+
+**esptool resolution chain**:
+1. `python -m esptool` (installed as Python package)
+2. `esptool.py` on PATH (standalone binary)
+
+The CLI surface provides the `firmware` command group with 5 subcommands:
+
+```bash
+pyrcli firmware flash COM3 firmware.bin -b 921600 --erase-first
+pyrcli firmware erase COM3
+pyrcli firmware info COM3
+pyrcli firmware verify COM3 firmware.bin
+pyrcli firmware read COM3 0x100000 -o backup.bin
+```
+
+---
+
+## Shell Completion & CLI Enhancements
+
+### Auto-Completion
+
+The main Typer app registers `--install-completion` and `--show-completion` for bash/zsh/PowerShell. All commands with a `port` argument have a serial-port auto-completion callback (`_complete_port`) that scans available ports via `MicroPython.scan_ports()`.
+
+### `fs ls` Enhancements
+
+The device file browser command supports three new flags:
+
+| Flag | Description |
+|------|-------------|
+| `--recursive` / `-r` | Recursively list all sub-directories via device-side `os.walk()` |
+| `--sort` | Sort by `name` (default), `size`, or `type`; prefix `-` for descending |
+| `--paginate` / `-p` | Page output with 20 lines per page, Enter to continue, q to quit |
+
+### `fs_ls_recursive()` Method
+
+A new method on `MicroPython` that walks the directory tree on the device side in a single round-trip, outputting `size|type|path` for each entry. The device-side Python script uses recursive `os.listdir()` + `os.stat()` calls.

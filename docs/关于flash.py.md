@@ -1,4 +1,4 @@
-# `Flash.py` — MicroPython 设备刷入工具
+# `flash.py` — MicroPython 设备刷入工具
 
 通过串口（UART）的**原始 REPL 模式**向 MicroPython 设备（ESP32、ESP8266、RP2040 等）上传文件或目录，并提供交互式 REPL 终端、自动编译 `.py → .mpy`、条件编译、增量刷入等能力。
 
@@ -472,6 +472,15 @@ MicroPython(port=None, baudrate=115200, timeout=10)
 列出设备目录下的文件和子目录，返回包含 `name`、`type`（`F`/`D`）、`size` 的字典列表。
 
 - 对每个条目连续两次 `os.stat()`，解决 MicroPython 部分端口首次读取目录大小不稳定的问题。
+
+#### `fs_ls_recursive(remote_path="/")`
+
+递归列出设备目录下的所有文件和子目录（设备端单次遍历）。
+
+- 设备端递归脚本使用 `os.listdir()` + `os.stat()` 遍历完整目录树
+- 输出格式与 `fs_ls` 一致：`size|type|path`
+- 超时 30 秒（递归扫描可能较慢）
+- 返回: `list[dict]`，每个元素含 `name`（全路径）、`type`（`F`/`D`）、`size`
 
 #### `fs_rm(remote_path)`
 

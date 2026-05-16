@@ -1,13 +1,16 @@
 import os
 import typer
+import click
 import sys
 import re
-from typing import Optional
-from .utils.Flash import MicroPython
+import subprocess
+from typing import List, Optional
+from .utils.flash import MicroPython
 from .utils.webrepl_micropython import WebREPLMicroPython
 from .utils.config import create_default_config
 from .project.project import init_project, init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
+from .utils.firmware import flash_firmware, erase_flash, chip_info, verify_firmware, read_flash
 
 
 def _norm_path(p: str) -> str:
@@ -56,9 +59,19 @@ def _norm_path(p: str) -> str:
 
     return p
 
+def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List[str]:
+    """Shell 补全回调：自动补全可用串口号。"""
+    try:
+        ports = MicroPython.scan_ports(require_vid=False)
+        return [p["device"] for p in ports if incomplete in p["device"]]
+    except Exception:
+        return []
+
+
 app = typer.Typer(
     name="pyrite-cli",
     help="## PYRITE-CLI ## - MicroPython 设备刷入工具",
+    add_completion=True,
 )
 
 
@@ -124,7 +137,8 @@ def scan(
 
 @app.command()
 def flash(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     file: str = typer.Argument(..., help="本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径（必填）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -162,7 +176,8 @@ def flash(
 
 @app.command()
 def repl(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -181,7 +196,8 @@ def repl(
 
 @app.command()
 def flash_program(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀（必填）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -232,7 +248,8 @@ def flash_program(
 
 @app.command()
 def run(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     code: str = typer.Argument(..., help="要执行的 Python 代码"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
@@ -254,7 +271,8 @@ def run(
 
 @app.command()
 def reset(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -304,7 +322,8 @@ def config():
 
 @app.command()
 def board_info(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
@@ -394,7 +413,8 @@ except:pass
 
 # ── project 子命令组 ──────────────────────────────────────────────
 
-project_app = typer.Typer(help="项目脚手架、存根、文件哈希与增量刷入")
+project_app = typer.Typer(help="项目脚手架、存根、文件哈希与增量刷入",
+                          add_completion=False)
 app.add_typer(project_app, name="project")
 
 
@@ -443,7 +463,8 @@ def project_hash(
 
 @project_app.command("flash")
 def project_flash(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -488,7 +509,8 @@ def project_flash(
 
 @project_app.command("status")
 def project_status(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -525,7 +547,8 @@ def project_status(
 
 @project_app.command("pull")
 def project_pull(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     directory: str = typer.Argument(help="本地项目目录路径（如 . 或 ./bak）"),
     remote_path: str = typer.Argument("/",
                                       help="设备上的远程路径前缀",
@@ -565,8 +588,58 @@ def project_pull(
 
 # ── fs 设备文件浏览器 ──────────────────────────────────────────────
 
-fs_app = typer.Typer(help="MicroPython 设备文件浏览器")
+fs_app = typer.Typer(help="MicroPython 设备文件浏览器",
+                     add_completion=False)
 app.add_typer(fs_app, name="fs")
+
+
+def _display_paged(lines_with_color: List[tuple[str, bool]], page_size: int = 20) -> None:
+    """分页显示文件列表，按 Enter 继续，按 q 退出。"""
+    total = len(lines_with_color)
+    start = 0
+    while start < total:
+        end = min(start + page_size, total)
+        for i in range(start, end):
+            line, is_dir = lines_with_color[i]
+            if is_dir:
+                typer.secho(line, fg=typer.colors.YELLOW)
+            else:
+                print(line)
+        start = end
+        if start < total:
+            typer.secho(
+                f"\n  -- 更多 ({start}/{total} 行, Enter 继续, q 退出) -- ",
+                fg=typer.colors.BRIGHT_BLACK, nl=False
+            )
+            ch = _read_one_key()
+            print()
+            if ch == 'q':
+                break
+
+
+def _read_one_key() -> str:
+    """读取单键输入，跨平台。返回 'q' 或 'enter'。"""
+    try:
+        import msvcrt
+        ch = msvcrt.getch()
+        if ch in (b'q', b'Q'):
+            return 'q'
+        return 'enter'
+    except ImportError:
+        import sys
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        if ch in ('q', 'Q'):
+            return 'q'
+        return 'enter'
 
 
 def _build_tag_args(mp: MicroPython, target: Optional[str],
@@ -586,8 +659,15 @@ def _build_tag_args(mp: MicroPython, target: Optional[str],
 
 @fs_app.command("ls")
 def fs_ls(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     path: str = typer.Argument("/", help="设备上的目录路径"),
+    recursive: bool = typer.Option(False, "--recursive", "-r",
+                                   help="递归列出所有子目录"),
+    sort: Optional[str] = typer.Option(None, "--sort",
+                                        help="排序方式: name, size, type, -name, -size, -type（加 - 为倒序）"),
+    paginate: bool = typer.Option(False, "--paginate", "-p",
+                                   help="分页显示（每页 20 行）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -600,30 +680,56 @@ def fs_ls(
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
-        items = mp.fs_ls(path)
+        if recursive:
+            items = mp.fs_ls_recursive(path)
+        else:
+            items = mp.fs_ls(path)
         if not items:
             print("  (空目录)")
         else:
+            # 排序
+            reverse = False
+            sort_key = (sort or "name")
+            if sort_key.startswith("-"):
+                reverse = True
+                sort_key = sort_key[1:]
+
+            if sort_key == "size":
+                items.sort(key=lambda x: int(x['size']) if x['size'].isdigit() else 0, reverse=reverse)
+            elif sort_key == "type":
+                items.sort(key=lambda x: (x['type'], x['name']), reverse=reverse)
+            else:  # name（默认）
+                items.sort(key=lambda x: x['name'], reverse=reverse)
+
+            # 格式化输出行
+            output_lines = []
             for item in items:
                 is_dir = item['type'] == 'D'
                 name = item['name'] + '/' if is_dir else item['name']
-                tag = f"[{item['type']}]"
                 sz = item['size'] if item['size'].isdigit() else '?'
                 if sz.isdigit():
                     sz_int = int(sz)
                     if sz_int < 1024:
                         sz_str = f"{sz_int:>7} bytes"
                     else:
-                        sz_str = f" {sz_int//1024:>6} KB"
+                        sz_str = f" {sz_int // 1024:>6} KB"
                 else:
                     sz_str = f" {sz:>7}"
-                line = f"  {tag} {name:<31} {sz_str}"
-                if is_dir:
-                    typer.secho(line, fg=typer.colors.YELLOW)
-                else:
-                    print(line)
-        # 仅在列根目录时显示 Flash 占用进度条
-        if path.strip() in ("", ".", "./", "/"):
+                line = f"  {'[D]' if is_dir else '[F]'} {name:<31} {sz_str}"
+                output_lines.append((line, is_dir))
+
+            # 输出（分页 / 直接）
+            if paginate and len(output_lines) > 20:
+                _display_paged(output_lines, page_size=20)
+            else:
+                for line, is_dir in output_lines:
+                    if is_dir:
+                        typer.secho(line, fg=typer.colors.YELLOW)
+                    else:
+                        print(line)
+
+        # 仅在非递归且列根目录时显示 Flash 占用进度条
+        if not recursive and path.strip() in ("", ".", "./", "/"):
             df = mp.fs_df()
             if df['total'] > 0:
                 pct = df['used'] / df['total']
@@ -633,7 +739,7 @@ def fs_ls(
                 total_mb = df['total'] / 1024 / 1024
                 used_mb = df['used'] / 1024 / 1024
                 free_mb = df['free'] / 1024 / 1024
-                typer.secho(f"\n  Flash: [{bar}] {pct*100:.1f}%", fg=typer.colors.BRIGHT_BLACK)
+                typer.secho(f"\n  Flash: [{bar}] {pct * 100:.1f}%", fg=typer.colors.BRIGHT_BLACK)
                 print(f"         {used_mb:.1f} MB used / {free_mb:.1f} MB free / {total_mb:.1f} MB total")
     finally:
         mp.disconnect()
@@ -641,7 +747,8 @@ def fs_ls(
 
 @fs_app.command("rm")
 def fs_rm(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     path: str = typer.Argument(..., help="设备上要删除的文件路径"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
@@ -665,7 +772,8 @@ def fs_rm(
 
 @fs_app.command("cat")
 def fs_cat(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     path: str = typer.Argument(..., help="设备上的文件路径"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
@@ -686,7 +794,8 @@ def fs_cat(
 
 @fs_app.command("put")
 def fs_put(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     local_path: str = typer.Argument(..., help="本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -718,7 +827,8 @@ def fs_put(
 
 @fs_app.command("get")
 def fs_get(
-    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0"),
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
     remote_path: str = typer.Argument(..., help="设备上的文件路径"),
     local_path: str = typer.Argument(None, help="本地保存路径（默认使用远程文件名）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -739,6 +849,133 @@ def fs_get(
     finally:
         mp.disconnect()
 
+
+# ── firmware 固件刷写 ────────────────────────────────────────────
+
+firmware_app = typer.Typer(help="固件刷写工具（需安装 esptool）",
+                           add_completion=False)
+app.add_typer(firmware_app, name="firmware")
+
+
+@firmware_app.command("flash")
+def firmware_flash(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    firmware: str = typer.Argument(..., help="固件 .bin 文件路径"),
+    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率（默认 460800）"),
+    address: str = typer.Option("0x0", "--address", "-a", help="烧录起始地址（默认 0x0）"),
+    flash_mode: str = typer.Option("keep", "--flash-mode", "-m",
+                                    help="Flash 模式: qio, qout, dio, dout, keep"),
+    flash_size: str = typer.Option("keep", "--flash-size", "-s",
+                                    help="Flash 容量: 1MB/2MB/4MB/8MB/16MB/detect/keep"),
+    erase_first: bool = typer.Option(False, "--erase-first", "-e",
+                                      help="烧录前先全片擦除"),
+):
+    """烧录固件到设备（通过 esptool）"""
+    try:
+        flash_firmware(
+            port=port, firmware=firmware, baudrate=baudrate,
+            address=address, flash_mode=flash_mode, flash_size=flash_size,
+            erase_first=erase_first,
+        )
+        typer.secho("  ✓ 烧录完成", fg=typer.colors.GREEN)
+    except FileNotFoundError:
+        typer.secho("未找到 esptool，请安装：pip install esptool", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError:
+        typer.secho("  ✗ 烧录失败，请检查连接和参数", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@firmware_app.command("erase")
+def firmware_erase(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率（默认 460800）"),
+):
+    """擦除设备整个 Flash"""
+    try:
+        erase_flash(port=port, baudrate=baudrate)
+        typer.secho("  ✓ Flash 已擦除", fg=typer.colors.GREEN)
+    except FileNotFoundError:
+        typer.secho("未找到 esptool，请安装：pip install esptool", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError:
+        typer.secho("  ✗ 擦除失败，请检查连接", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@firmware_app.command("info")
+def firmware_info(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率（默认 460800）"),
+):
+    """读取设备芯片和 Flash 信息"""
+    try:
+        output = chip_info(port=port, baudrate=baudrate)
+        # 提取关键字段用于格式化输出
+        lines = output.strip().splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # 去掉 esptool 的 DEBUG/日志前缀，只显示关键行
+            if any(kw in line for kw in ("Detected", "Manufacturer", "Device",
+                                         "flash size", "MAC:", "Chip is",
+                                         "Features:", "Crystal")):
+                typer.secho(f"  {line}", fg=typer.colors.CYAN)
+            elif line.startswith("esptool.py") or "Serial" in line:
+                print(f"  {line}")
+            else:
+                print(f"  {line}")
+    except FileNotFoundError:
+        typer.secho("未找到 esptool，请安装：pip install esptool", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    except RuntimeError as e:
+        typer.secho(f"  ✗ {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@firmware_app.command("verify")
+def firmware_verify(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    firmware: str = typer.Argument(..., help="固件 .bin 文件路径"),
+    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率（默认 460800）"),
+    address: str = typer.Option("0x0", "--address", "-a", help="起始地址（默认 0x0）"),
+):
+    """验证固件烧录结果（比对 Flash 内容）"""
+    try:
+        verify_firmware(port=port, firmware=firmware, baudrate=baudrate, address=address)
+        typer.secho("  ✓ 验证通过，固件与 Flash 内容一致", fg=typer.colors.GREEN)
+    except FileNotFoundError:
+        typer.secho("未找到 esptool，请安装：pip install esptool", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError:
+        typer.secho("  ✗ 验证失败，固件与 Flash 内容不匹配", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@firmware_app.command("read")
+def firmware_read(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    size: str = typer.Argument(..., help="读取字节数（如 0x100000）"),
+    address: str = typer.Option("0x0", "--address", "-a", help="起始地址（默认 0x0）"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="输出文件路径"),
+    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率（默认 460800）"),
+):
+    """从设备 Flash 读取内容到文件"""
+    try:
+        dst = read_flash(port=port, size=size, address=address, output=output, baudrate=baudrate)
+        typer.secho(f"  ✓ 已读取到: {dst}", fg=typer.colors.GREEN)
+    except FileNotFoundError:
+        typer.secho("未找到 esptool，请安装：pip install esptool", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError:
+        typer.secho("  ✗ 读取失败", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
 def main():

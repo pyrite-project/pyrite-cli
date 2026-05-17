@@ -11,6 +11,7 @@ from .utils.config import create_default_config
 from .project.project import init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
 from .utils.firmware import flash_firmware, erase_flash, chip_info, verify_firmware, read_flash
+from .plugin_manager import load_plugins, get_loaded_plugins
 
 
 def _norm_path(p: str) -> str:
@@ -959,6 +960,45 @@ def firmware_read(
     except subprocess.CalledProcessError:
         typer.secho("  ✗ 读取失败", fg=typer.colors.RED)
         raise typer.Exit(1)
+
+
+# ── plugin 插件管理 ────────────────────────────────────────────────
+
+plugin_app = typer.Typer(help="管理第三方插件", add_completion=False)
+app.add_typer(plugin_app, name="plugin")
+
+
+@plugin_app.command("list")
+def plugin_list():
+    """列出所有已安装的第三方插件"""
+    plugins = get_loaded_plugins()
+    if not plugins:
+        print("  未安装任何第三方插件。")
+        return
+    print(f"  已安装 {len(plugins)} 个插件:\n")
+    for p in plugins:
+        print(f"  {p.name:<16} {p.version:<10} {p.description}")
+
+
+@plugin_app.command("info")
+def plugin_info(
+    name: str = typer.Argument(..., help="插件名称"),
+):
+    """查看指定插件的详细信息"""
+    plugins = get_loaded_plugins()
+    for p in plugins:
+        if p.name == name:
+            typer.secho(f"  名称: {p.name}", bold=True)
+            print(f"  版本: {p.version}")
+            print(f"  描述: {p.description}")
+            print(f"  入口: {p.module_path}")
+            return
+    typer.secho(f"  未找到插件: {name}", fg=typer.colors.RED)
+
+
+# ── 加载第三方插件 ────────────────────────────────────────────────
+
+load_plugins(app)
 
 
 def main():

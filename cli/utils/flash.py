@@ -162,6 +162,14 @@ class MicroPython:
             raise ValueError("未提供串口号，请先调用 scan_ports() 或指定 port")
 
         self.transport.connect()
+
+        # 串口传输：自动 DTR/RTS 硬件复位设备，确保设备处于已知启动状态
+        if isinstance(self.transport, SerialTransport):
+            try:
+                self.transport.dtr_rts_reset()
+            except Exception:
+                pass
+
         return True
 
     def _ensure_connected(self) -> None:
@@ -830,7 +838,14 @@ class MicroPython:
         return self._execute(code, timeout=timeout)
 
     def reset(self) -> None:
-        """软重启设备 (machine.reset())。"""
+        """复位设备。优先使用 DTR/RTS 硬件复位，否则使用软重启。"""
+        if isinstance(self.transport, SerialTransport):
+            try:
+                self.transport.dtr_rts_reset()
+                return
+            except Exception:
+                pass
+        # 兜底：设备端软重启
         self._enter_raw_repl()
         try:
             self._execute("import machine; machine.reset()", timeout=2)
@@ -900,21 +915,38 @@ class MicroPython:
     # ── 设备文件管理 (fs) ─────────────────────────────────────────
 
     def fs_ls(self, remote_path: str = "/") -> List[Dict[str, str]]:
-        """列出设备目录下的文件和子目录。"""
+        """列出设备目录下的文件和子目录。目录体积为递归计算的文件大小总和（最大递归深度 32）。
+
+        使用 os.ilistdir() 取代 os.listdir() + os.stat()，将设备端文件系统调用减半。
+        """
         script = (
             "import os\n"
-            "def _st(p):\n"
-            " s=os.stat(p); s=os.stat(p)\n"
-            " return s\n"
-            f"p={remote_path!r}\n"
-            "for n in sorted(os.listdir(p or '/')):\n"
+            "def _ds(p,_d=0):\n"
+            " t=0\n"
+            " if _d>32:\n"
+            "  return 0\n"
             " try:\n"
-            "  s=_st((p+'/'+n).replace('//','/'))\n"
-            "  print(str(s[6])+'|'+('D' if s[0]&0x4000 else 'F')+'|'+n)\n"
+            "  for n,fl,_,sz in os.ilistdir(p):\n"
+            "   if fl&0x4000:\n"
+            "    fp='/'+n if p=='/' else p+'/'+n\n"
+            "    t+=_ds(fp,_d+1)\n"
+            "   else:\n"
+            "    t+=sz\n"
+            " except:\n"
+            "  pass\n"
+            " return t\n"
+            f"p={remote_path!r}\n"
+            "for n,fl,_,sz in os.ilistdir(p or '/'):\n"
+            " try:\n"
+            "  if fl&0x4000:\n"
+            "   fp='/'+n if p=='/' else p+'/'+n\n"
+            "   print(str(_ds(fp))+'|D|'+n)\n"
+            "  else:\n"
+            "   print(str(sz)+'|F|'+n)\n"
             " except OSError:\n"
             "  print('?|?|'+n)\n"
         )
-        out = self.run(script)
+        out = self.run(script, timeout=30)
         items = []
         for line in out.strip().splitlines():
             line = line.strip()

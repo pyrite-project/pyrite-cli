@@ -64,6 +64,35 @@ class SerialTransport(Transport):
             except Exception:
                 pass
 
+    def set_dtr(self, state: bool) -> None:
+        """设置 DTR 信号线状态。"""
+        if self._ser and self._ser.is_open:
+            self._ser.dtr = state
+
+    def set_rts(self, state: bool) -> None:
+        """设置 RTS 信号线状态。"""
+        if self._ser and self._ser.is_open:
+            self._ser.rts = state
+
+    def dtr_rts_reset(self) -> None:
+        """通过 DTR/RTS 信号线硬件复位设备。
+
+        典型 ESP32/ESP8266 复位时序：
+        RTS 接 EN→ 拉高 RTS 使 EN 低 → 芯片复位
+        释放 RTS → EN 恢复高 → 芯片启动
+        """
+        if not self._ser or not self._ser.is_open:
+            return
+        # 进入复位
+        self._ser.rts = True
+        self._ser.dtr = False
+        time.sleep(0.1)
+        # 释放复位，等待设备启动
+        self._ser.dtr = True
+        self._ser.rts = False
+        time.sleep(0.5)
+        self.reset_input_buffer()
+
     @property
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open

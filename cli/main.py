@@ -8,7 +8,7 @@ from typing import List, Optional
 from .utils.flash import MicroPython
 from .utils.webrepl_micropython import WebREPLMicroPython
 from .utils.config import create_default_config
-from .project.project import init_project, init_stubs, new_project_interactive
+from .project.project import init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
 from .utils.firmware import flash_firmware, erase_flash, chip_info, verify_firmware, read_flash
 
@@ -579,7 +579,7 @@ def _display_paged(lines_with_color: List[tuple[str, bool]], page_size: int = 20
             if is_dir:
                 typer.secho(line, fg=typer.colors.YELLOW)
             else:
-                print(line)
+                typer.secho(line, fg=typer.colors.CYAN)
         start = end
         if start < total:
             typer.secho(
@@ -640,7 +640,7 @@ def fs_ls(
     recursive: bool = typer.Option(False, "--recursive", "-r",
                                    help="递归列出所有子目录"),
     sort: Optional[str] = typer.Option(None, "--sort",
-                                        help="排序方式: name, size, type, -name, -size, -type（加 - 为倒序）"),
+                                        help="排序方式: name(默认), size; 加 - 前缀倒序（如 -size）。默认目录优先，目录内再按指定方式排序"),
     paginate: bool = typer.Option(False, "--paginate", "-p",
                                    help="分页显示（每页 20 行）"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
@@ -662,19 +662,25 @@ def fs_ls(
         if not items:
             print("  (空目录)")
         else:
-            # 排序
+            # 排序：始终目录优先，再按名称或体积排序
             reverse = False
             sort_key = (sort or "name")
             if sort_key.startswith("-"):
                 reverse = True
                 sort_key = sort_key[1:]
 
+            # type_order: 'D'=0 排在 'F'=1 之前
             if sort_key == "size":
-                items.sort(key=lambda x: int(x['size']) if x['size'].isdigit() else 0, reverse=reverse)
-            elif sort_key == "type":
-                items.sort(key=lambda x: (x['type'], x['name']), reverse=reverse)
+                items.sort(key=lambda x: (
+                    0 if x['type'] == 'D' else 1,
+                    int(x['size']) if x['size'].isdigit() else 0,
+                    x['name'],
+                ), reverse=reverse)
             else:  # name（默认）
-                items.sort(key=lambda x: x['name'], reverse=reverse)
+                items.sort(key=lambda x: (
+                    0 if x['type'] == 'D' else 1,
+                    x['name'],
+                ), reverse=reverse)
 
             # 格式化输出行
             output_lines = []
@@ -685,14 +691,16 @@ def fs_ls(
                 if sz.isdigit():
                     sz_int = int(sz)
                     if sz_int < 1024:
-                        sz_str = f"{sz_int:>7} bytes"
+                        num_str = f"{sz_int:>8}"
+                        unit_str = "bytes"
                     else:
-                        sz_str = f" {sz_int // 1024:>6} KB"
+                        num_str = f"{sz_int / 1024:>8.2f}"
+                        unit_str = "KB"
                 else:
-                    sz_str = f" {sz:>7}"
-                line = f"  {'[D]' if is_dir else '[F]'} {name:<31} {sz_str}"
+                    num_str = "       --"
+                    unit_str = ""
+                line = f"  {'[D]' if is_dir else '[F]'} {name:<31} {num_str} {unit_str}"
                 output_lines.append((line, is_dir))
-
             # 输出（分页 / 直接）
             if paginate and len(output_lines) > 20:
                 _display_paged(output_lines, page_size=20)

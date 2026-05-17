@@ -13,3 +13,7 @@ pull_test/
 test_proj/
 build/
 log/
+
+# 未来功能设计方案（不纳入版本控制）
+docs/插件系统方案.md
+skills-lock.json

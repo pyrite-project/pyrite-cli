@@ -1,7 +1,27 @@
-typer>=0.9.0
-pyserial>=3.5
-requests>=2.28.0
-tqdm>=4.64.0
-mpy-cross
-libcst>=1.1.0
-tomli>=2.0.0
+# ============================================================
+# requirements.txt — pyrite-cli 依赖锁定
+# 由 scripts/gen_requirements.py 自动生成，手动修改将被覆盖
+# 用法：pip install -r requirements.txt
+# ============================================================
+
+# ----- 运行时核心依赖 -----
+typer==0.21.0
+click==8.1.8
+pyserial==3.5
+requests==2.32.4
+tqdm==4.67.1
+libcst==1.8.6
+websocket-client==1.9.0
+esptool==5.2.0
+mpy-cross==1.26.0.post2
+
+# ----- 条件依赖 -----
+tomli==2.4.0; python_version < '3.11'
+
+# ----- 开发依赖 -----
+# pytest==9.0.3
+# mypy
+
+# ----- 构建依赖 -----
+# build
+# setuptools>=64.0

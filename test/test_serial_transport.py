@@ -31,9 +31,55 @@ class TestSerialTransportDtrRts:
         transport = SerialTransport(port="COM99")
         transport._ser = MagicMock()
         transport.dtr_rts_reset()
-        # 复位后 DTR=True, RTS=False
-        assert transport._ser.dtr is True
+        # 复位后 DTR=False, RTS=False → GPIO0 高电平 (正常启动模式)
+        assert transport._ser.dtr is False
         assert transport._ser.rts is False
+
+    def test_dtr_rts_reset_sequence(self):
+        """验证 DTR/RTS 复位时序不会将芯片置入下载模式。
+
+        标准 ESP32 自动复位电路：
+        - RTS → EN (RTS=高 → EN=低 → 复位)
+        - DTR → GPIO0 (DTR=高 → GPIO0=低 → 下载模式)
+
+        释放复位时 GPIO0 必须保持高电平（DTR=False），否则芯片进入下载模式。
+        """
+        class TrackingSerial:
+            is_open = True
+            def __init__(self):
+                object.__setattr__(self, '_rts_vals', [])
+                object.__setattr__(self, '_dtr_vals', [])
+                object.__setattr__(self, 'rts', False)
+                object.__setattr__(self, 'dtr', False)
+            def __setattr__(self, name, value):
+                if name == 'rts':
+                    self._rts_vals.append(value)
+                elif name == 'dtr':
+                    self._dtr_vals.append(value)
+                super().__setattr__(name, value)
+            def reset_output_buffer(self):
+                pass
+            def reset_input_buffer(self):
+                pass
+
+        transport = SerialTransport(port="COM99")
+        transport._ser = TrackingSerial()
+        transport.dtr_rts_reset()
+
+        # RTS 序列: True (复位) → False (释放)
+        assert transport._ser._rts_vals == [True, False], (
+            f"RTS 时序异常: {transport._ser._rts_vals}"
+        )
+        # DTR 序列: 只能出现 False (GPIO0高=正常模式)，绝不能出现 True
+        # 当 _ser.dtr 默认为 False 时，第一次赋值 False 不会记录
+        forbidden = [v for v in transport._ser._dtr_vals if v is True]
+        assert not forbidden, (
+            f"DTR 在复位过程中被设为 True (GPIO0=低)，芯片会进入下载模式. "
+            f"DTR 赋值记录: {transport._ser._dtr_vals}"
+        )
+        # 最终状态: RTS=False, DTR=False → 正常启动
+        assert transport._ser.rts is False
+        assert transport._ser.dtr is False
 
     def test_dtr_rts_reset_no_ser_does_nothing(self):
         """未连接时 dtr_rts_reset() 不抛异常。"""

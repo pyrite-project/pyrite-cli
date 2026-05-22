@@ -223,6 +223,8 @@ def download_stubs(stub_dir: str, output_dir: str,
             total_str += f" ({failed} 失败)"
         print(f"  下载完成: {total_str}")
 
+    out_path = Path(f"./.stubs/{out_path}")
+
     return downloaded, out_path
 
 

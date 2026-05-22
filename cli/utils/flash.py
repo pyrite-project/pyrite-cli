@@ -1,5 +1,4 @@
-import os
-import time
+﻿import time
 import binascii
 import tempfile
 import re
@@ -512,7 +511,8 @@ class MicroPython:
                    compile: Optional[bool] = None,
                    bytecode_ver: Optional[int] = None,
                    arch: Optional[str] = None,
-                   active_tags: Optional[Set[str]] = None) -> None:
+                   active_tags: Optional[Set[str]] = None,
+                   dry_run: bool = False) -> None:
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"本地文件不存在: {local_path}")
 
@@ -560,6 +560,7 @@ class MicroPython:
 
         print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={DEFAULT_CHUNK_SIZE})")
 
+        _t0 = time.time()
         try:
             with self._repl_log_ctx():
                 for attempt in range(max_retries + 1):
@@ -602,7 +603,9 @@ class MicroPython:
                             )
                             if not ok:
                                 raise RuntimeError("校验失败")
-                            print(f"  {_GREEN}✓ 刷入成功{_RESET}")
+                            elapsed = time.time() - _t0
+                            rate = file_size / elapsed / 1024 if elapsed > 0 else 0
+                            print(f"  {_GREEN}✓ 刷入成功{_RESET} ({file_size/1024:.1f} KB, {elapsed:.1f}s, {rate:.0f} KB/s)")
                         else:
                             print(f"  {_GREEN}✓ 刷入成功 (校验已关闭){_RESET}")
                         return  # 成功
@@ -622,7 +625,8 @@ class MicroPython:
     def flash_program(self, local_dir: str, remote_prefix: str = "",
                       bytecode_ver: Optional[int] = None, arch: Optional[str] = None,
                       active_tags: Optional[Set[str]] = None,
-                      manifest_path: Optional[str] = None) -> List[Tuple[str, str, bool]]:
+                      manifest_path: Optional[str] = None,
+                      dry_run: bool = False) -> List[Tuple[str, str, bool]]:
         if not os.path.isdir(local_dir):
             raise NotADirectoryError(f"不是有效目录: {local_dir}")
 
@@ -698,6 +702,13 @@ class MicroPython:
 
         if not file_list:
             print("  没有需要刷入的文件。")
+            return []
+
+        _t0 = time.time()
+        if dry_run:
+            print(f"  {_YELLOW}[DRY-RUN]{_RESET} 将批量刷入 {len(file_list)} 个文件:")
+            for rp, lp, sz in file_list:
+                print(f"    {lp} -> {rp} ({sz} 字节)")
             return []
 
         max_retries = self.config.max_retries
@@ -786,7 +797,9 @@ class MicroPython:
                                 continue
 
                         total_size = len(all_data)
-                        print(f"  {_GREEN}✓ 刷入成功 ({total_size} 字节, {len(file_list)} 个文件){_RESET}")
+                        elapsed = time.time() - _t0
+                        rate = total_size / elapsed / 1024 if elapsed > 0 else 0
+                        print(f"  {_GREEN}✓ 刷入成功{_RESET} ({total_size/1024:.1f} KB, {len(file_list)} 个文件, {elapsed:.1f}s, {rate:.0f} KB/s)")
                         return [(lp, rp, True) for (rp, lp, sz) in file_list]
 
                     except (serial.SerialException, Exception) as e:
@@ -1014,13 +1027,42 @@ class MicroPython:
                 }
         return {'total': 0, 'used': 0, 'free': 0}
 
-    def fs_rm(self, remote_path: str) -> bool:
-        """删除设备上的文件或空目录。"""
-        script = (
-            "import os\n"
-            f"os.remove({remote_path!r})\n"
-            "print('OK')\n"
-        )
+    def fs_rm(self, remote_path: str, recursive: bool = False,
+               force: bool = False, max_depth: int = 32) -> bool:
+        """删除设备上的文件或递归删除目录。"""
+        lit = repr(remote_path)
+        if recursive:
+            guard = " except:\n  pass\n" if force else ""
+            script = (
+                "import os\n"
+                "def _rmrf(p,d=0):\n"
+                " try:\n"
+                "  s=os.stat(p)\n"
+                "  if s[0]&0x4000:\n"
+                f"   if d>{max_depth}: return\n"
+                "   for n in os.listdir(p):\n"
+                "    fp=n if p=='/' else p+'/'+n\n"
+                "    _rmrf(fp,d+1)\n"
+                "   os.rmdir(p)\n"
+                "  else: os.remove(p)\n"
+                f"{guard}"
+                f"_rmrf({lit})\n"
+                "print('OK')\n"
+            )
+        else:
+            if force:
+                script = (
+                    "import os\n"
+                    f"try:\n os.remove({lit})\n"
+                    "except:\n pass\n"
+                    "print('OK')\n"
+                )
+            else:
+                script = (
+                    "import os\n"
+                    f"os.remove({lit})\n"
+                    "print('OK')\n"
+                )
         out = self.run(script)
         return 'OK' in out
 
@@ -1036,6 +1078,89 @@ class MicroPython:
         with open(local_path, "wb") as f:
             f.write(data)
         return len(data)
+
+
+    def fs_mv(self, src: str, dst: str) -> bool:
+        """重命名/移动设备上的文件或目录。"""
+        script = (
+            "import os\n"
+            f"os.rename({src!r}, {dst!r})\n"
+            "print('OK')\n"
+        )
+        out = self.run(script)
+        return 'OK' in out
+
+    def fs_cp(self, src: str, dst: str) -> bool:
+        """复制设备上的文件。目录复制使用递归复制。"""
+        script = (
+            "import os\n"
+            "try:\n"
+            " s=os.stat(%r)\n"
+            " if s[0]&0x4000:\n"
+            "  # directory: recursive copy\n"
+            "  os.mkdir(%r)\n"
+            "  def _cpdir(sd,dd):\n"
+            "   for n in os.listdir(sd):\n"
+            "    fp=sd+'/'+n; td=dd+'/'+n\n"
+            "    try:\n"
+            "     st=os.stat(fp)\n"
+            "     if st[0]&0x4000:\n"
+            "      os.mkdir(td)\n"
+            "      _cpdir(fp,td)\n"
+            "     else:\n"
+            "      with open(fp,'rb') as f:\n"
+            "       with open(td,'wb') as t:\n"
+            "        t.write(f.read())\n"
+            "    except:\n"
+            "     pass\n"
+            "  _cpdir(%r,%r)\n"
+            " else:\n"
+            "  with open(%r,'rb') as f:\n"
+            "   with open(%r,'wb') as t:\n"
+            "    t.write(f.read())\n"
+            " print('OK')\n"
+            "except Exception as e:\n"
+            " print('ERR:'+str(e))\n"
+        ) % (src, dst, src, dst, src, dst)
+        out = self.run(script)
+        return 'OK' in out
+
+    def fs_tree(self, remote_path: str = "/") -> str:
+        """以树形结构列出设备目录内容，返回格式化字符串。"""
+        items = self.fs_ls_recursive(remote_path)
+        if not items:
+            return "  (空目录)"
+
+        # Build tree from flat list
+        tree = {}
+        for item in items:
+            path = item['name']
+            parts = path.strip('/').split('/')
+            node = tree
+            for p in parts:
+                if p not in node:
+                    node[p] = {}
+                node = node[p]
+
+        def _render(node, prefix="", is_last=True, is_root=True):
+            lines = []
+            keys = sorted(node.keys(), key=lambda k: (0 if isinstance(node[k], dict) else 1, k))
+            for i, k in enumerate(keys):
+                connector = "└── " if i == len(keys) - 1 else "├── "
+                sub_prefix = "    " if i == len(keys) - 1 else "│   "
+                is_dir = isinstance(node[k], dict)
+                suffix = "/" if is_dir else ""
+                if is_root:
+                    lines.append(f"  {connector}{k}{suffix}")
+                else:
+                    lines.append(f"{prefix}{connector}{k}{suffix}")
+                if is_dir:
+                    lines.extend(_render(node[k], prefix + sub_prefix, i == len(keys) - 1, False))
+            return lines
+
+        result = [f"  {remote_path}/"]
+        result.extend(_render(tree))
+        return "\n".join(result)
 
     def __enter__(self) -> 'MicroPython':
         return self

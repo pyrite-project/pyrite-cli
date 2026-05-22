@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from typing import Dict, List
 
 
@@ -10,3 +10,5 @@ class PyriteConfig:
     verify: str = "size"
     max_retries: int = 2
     board_tags: Dict[str, List[str]] = field(default_factory=dict)
+    baudrate: int = 0  # 0 means use CLI default
+    timeout: int = 0  # 0 means use CLI default

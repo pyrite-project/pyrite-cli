@@ -28,7 +28,7 @@ class _Transformer(cst.CSTTransformer):
         item = updated_node.items[0].item
         if not _is_macro(item):
             return updated_node
-        test = cst.Name("True") if _tag(item) in self.active_tags else cst.Name("False")
+        test = cst.Name("True") if self.active_tags is None or _tag(item) in self.active_tags else cst.Name("False")
         return cst.If(
             test=test,
             body=updated_node.body,
@@ -40,7 +40,7 @@ class _Transformer(cst.CSTTransformer):
         macro_decs = [d for d in updated_node.decorators if _is_macro(d.decorator)]
         if not macro_decs:
             return updated_node
-        matched = all(_tag(d.decorator) in self.active_tags for d in macro_decs)
+        matched = self.active_tags is None or all(_tag(d.decorator) in self.active_tags for d in macro_decs)
         clean = updated_node.with_changes(
             decorators=[d for d in updated_node.decorators if not _is_macro(d.decorator)]
         )

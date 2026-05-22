@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import json
 import hashlib
@@ -162,6 +162,10 @@ class ProjectSyncManager:
             print(f"    [{reason}] {os.path.relpath(lp, local_dir)} -> {rp}")
         if unchanged_count:
             print(f"  {_GREEN}{unchanged_count} 个文件未更改，跳过{_RESET}")
+
+        if dry_run:
+            print(f"  {_YELLOW}[DRY-RUN]{_RESET} 以上 {len(changed)} 个文件将被刷入（未实际执行）")
+            return []
 
         # 逐个刷入变更文件
         results: List[Tuple[str, str, bool]] = []

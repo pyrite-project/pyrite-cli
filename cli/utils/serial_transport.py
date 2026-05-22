@@ -77,18 +77,21 @@ class SerialTransport(Transport):
     def dtr_rts_reset(self) -> None:
         """通过 DTR/RTS 信号线硬件复位设备。
 
-        典型 ESP32/ESP8266 复位时序：
-        RTS 接 EN→ 拉高 RTS 使 EN 低 → 芯片复位
-        释放 RTS → EN 恢复高 → 芯片启动
+        标准 ESP32/ESP8266 自动复位电路：
+          RTS → EN (RTS=高 → EN=低 → 芯片复位)
+          DTR → GPIO0 (DTR=高 → GPIO0=低 → 下载模式)
+
+        释放复位时必须保证 DTR=False (GPIO0=高)，否则芯片会进入下载模式。
+        正确的时序：先拉低 EN，释放 EN 时保持 GPIO0 为高。
         """
         if not self._ser or not self._ser.is_open:
             return
-        # 进入复位
+        # 进入复位：RTS=高 → EN=低
         self._ser.rts = True
+        # GPIO0 保持高电平（DTR=低），确保释放后正常启动
         self._ser.dtr = False
         time.sleep(0.1)
-        # 释放复位，等待设备启动
-        self._ser.dtr = True
+        # 释放复位：RTS=低 → EN=高，GPIO0 仍为高 → 芯片正常启动
         self._ser.rts = False
         time.sleep(0.5)
         self.reset_input_buffer()

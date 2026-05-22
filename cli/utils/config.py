@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 from pathlib import Path
 from typing import Dict, List
@@ -46,6 +46,23 @@ def _load_config() -> PyriteConfig:
                 r = data.get("max_retries", 2)
                 if isinstance(r, int) and r >= 0:
                     cfg.max_retries = r
+                b = data.get("baudrate", 0)
+                if isinstance(b, int) and b > 0:
+                    cfg.baudrate = b
+                # Apply profile overrides
+                selected = data.get("profile", "")
+                if selected and isinstance(data.get("profiles"), dict):
+                    prof = data["profiles"].get(selected, {})
+                    if isinstance(prof.get("baudrate"), int) and prof["baudrate"] > 0:
+                        cfg.baudrate = prof["baudrate"]
+                    if isinstance(prof.get("chunk_size"), int) and prof["chunk_size"] > 0:
+                        cfg.chunk_size = prof["chunk_size"]
+                    if isinstance(prof.get("verify"), str) and prof["verify"] in ("off", "size", "crc32"):
+                        cfg.verify = prof["verify"]
+                    if isinstance(prof.get("download_threads"), int) and prof["download_threads"] > 0:
+                        cfg.download_threads = min(prof["download_threads"], 12)
+                    if isinstance(prof.get("timeout"), int) and prof["timeout"] > 0:
+                        cfg.timeout = prof["timeout"]
             except (json.JSONDecodeError, OSError):
                 pass
             break

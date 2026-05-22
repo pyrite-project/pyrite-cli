@@ -29,6 +29,17 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 [tool.setuptools.package-data]
 "cli.project" = ["feature_stub.pyi"]
 
+[tool.pytest.ini_options]
+testpaths = [
+    "test/test_protocol_helpers.py",
+    "test/test_flash_utils.py",
+    "test/test_config.py",
+    "test/test_logger.py",
+    "test/test_manifest_loader.py",
+    "test/test_preprocessor.py",
+    "test/test_serial_transport.py",
+]
+
 [tool.mypy]
 python_version = "3.10"
 warn_unused_configs = true

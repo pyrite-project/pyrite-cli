@@ -1,4 +1,4 @@
-import os
+﻿import os
 import typer
 import click
 import sys
@@ -12,6 +12,8 @@ from .project.project import init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
 from .utils.firmware import flash_firmware, erase_flash, chip_info, verify_firmware, read_flash
 from .plugin_manager import load_plugins, get_loaded_plugins
+from . import __version__
+from .utils.logger import configure_from_verbosity
 
 
 def _norm_path(p: str) -> str:
@@ -76,7 +78,17 @@ app = typer.Typer(
 )
 
 
+
+@app.callback(invoke_without_command=True)
+def _global_options(
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="增加日志详细度 (-v=INFO, -vv=DEBUG)"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="静默模式，仅输出错误"),
+):
+    """pyrite-cli: MicroPython 设备刷入工具链"""
+    configure_from_verbosity(verbose, quiet)
+
 _BRIEF_CODE = """\
+
 import sys,os,machine
 u=os.uname()
 print(sys.implementation.name+' '+'.'.join(str(x) for x in sys.implementation.version))
@@ -97,6 +109,12 @@ def _fetch_brief(port: str) -> str:
     return "  " + "  ".join(lines) if lines else ""
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"pyrite-cli {__version__}")
+        raise typer.Exit()
+
+
 def _mp_factory(port: str, baudrate: int, timeout: int,
                 webrepl: Optional[str] = None,
                 password: Optional[str] = None) -> MicroPython:
@@ -113,8 +131,13 @@ def scan(
     keyword: Optional[str] = typer.Option(None, "--keyword", "-k", help="按描述关键字过滤"),
     all: bool = typer.Option(False, "--all", "-a", help="显示所有设备（包括无 VID/PID 的）"),
     with_info: bool = typer.Option(False, "--with-info", "-i", help="连接设备并显示简略板子信息"),
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        help="显示版本号并退出",
+        callback=_version_callback,
+        is_eager=True,
+    ),
 ):
-    """扫描主机所有可用串口设备"""
     ports = MicroPython.scan_ports(vid=vid, pid=pid, keyword=keyword, require_vid=not all)
     if not ports:
         print("未检测到串口设备。")
@@ -152,12 +175,22 @@ def flash(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags，逗号分隔"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    force: bool = typer.Option(False, "--force", "-F", help="强制覆盖，不检查设备上文件是否存在"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式：显示将要执行的操作但不实际执行"),
 ):
     """连接设备并通过原始 REPL 刷入单个文件"""
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
+        if not force and remote_path:
+            try:
+                mp.run(f"import os;os.stat({remote_path!r})")
+                typer.secho(f"  [WARN] 文件 '{remote_path}' 已存在于设备，使用 --force 覆盖或先删除", fg=typer.colors.YELLOW)
+                click.confirm("  继续覆盖?", default=False, abort=True)
+            except RuntimeError:
+                pass
+
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if target:
             active_tags = set(mp.config["board_tags"].get(target.upper(), [target.upper()]))
@@ -171,7 +204,7 @@ def flash(
             active_tags.update(t.strip() for t in feature.split(","))
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
-        mp.flash_file(file, remote_path, compile=not no_compile, bytecode_ver=ver, arch=arch, active_tags=active_tags or None)
+        mp.flash_file(file, remote_path, compile=not no_compile, bytecode_ver=ver, arch=arch, active_tags=active_tags or None, dry_run=dry_run)
     finally:
         mp.disconnect()
 
@@ -212,6 +245,7 @@ def flash_program(
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式：显示将要执行的操作但不实际执行"),
 ):
     """连接设备并递归刷入整个本地目录"""
     remote_path = _norm_path(remote_path)
@@ -234,7 +268,7 @@ def flash_program(
         if no_feature:
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
         results = mp.flash_program(directory, remote_path, bytecode_ver=ver, arch=arch,
-                                   active_tags=active_tags or None, manifest_path=manifest)
+                                   active_tags=active_tags or None, manifest_path=manifest, dry_run=dry_run)
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)
         parts = []
@@ -437,6 +471,25 @@ def project_hash(
                        active_tags=active_tags or None, manifest_path=manifest)
 
 
+
+@project_app.command("scan")
+def project_scan(
+    directory: str = typer.Argument(".", help="项目目录路径"),
+    manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="激活的 feature tags，逗号分隔（用于条件编译过滤）"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags，逗号分隔"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="哈希配置文件输出路径"),
+):
+    """扫描项目目录，计算 SHA256 哈希并保存到哈希配置文件"""
+    mp = MicroPython()
+    active_tags = set()
+    if feature:
+        active_tags.update(t.strip() for t in feature.split(','))
+    if no_feature:
+        active_tags.difference_update(t.strip() for t in no_feature.split(','))
+    ProjectSyncManager(mp).scan(directory, hash_config_path=output,
+                       active_tags=active_tags or None, manifest_path=manifest)
+
 @project_app.command("flash")
 def project_flash(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
@@ -455,6 +508,7 @@ def project_flash(
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式：显示将要执行的操作但不实际执行"),
 ):
     """连接设备并根据哈希配置增量刷入新增或变更的文件"""
     remote_path = _norm_path(remote_path)
@@ -733,7 +787,11 @@ def fs_ls(
 def fs_rm(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
                                autocompletion=_complete_port),
-    path: str = typer.Argument(..., help="设备上要删除的文件路径"),
+    path: str = typer.Argument(..., help="设备上要删除的文件或目录路径"),
+    recursive: bool = typer.Option(False, "-r", "--recursive",
+                                   help="递归删除目录及其内容"),
+    force: bool = typer.Option(False, "-f", "--force",
+                               help="忽略不存在的文件等错误"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -741,15 +799,20 @@ def fs_rm(
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ):
-    """连接设备并删除指定文件"""
+    """连接设备并删除文件或递归删除目录"""
     path = _norm_path(path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
-        if mp.fs_rm(path):
-            print(f"  已删除: {path}")
-        else:
-            print(f"  删除失败: {path}")
+        mp.fs_rm(path, recursive=recursive, force=force)
+        print(f"  已删除: {path}")
+    except RuntimeError as e:
+        msg = str(e)
+        if msg.startswith("设备执行错误:\n"):
+            msg = msg[len("设备执行错误:\n"):]
+        typer.secho(f"  删除失败: {path}", fg=typer.colors.RED)
+        for line in msg.strip().split("\n"):
+            typer.secho(f"    {line}", fg=typer.colors.RED)
     finally:
         mp.disconnect()
 
@@ -792,19 +855,29 @@ def fs_put(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags，逗号分隔"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    force: bool = typer.Option(False, "--force", "-F", help="强制覆盖，不检查设备上文件是否存在"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式：显示将要执行的操作但不实际执行"),
 ):
     """连接设备并上传本地文件"""
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        active_tags = _build_tag_args(mp, target, feature, no_feature)
-        if not active_tags and not target:
-            typer.secho("无法识别设备 target，请使用 --target 手动指定", fg=typer.colors.RED)
-            raise typer.Exit(1)
-        mp.flash_file(local_path, remote_path, compile=not no_compile,
-                      bytecode_ver=ver, arch=arch, active_tags=active_tags or None)
+        if not force:
+            try:
+                mp.run(f"import os;os.stat({repr(remote_path)})")
+                typer.secho(f"  [WARN] 文件 '{remote_path}' 已存在于设备，使用 --force 覆盖或先删除", fg=typer.colors.YELLOW)
+                click.confirm("  继续覆盖?", default=False, abort=True)
+            except RuntimeError:
+                pass  # 文件不存在，正常执行
+
+            ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
+            active_tags = _build_tag_args(mp, target, feature, no_feature)
+            if not active_tags and not target:
+                typer.secho("无法识别设备 target，请使用 --target 手动指定", fg=typer.colors.RED)
+                raise typer.Exit(1)
+            mp.flash_file(local_path, remote_path, compile=not no_compile,
+                        bytecode_ver=ver, arch=arch, active_tags=active_tags or None, dry_run=dry_run)
     finally:
         mp.disconnect()
 
@@ -835,6 +908,81 @@ def fs_get(
 
 
 # ── firmware 固件刷写 ────────────────────────────────────────────
+
+@fs_app.command("tree")
+def fs_tree(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    path: str = typer.Argument("/", help="设备上的目录路径"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+):
+    """以树形结构显示设备目录内容"""
+    path = _norm_path(path)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        print(mp.fs_tree(path))
+    finally:
+        mp.disconnect()
+
+
+@fs_app.command("mv")
+def fs_mv(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    src: str = typer.Argument(..., help="源路径"),
+    dst: str = typer.Argument(..., help="目标路径"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+):
+    """重命名/移动设备上的文件或目录"""
+    src = _norm_path(src)
+    dst = _norm_path(dst)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        if mp.fs_mv(src, dst):
+            print(f"  已移动: {src} -> {dst}")
+        else:
+            print(f"  移动失败: {src} -> {dst}")
+    finally:
+        mp.disconnect()
+
+
+@fs_app.command("cp")
+def fs_cp(
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    src: str = typer.Argument(..., help="源路径"),
+    dst: str = typer.Argument(..., help="目标路径"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b",
+                                 help="波特率（默认 115200）"),
+    timeout: int = typer.Option(10, "--timeout", "-t",
+                                help="超时秒数（默认 10）"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL, 如 ws://192.168.4.1:8266"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+):
+    """复制设备上的文件或目录"""
+    src = _norm_path(src)
+    dst = _norm_path(dst)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        if mp.fs_cp(src, dst):
+            print(f"  已复制: {src} -> {dst}")
+        else:
+            print(f"  复制失败: {src} -> {dst}")
+    finally:
+        mp.disconnect()
 
 firmware_app = typer.Typer(help="固件刷写工具（需安装 esptool）",
                            add_completion=False)
@@ -994,6 +1142,87 @@ def plugin_info(
             print(f"  入口: {p.module_path}")
             return
     typer.secho(f"  未找到插件: {name}", fg=typer.colors.RED)
+@plugin_app.command("create")
+def plugin_create(
+    name: str = typer.Argument(..., help="插件名称"),
+):
+    """脚手架生成一个新的插件目录"""
+    import os
+    from pathlib import Path
+
+    plugin_dir = Path.cwd() / "plugin" / name
+    if plugin_dir.exists():
+        typer.secho(f"  [ERROR] 插件目录已存在: {plugin_dir}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+
+    # __init__.py
+    init_py = f'''"""Pyrite-CLI plugin: {name}"""
+from __future__ import annotations
+
+import typer
+
+app = typer.Typer(help="{name} plugin commands")
+
+__plugin_name__ = "{name}"
+__plugin_version__ = "0.1.0"
+
+
+@app.command()
+def hello(
+    name: str = typer.Argument("world", help="Name to greet"),
+):
+    """Say hello"""
+    print(f"Hello, {{name}}!")
+'''
+    (plugin_dir / "__init__.py").write_text(init_py, encoding="utf-8")
+
+    typer.secho(f"  [OK] 插件 '{name}' 已创建: {plugin_dir}", fg=typer.colors.GREEN)
+    print(f"  编辑 {plugin_dir / '__init__.py'} 添加命令")
+
+
+@plugin_app.command("install")
+def plugin_install(
+    source: str = typer.Argument(..., help="插件源码目录路径或 GitHub repo URL（暂仅支持本地目录）"),
+):
+    """安装插件到本地项目"""
+    import os
+    import shutil
+    from pathlib import Path
+
+    src = Path(source)
+    if not src.is_dir():
+        typer.secho(f"  [ERROR] 源目录不存在: {src}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    name = src.name
+    dst = Path.cwd() / "plugin" / name
+    if dst.exists():
+        typer.secho(f"  [ERROR] 插件 '{name}' 已存在于当前项目", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+    typer.secho(f"  [OK] 插件 '{name}' 已安装: {dst}", fg=typer.colors.GREEN)
+
+
+@plugin_app.command("uninstall")
+def plugin_uninstall(
+    name: str = typer.Argument(..., help="要移除的插件名称"),
+):
+    """卸载本地项目中的插件"""
+    import shutil
+    from pathlib import Path
+
+    plugin_dir = Path.cwd() / "plugin" / name
+    if not plugin_dir.exists():
+        typer.secho(f"  [ERROR] 插件 '{name}' 未安装", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    shutil.rmtree(plugin_dir)
+    typer.secho(f"  [OK] 插件 '{name}' 已移除", fg=typer.colors.GREEN)
+
 
 
 # ── 加载第三方插件 ────────────────────────────────────────────────

@@ -57,6 +57,8 @@ class TestSerialTransportDtrRts:
                 elif name == 'dtr':
                     self._dtr_vals.append(value)
                 super().__setattr__(name, value)
+            def write(self, data):
+                pass
             def reset_output_buffer(self):
                 pass
             def reset_input_buffer(self):

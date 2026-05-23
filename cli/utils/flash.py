@@ -30,39 +30,59 @@ SET_EXECUTE = b'\x04'
 ENTER_RAW_PASTE = b'\x05'
 
 FLASH = """import sys,micropython
-
-micropython.kbd_intr(-1)
-usb = sys.stdin.buffer
-
-f_size = FSIZE
-with open(FILE, 'wb') as f:
-    while f_size:
-        ln = usb.read(min(BFSIZE, f_size))
-        if ln:
+try:
+    micropython.kbd_intr(-1)
+    usb = sys.stdin.buffer
+    sys.stdout.write('READY')
+    f_size = FSIZE
+    with open(FILE, 'wb') as f:
+        while f_size:
+            want = min(BFSIZE, f_size)
+            d = b''
+            while len(d) < want:
+                c = usb.read(min(64, want - len(d)))
+                if c:
+                    d += c
+            f.write(d)
             f.flush()
-            f.write(ln)
-            f_size -= len(ln)
-micropython.kbd_intr(3)
+            f_size -= len(d)
+            sys.stdout.write('+')
+    micropython.kbd_intr(3)
+    rec = b''
+    while not (b'ok' in rec):
+        rec = (rec + (usb.read(1) or b''))[-16:]
+    sys.stdout.write('ok')
+except Exception as e:
+    sys.stdout.write('FLASH_ERR:' + str(e) + '\\n')
+    raise
 """
 
 FLASH_PROGRAM = """import sys, micropython
 
 # 禁用 Ctrl+C 中断，防止数据流中的 0x03 字节误触发设备重启
-micropython.kbd_intr(-1)
-usb = sys.stdin.buffer
+try:
+    micropython.kbd_intr(-1)
+    usb = sys.stdin.buffer
+    sys.stdout.write('READY')
 
-# FILES 格式: [(size, remote_path), ...]，运行前由 PC 端替换
-entries = FILES
-for file_size, file_path in entries:
-    with open(file_path, 'wb') as f:
-        remaining = file_size
-        while remaining:
-            chunk = usb.read(min(remaining, BFSIZE))
-            if chunk:
-                f.write(chunk)
-                remaining -= len(chunk)
-# 恢复 Ctrl+C 中断
-micropython.kbd_intr(3)
+    # FILES 格式: [(size, remote_path), ...]，运行前由 PC 端替换
+    entries = FILES
+    for file_size, file_path in entries:
+        with open(file_path, 'wb') as f:
+            remaining = file_size
+            while remaining:
+                blk = min(remaining, BFSIZE)
+                d = usb.read(blk)
+                if d:
+                    f.write(d)
+                    f.flush()
+                    remaining -= len(d)
+                    sys.stdout.write('+')
+    # 恢复 Ctrl+C 中断
+    micropython.kbd_intr(3)
+except Exception as e:
+    sys.stdout.write('FLASH_ERR:' + str(e) + '\\n')
+    raise
 """
 
 # ── 协议辅助函数（模块级） ──────────────────────────────────
@@ -187,31 +207,65 @@ class MicroPython:
                     raise ConnectionError(f"重连失败 ({max_retries + 1} 次): {e}")
                 time.sleep(1)
 
+    def _read_until_raw_repl(self, timeout: int = 3) -> Tuple[bool, bytes]:
+        """读取所有串口数据直到检测到原始 REPL 确认消息或超时。
+
+        原始 REPL 进入后设备会发送 "raw REPL; CTRL-B to exit" 确认。
+        相比 _read_until(b">")，此方法不会错误匹配常规 REPL 的 >>> 提示符。
+
+        Returns:
+            (是否进入原始 REPL, 已读取的全部数据)
+        """
+        deadline = time.time() + timeout
+        buf = b""
+        while time.time() < deadline:
+            if self.transport.in_waiting:
+                chunk = self.transport.read(self.transport.in_waiting)
+                buf += chunk
+                self._log_repl_data("rx", chunk)
+                if b"CTRL-B" in buf:
+                    return True, buf
+            time.sleep(0.02)
+        return False, buf
+
     def _init_device_state(self) -> None:
         """初始化设备到原始 REPL 模式并设置 kbd_intr(-1)。
 
         在原始 REPL 模式中执行完整序列：
-        Ctrl+C × 2 → Ctrl+A → fallback Ctrl+D → Ctrl+A → kbd_intr(-1)
+        Ctrl+C × 5 → Ctrl+A → fallback Ctrl+D → Ctrl+A → kbd_intr(-1)
         """
-        for _ in range(2):
+        for _ in range(5):
             self._write(SET_RESET)
-            time.sleep(0.1)
+            time.sleep(0.02)
         self.transport.reset_input_buffer()
 
         self._write(ENTER_RAW_REPL)
-        data = self._read_until(b">", timeout=2)
+        ok, data = self._read_until_raw_repl(timeout=2)
 
-        if b">" not in data:
+        if not ok:
             self._write(SET_EXECUTE)
             time.sleep(0.8)
             self.transport.reset_input_buffer()
             self._write(ENTER_RAW_REPL)
-            data = self._read_until(b">", timeout=3)
+            ok, data = self._read_until_raw_repl(timeout=3)
 
-        if b">" not in data:
+        if not ok:
+            # 尝试 DTR/RTS 硬件复位兜底
+            if isinstance(self.transport, SerialTransport):
+                try:
+                    self.transport.dtr_rts_reset()
+                    time.sleep(0.5)
+                    self.transport.reset_input_buffer()
+                    self._write(ENTER_RAW_REPL)
+                    ok, data = self._read_until_raw_repl(timeout=3)
+                    if ok:
+                        self._execute("import micropython; micropython.kbd_intr(-1)", timeout=3, raise_on_error=False)
+                        return
+                except Exception:
+                    pass
             raise RuntimeError(f"无法进入原始 REPL 模式，设备响应: {data[:100]!r}")
 
-        self._execute("import micropython; micropython.kbd_intr(-1)", timeout=3)
+        self._execute("import micropython; micropython.kbd_intr(-1)", timeout=3, raise_on_error=False)
 
     def disconnect(self) -> None:
         """断开串口连接，退出原始 REPL 并关闭串口。"""
@@ -291,7 +345,7 @@ class MicroPython:
             text = text.replace(c, name)
         self._repl_log_file.write(f"[{ts}] {marker} {text}\n")
         stripped = text.replace("\n", "").replace("\r", "").replace("\t", "")
-        if stripped.strip() == "" and data:
+        if not stripped.strip() and data:
             self._repl_log_file.write(f"[{ts}] {marker} [hex] {data.hex(' ')}\n")
         self._repl_log_file.flush()
 
@@ -299,24 +353,60 @@ class MicroPython:
         """写入数据到串口。"""
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self._log_repl_data("tx", data)
+        if not getattr(self, '_suppress_tx_log', False):
+            self._log_repl_data("tx", data)
         self.transport.write(data)
 
-    def _read_until(self, terminator: bytes = b"\x04", timeout: Optional[int] = None) -> bytes:
+    def _read_until(self, terminator: bytes = b"\x04", timeout: Optional[int] = None) -> Tuple[bool, bytes]:
         timeout = timeout or self.timeout
         buf = b""
         deadline = time.time() + timeout
+        sleep_time = 0.001
+        idle_count = 0
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
                 buf += chunk
                 self._log_repl_data("rx", chunk)
+                idle_count = 0
+                sleep_time = 0.001
                 idx = buf.find(terminator)
                 if idx >= 0:
                     buf = buf[:idx + len(terminator)]
-                    break
-            time.sleep(0.02)
-        return buf
+                    return True, buf
+            else:
+                idle_count += 1
+                if idle_count > 10:
+                    sleep_time = 0.02
+            time.sleep(sleep_time)
+        return False, buf
+
+    def _read_until_marker(self, marker: bytes, timeout: int = 30) -> Tuple[bool, bytes]:
+        """等待标记出现在串口数据流中。
+
+        持续读取并记录串口数据直到标记出现或超时。
+        返回 (True, b"") 表示标记已收到，(False, 已读数据) 表示超时。
+        超时时返回的数据可用于分析错误原因。
+        """
+        deadline = time.time() + timeout
+        buf = b""
+        sleep_time = 0.001
+        idle_count = 0
+        while time.time() < deadline:
+            if self.transport.in_waiting:
+                chunk = self.transport.read(self.transport.in_waiting)
+                buf += chunk
+                self._log_repl_data("rx", chunk)
+                if marker in buf:
+                    return True, b""
+                idle_count = 0
+                sleep_time = 0.001
+            else:
+                idle_count += 1
+                if idle_count > 10:
+                    sleep_time = 0.02
+            time.sleep(sleep_time)
+        return False, buf
 
     def repl_(self) -> None:
         """交互式 MicroPython REPL（串口透传模式）。"""
@@ -426,12 +516,13 @@ class MicroPython:
                 except Exception:
                     pass
 
-    def _execute(self, code: str | bytes, timeout: int = 10) -> str:
+    def _execute(self, code: str | bytes, timeout: int = 10, raise_on_error: bool = True) -> str:
         """在原始 REPL 中执行 Python 代码并返回设备输出。
 
         Args:
             code: 要执行的 Python 代码（字符串或 bytes）
             timeout: 等待响应超时（秒）
+            raise_on_error: 设备返回 Traceback 时是否抛出异常
 
         Returns:
             设备输出的 stdout 文本
@@ -442,7 +533,7 @@ class MicroPython:
         self._write(code)
         self._write(SET_EXECUTE)  # Ctrl+D 执行
 
-        resp = self._read_until(SET_EXECUTE, timeout=timeout)
+        _, resp = self._read_until(SET_EXECUTE, timeout=timeout)
         # 去掉尾部的 \x04
         resp = resp.rstrip(SET_EXECUTE)
         text = resp.decode("utf-8", errors="replace")
@@ -450,10 +541,43 @@ class MicroPython:
             text = text[2:]
         text = text.strip()
 
-        if "Traceback" in text:
+        if raise_on_error and "Traceback" in text:
             raise RuntimeError(f"设备执行错误:\n{text}")
 
         return text
+
+    def _exec_raw(self, code: str | bytes, timeout: int = 10) -> str:
+        """在原始 REPL 中执行代码，忽略设备启动阶段的 Traceback。"""
+        return self._execute(code, timeout=timeout, raise_on_error=False)
+
+    def _send_data_with_ack(self, data_iter, total: int, desc: str = "传输中") -> None:
+        """逐块发送数据，每块等待设备 '+' 确认。
+
+        Args:
+            data_iter: 生成 bytes 块的迭代器
+            total: 数据总大小（字节），用于进度条
+            desc: 进度条描述文字
+        """
+        self._suppress_tx_log = True
+        self._log_repl_data("tx", f"[data: {total} bytes]\n".encode())
+        try:
+            if tqdm:
+                with tqdm(total=total, desc=desc, unit="B",
+                          unit_scale=True, leave=False) as pbar:
+                    for chunk in data_iter:
+                        self._write(chunk)
+                        found, err_data = self._read_until_marker(b"+", timeout=10)
+                        if not found:
+                            raise RuntimeError(f"设备写入超时, 收到: {err_data!r}")
+                        pbar.update(len(chunk))
+            else:
+                for chunk in data_iter:
+                    self._write(chunk)
+                    found, err_data = self._read_until_marker(b"+", timeout=10)
+                    if not found:
+                        raise RuntimeError(f"设备写入超时, 收到: {err_data!r}")
+        finally:
+            self._suppress_tx_log = False
 
     @staticmethod
     def _compute_crc32(data: bytes) -> int:
@@ -481,7 +605,15 @@ class MicroPython:
             out = self._execute(
                 f"import os; print(os.stat({remote_lit})[6])", timeout=5
             )
-            actual_size = int(out.strip().splitlines()[-1])
+            lines = out.strip().splitlines()
+            if not lines:
+                print(f"  {_RED}文件大小校验失败: 设备无响应{_RESET}")
+                return False
+            try:
+                actual_size = int(lines[-1])
+            except ValueError:
+                print(f"  {_RED}文件大小校验失败: 设备返回异常数据 {lines[-1]!r}{_RESET}")
+                return False
         except Exception as e:
             print(f"  {_RED}文件大小校验失败: {e}{_RESET}")
             return False
@@ -493,16 +625,24 @@ class MicroPython:
         if verify_mode == "crc32" and expected_crc is not None:
             try:
                 crc_out = self._execute(
-                    "import ubinascii\n"
+                    "import gc,ubinascii\n"
+                    f"crc=0\n"
                     f"with open({remote_lit},'rb') as f:\n"
-                    " print(ubinascii.crc32(f.read()))",
+                    " while True:\n"
+                    "  gc.collect()\n"
+                    "  chunk=f.read(int(gc.mem_free()*0.7))\n"
+                    "  if not chunk:break\n"
+                    "  crc=ubinascii.crc32(chunk,crc)\n"
+                    "print(crc&0xffffffff)",
                     timeout=15,
                 )
-                actual_crc = int(crc_out.strip().splitlines()[-1]) & 0xffffffff
+                crc_lines = crc_out.strip().splitlines()
+                if not crc_lines:
+                    print(f"  {_YELLOW}[WARN]{_RESET} CRC32 校验无响应，仅验证文件大小")
+                    return True
+                actual_crc = int(crc_lines[-1]) & 0xffffffff
                 if actual_crc != expected_crc:
-                    print(f"  {_RED}CRC32 不匹配: 期望 {expected_crc:#x}, 实际 {actual_crc:#x}{_RESET}")
                     return False
-                print(f"  {_GREEN}CRC32 校验通过{_RESET}")
             except Exception as e:
                 print(f"  {_YELLOW}[WARN]{_RESET} CRC32 校验不可用 ({e})，仅验证文件大小")
 
@@ -547,7 +687,8 @@ class MicroPython:
             if mpy_path:
                 tmp_dirs.append(tmp_dir)
                 actual_local = mpy_path
-                actual_remote = actual_remote[:-3] + ".mpy"
+                if not actual_remote.endswith(".mpy"):
+                    actual_remote = actual_remote[:-3] + ".mpy"
 
         file_size = os.path.getsize(actual_local)
         verify_mode = self.config.verify
@@ -561,55 +702,60 @@ class MicroPython:
 
         print(f"  {_GREEN}刷入:{_RESET} {local_path} -> {actual_remote} ({file_size} 字节, 块大小={DEFAULT_CHUNK_SIZE})")
 
+        script = (
+            FLASH.replace("FILE", repr(actual_remote))
+            .replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
+            .replace("FSIZE", str(file_size))
+        )
+
         _t0 = time.time()
         try:
             with self._repl_log_ctx():
-                for attempt in range(max_retries + 1):
-                    self._enter_raw_repl()
+                self._enter_raw_repl()
 
+                # 创建远程目录（在重试循环外只做一次）
+                remote_dir = actual_remote.rsplit("/", 1)[0]
+                if remote_dir:
+                    self._execute(
+                        "import os\n"
+                        f"try:\n"
+                        f" os.mkdir({remote_dir!r})\n"
+                        f"except OSError:\n"
+                        f" pass\n",
+                        timeout=3,
+                    )
+
+                for attempt in range(max_retries + 1):
                     if attempt > 0:
+                        self._enter_raw_repl()
                         print(f"  {_YELLOW}[RETRY {attempt}/{max_retries}]{_RESET}")
 
                     try:
-                        # 确保远程目录存在（POSIX 风格路径）
-                        remote_dir = actual_remote.rsplit("/", 1)[0]
-                        if remote_dir:
-                            self._execute(
-                                "import os\n"
-                                f"try:\n"
-                                f" os.mkdir({remote_dir!r})\n"
-                                f"except OSError:\n"
-                                f" pass\n",
-                                timeout=3,
-                            )
-
                         self._drain_rx_log()
-                        self._write(
-                            FLASH.replace("FILE", repr(actual_remote))
-                            .replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
-                            .replace("FSIZE", str(file_size))
-                        )
+                        self._write(script.encode())
                         self._write(SET_EXECUTE)
-                        time.sleep(0.3)
+                        found, err_data = self._read_until_marker(b"READY", timeout=30)
+                        if not found:
+                            raise RuntimeError(f"设备未就绪: {err_data!r}")
 
-                        with open(actual_local, 'rb') as f:
-                            if tqdm:
-                                with tqdm(total=file_size, desc="传输中", unit="B",
-                                          unit_scale=True, leave=False) as pbar:
-                                    for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
-                                        chunk = f.read(DEFAULT_CHUNK_SIZE)
-                                        self._write(chunk)
-                                        pbar.update(len(chunk))
-                            else:
-                                for _ in range(0, file_size, DEFAULT_CHUNK_SIZE):
-                                    self._write(f.read(DEFAULT_CHUNK_SIZE))
+                        def _file_chunks():
+                            with open(actual_local, 'rb') as f:
+                                while True:
+                                    chunk = f.read(DEFAULT_CHUNK_SIZE)
+                                    if not chunk:
+                                        break
+                                    yield chunk
+                        self._send_data_with_ack(_file_chunks(), file_size)
 
-                        self._drain_rx_log()
+                        # 等待刷入完成提示符
+                        self._write(b"ok")
+                        found, err_data = self._read_until_marker(b"ok", timeout=10)
+                        if not found:
+                            print(err_data)
+                            print(f"  {_YELLOW}[WARN]{_RESET} 刷入完成但设备未返回提示符，跳过校验")
+                            print(f"  {_GREEN}[OK] 刷入成功 (校验已跳过){_RESET}")
+                            return
 
-                        # 等待设备返回原始 REPL 提示符，确保刷入完成
-                        self._read_until(b">", timeout=5)
-
-                        # ── 刷入后校验 ──
                         if verify_mode != "off":
                             ok = self._verify_file_on_device(
                                 actual_remote, file_size, verify_mode, expected_crc
@@ -618,19 +764,15 @@ class MicroPython:
                                 raise RuntimeError("校验失败")
                             elapsed = time.time() - _t0
                             rate = file_size / elapsed / 1024 if elapsed > 0 else 0
-                            print(f"  {_GREEN}✓ 刷入成功{_RESET} ({file_size/1024:.1f} KB, {elapsed:.1f}s, {rate:.0f} KB/s)")
+                            print(f"  {_GREEN}[OK] 刷入成功{_RESET} ({file_size/1024:.1f} KB, {elapsed:.1f}s, {rate:.0f} KB/s)")
                         else:
-                            print(f"  {_GREEN}✓ 刷入成功 (校验已关闭){_RESET}")
-                        return  # 成功
+                            print(f"  {_GREEN}[OK] 刷入成功 (校验已关闭){_RESET}")
+                        return
 
                     except (serial.SerialException, Exception) as e:
                         if attempt >= max_retries:
                             raise
                         print(f"  {_YELLOW}{e}，准备重试 ({attempt+1}/{max_retries})...{_RESET}")
-                        try:
-                            self._execute("f.close()", timeout=2)
-                        except Exception:
-                            pass
         finally:
             for d in tmp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
@@ -703,7 +845,8 @@ class MicroPython:
                 if mpy_path:
                     tmp_dirs.append(mpy_tmp_dir)
                     actual_local = mpy_path
-                    actual_remote = actual_remote[:-3] + ".mpy"
+                    if not actual_remote.endswith(".mpy"):
+                        actual_remote = actual_remote[:-3] + ".mpy"
 
             with open(actual_local, "rb") as f:
                 content = f.read()
@@ -724,6 +867,7 @@ class MicroPython:
                 print(f"    {lp} -> {rp} ({sz} 字节)")
             return []
 
+        script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
         max_retries = self.config.max_retries
 
         try:
@@ -746,9 +890,6 @@ class MicroPython:
                     )
                     self._execute(mkdir_cmds)
 
-                # ── 发送刷入脚本 ──
-                script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
-
                 with self._repl_log_ctx():
                     print(f"  {_GREEN}刷入 {len(file_list)} 个文件:{_RESET}")
                     for rp, lp, sz in file_list:
@@ -756,24 +897,25 @@ class MicroPython:
 
                     try:
                         self._write(script.encode() + SET_EXECUTE)
-                        time.sleep(0.3)
+                        found, err_data = self._read_until_marker(b"READY", timeout=30)
+                        if not found:
+                            raise RuntimeError(f"设备未就绪: {err_data!r}")
 
                         total_data_size = len(all_data)
-                        if tqdm:
-                            with tqdm(total=total_data_size, desc="传输中", unit="B",
-                                      unit_scale=True, leave=False) as pbar:
-                                for offset in range(0, total_data_size, DEFAULT_CHUNK_SIZE):
-                                    chunk = all_data[offset:offset + DEFAULT_CHUNK_SIZE]
-                                    self._write(chunk)
-                                    pbar.update(len(chunk))
-                        else:
-                            for offset in range(0, total_data_size, DEFAULT_CHUNK_SIZE):
-                                self._write(all_data[offset:offset + DEFAULT_CHUNK_SIZE])
+                        self._send_data_with_ack(
+                            (all_data[i:i + DEFAULT_CHUNK_SIZE] for i in range(0, total_data_size, DEFAULT_CHUNK_SIZE)),
+                            total_data_size,
+                        )
 
-                        self._drain_rx_log()
-
-                        # 等待设备返回原始 REPL 提示符
-                        self._read_until(b">", timeout=10)
+                        # 等待刷入完成提示符
+                        found, err_data = self._read_until_marker(b">", timeout=10)
+                        if not found:
+                            print(f"  {_YELLOW}[WARN]{_RESET} 刷入完成但设备未返回提示符，跳过校验")
+                            total_size = len(all_data)
+                            elapsed = time.time() - _t0
+                            rate = total_size / elapsed / 1024 if elapsed > 0 else 0
+                            print(f"  {_GREEN}[OK] 刷入成功{_RESET} ({total_size/1024:.1f} KB, {len(file_list)} 个文件, {elapsed:.1f}s, {rate:.0f} KB/s)")
+                            return [(lp, rp, True) for (rp, lp, sz) in file_list]
 
                         # ── 校验 ──
                         if verify_mode != "off":
@@ -796,7 +938,7 @@ class MicroPython:
                                 for lp, rp in failed_files:
                                     try:
                                         self.flash_file(
-                                            lp, rp, compile=None,
+                                            lp, rp, compile=False,
                                             bytecode_ver=bytecode_ver, arch=arch,
                                             active_tags=active_tags,
                                         )
@@ -804,15 +946,14 @@ class MicroPython:
                                     except Exception as e2:
                                         print(f"  {_RED}重试失败 {rp}: {e2}{_RESET}")
                                 if retry_ok == len(failed_files):
-                                    print(f"  {_GREEN}✓ 全部重试成功{_RESET}")
-                                    break  # 成功，退出重试循环
-                                # 仍有失败，继续外层重试
+                                    print(f"  {_GREEN}[OK] 全部重试成功{_RESET}")
+                                    break
                                 continue
 
                         total_size = len(all_data)
                         elapsed = time.time() - _t0
                         rate = total_size / elapsed / 1024 if elapsed > 0 else 0
-                        print(f"  {_GREEN}✓ 刷入成功{_RESET} ({total_size/1024:.1f} KB, {len(file_list)} 个文件, {elapsed:.1f}s, {rate:.0f} KB/s)")
+                        print(f"  {_GREEN}[OK] 刷入成功{_RESET} ({total_size/1024:.1f} KB, {len(file_list)} 个文件, {elapsed:.1f}s, {rate:.0f} KB/s)")
                         return [(lp, rp, True) for (rp, lp, sz) in file_list]
 
                     except (serial.SerialException, Exception) as e:

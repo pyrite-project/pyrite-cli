@@ -1,4 +1,5 @@
-﻿import time
+﻿import os
+import time
 import binascii
 import tempfile
 import re
@@ -570,6 +571,18 @@ class MicroPython:
                         print(f"  {_YELLOW}[RETRY {attempt}/{max_retries}]{_RESET}")
 
                     try:
+                        # 确保远程目录存在（POSIX 风格路径）
+                        remote_dir = actual_remote.rsplit("/", 1)[0]
+                        if remote_dir:
+                            self._execute(
+                                "import os\n"
+                                f"try:\n"
+                                f" os.mkdir({remote_dir!r})\n"
+                                f"except OSError:\n"
+                                f" pass\n",
+                                timeout=3,
+                            )
+
                         self._drain_rx_log()
                         self._write(
                             FLASH.replace("FILE", repr(actual_remote))

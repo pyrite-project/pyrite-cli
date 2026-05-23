@@ -494,8 +494,8 @@ def project_scan(
 def project_flash(
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
                                autocompletion=_complete_port),
-    directory: str = typer.Argument(..., help="本地项目目录路径"),
-    remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
+    directory: str = typer.Argument("./", help="本地项目目录路径"),
+    remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
     baudrate: int = typer.Option(115200, "--baudrate", "-b",
                                  help="波特率（默认 115200）"),
     timeout: int = typer.Option(10, "--timeout", "-t",
@@ -532,7 +532,8 @@ def project_flash(
             active_tags.difference_update(t.strip() for t in no_feature.split(","))
         ProjectSyncManager(mp).flash(directory, remote_path, hash_config_path=hash_config,
                             bytecode_ver=ver, arch=arch,
-                            active_tags=active_tags or None, manifest_path=manifest)
+                            active_tags=active_tags or None, manifest_path=manifest,
+                            dry_run=dry_run)
     finally:
         mp.disconnect()
 

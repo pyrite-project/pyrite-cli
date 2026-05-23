@@ -105,6 +105,7 @@ class ProjectSyncManager:
         arch: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
+        dry_run: bool = False,
     ) -> List[Tuple[str, str, bool]]:
         """根据哈希配置，仅刷入新增或已更改的文件。"""
         if hash_config_path is None:

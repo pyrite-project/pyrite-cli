@@ -15,7 +15,7 @@ pyrite-cli 未来发展方向与功能优化清单。
 
 - [ ] **项目模板库** — 提供预置项目模板（IoT 传感器、WiFi 连接、BLE 扫描等），`pyrcli new` 时可选择模板
 - [ ] **设备端文件 diff** — `project status` 增加行级 diff 显示，不止于大小/哈希比对
-- [ ] **JSON 输出模式** — 为 `scan`、`board-info`、`project status` 添加 `--json` 输出，方便脚本集成
+- [x] **JSON 输出模式** — 为 `scan`、`board-info`、`project status` 添加 `--json` 输出，方便脚本集成
 - [ ] **OTA 升级** — 利用 WebREPL 通道实现远程固件与代码更新
 - [ ] **多设备并行管理** — `pyrcli broadcast` 同时向多个串口/WebREPL 设备发送命令
 - [ ] **mDNS 设备发现** — 局域网自动发现 MicroPython 设备，无需手动指定 IP/端口

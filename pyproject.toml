@@ -18,7 +18,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["mypy>=1.8.0"]
+dev = [
+    "mypy>=1.8.0",
+    "pytest>=8.0",
+]
 
 [project.scripts]
 pyrcli = "cli.main:main"
@@ -38,6 +41,7 @@ testpaths = [
     "test/test_manifest_loader.py",
     "test/test_preprocessor.py",
     "test/test_serial_transport.py",
+    "test/test_output.py",
 ]
 
 [tool.mypy]

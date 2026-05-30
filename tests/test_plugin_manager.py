@@ -39,7 +39,7 @@ class TestLoadPlugin:
         mock_ep.value = "pyrite_ota:app"
         mock_ep.load.return_value = typer.Typer(help="OTA plugin")
 
-        with patch("cli.plugin_manager.importlib.import_module") as mock_import:
+        with patch("cli.plugins.manager.importlib.import_module") as mock_import:
             mock_mod = MagicMock()
             mock_mod.__plugin_name__ = "ota"
             mock_mod.__plugin_version__ = "1.0.0"
@@ -78,7 +78,7 @@ class TestLoadPlugin:
         mock_ep.value = "pyrite_mqtt:app"
         mock_ep.load.return_value = typer.Typer()
 
-        with patch("cli.plugin_manager.importlib.import_module") as mock_import:
+        with patch("cli.plugins.manager.importlib.import_module") as mock_import:
             mock_mod = MagicMock(spec=[])
             mock_import.return_value = mock_mod
 
@@ -101,8 +101,8 @@ class TestLoadPlugins:
         mock_ep.load.return_value = typer.Typer(help="OTA plugin")
 
         main_app = typer.Typer()
-        with patch("cli.plugin_manager.discover_plugins", return_value=[mock_ep]):
-            with patch("cli.plugin_manager.importlib.import_module") as mock_import:
+        with patch("cli.plugins.manager.discover_plugins", return_value=[mock_ep]):
+            with patch("cli.plugins.manager.importlib.import_module") as mock_import:
                 mock_mod = MagicMock()
                 mock_mod.__plugin_name__ = "ota"
                 mock_mod.__plugin_version__ = "0.1.0"
@@ -128,9 +128,9 @@ class TestLoadPlugins:
 
         main_app = typer.Typer()
         with patch(
-            "cli.plugin_manager.discover_plugins", return_value=[good_ep, bad_ep]
+            "cli.plugins.manager.discover_plugins", return_value=[good_ep, bad_ep]
         ):
-            with patch("cli.plugin_manager.importlib.import_module") as mock_import:
+            with patch("cli.plugins.manager.importlib.import_module") as mock_import:
                 mock_import.return_value = MagicMock(
                     __plugin_name__="good", __plugin_version__="1.0.0"
                 )
@@ -142,7 +142,7 @@ class TestLoadPlugins:
     def test_empty_discovery(self):
         """没有发现任何插件时 load_plugins 返回空列表。"""
         main_app = typer.Typer()
-        with patch("cli.plugin_manager.discover_plugins", return_value=[]):
+        with patch("cli.plugins.manager.discover_plugins", return_value=[]):
             plugins = load_plugins(main_app)
         assert plugins == []
 

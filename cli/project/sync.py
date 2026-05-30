@@ -1,18 +1,29 @@
-﻿import os
-import time
-import json
+"""
+项目同步管理器 — 哈希增量刷入、状态比对、文件拉取。
+
+通过 ``ProjectSyncManager`` 封装所有需要设备连接的项目级操作，
+使用 MicroPython 实例与设备通信。
+"""
+
+from __future__ import annotations
+
 import hashlib
+import json
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
-from ..utils.ansi import _GREEN, _YELLOW, _RED, _RESET
-from ..utils.output import log, print_json
-from ..utils.flash import _strip_repl_trailer, SET_EXECUTE
-from ..utils.config import _HASH_VERSION, HASH_CONFIG_FILE
+from ..utils.config import HASH_CONFIG_FILE, _HASH_VERSION
+from ..utils.flash import SET_EXECUTE, _strip_repl_trailer
+from ..utils.log import get_logger
 from ..utils.manifest_loader import load_manifest
+from ..utils.output import log as output_log, print_json
 
 if TYPE_CHECKING:
     from ..utils.flash import MicroPython
+
+log = get_logger(__name__)
 
 
 def compute_file_hash(filepath: str) -> str:
@@ -28,10 +39,7 @@ def compute_file_hash(filepath: str) -> str:
 
 
 class ProjectSyncManager:
-    """项目同步管理器 — 哈希增量刷入、状态比对、文件拉取。
-
-    封装所有需要设备连接的项目级操作，通过 MicroPython 实例与设备通信。
-    """
+    """项目同步管理器 — 哈希增量刷入、状态比对、文件拉取。"""
 
     def __init__(self, mp: "MicroPython") -> None:
         self.mp = mp
@@ -44,13 +52,11 @@ class ProjectSyncManager:
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
     ) -> List[Tuple[str, str]]:
-        """收集项目中可刷入的文件列表。
-
-        Returns:
-            list of (local_abs_path, local_rel_remote)
-        """
+        """收集项目中可刷入的文件列表。"""
         if manifest_path:
-            entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
+            entries = load_manifest(
+                manifest_path, active_tags or set(), base_dir=local_dir,
+            )
         else:
             entries = []
             for root, _dirs, files in os.walk(local_dir):
@@ -60,14 +66,16 @@ class ProjectSyncManager:
                     lp = os.path.join(root, fn)
                     rp = os.path.relpath(lp, local_dir).replace("\\", "/")
                     entries.append((lp, rp))
-        # 过滤 manifest.py 和 .pyi
-        return [(lp, rp) for lp, rp in entries
-                if Path(rp).name != "manifest.py" and not lp.endswith(".pyi")]
+        return [
+            (lp, rp) for lp, rp in entries
+            if Path(rp).name != "manifest.py" and not lp.endswith(".pyi")
+        ]
 
     # ── project scan ────────────────────────────────
 
     def scan(
-        self, local_dir: str,
+        self,
+        local_dir: str,
         hash_config_path: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
@@ -91,16 +99,17 @@ class ProjectSyncManager:
         with open(hash_config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
-        log(f"  {_GREEN}项目文件哈希已保存:{_RESET} {hash_config_path}")
-        log(f"  {_GREEN}共 {len(file_hashes)} 个文件{_RESET}")
+        log.info("项目文件哈希已保存: %s (%d 个文件)", hash_config_path, len(file_hashes))
         for rel_path in sorted(file_hashes):
-            log(f"    {rel_path}")
+            log.debug("  %s", rel_path)
         return hash_config_path
 
     # ── project flash ───────────────────────────────
 
     def flash(
-        self, local_dir: str, remote_prefix: str,
+        self,
+        local_dir: str,
+        remote_prefix: str,
         hash_config_path: Optional[str] = None,
         bytecode_ver: Optional[int] = None,
         arch: Optional[str] = None,
@@ -112,23 +121,20 @@ class ProjectSyncManager:
         if hash_config_path is None:
             hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
 
-        # 加载已有哈希配置
         if os.path.exists(hash_config_path):
             with open(hash_config_path, "r", encoding="utf-8") as f:
                 stored_config = json.load(f)
             stored_hashes = stored_config.get("files", {})
         else:
-            log(f"  {_YELLOW}[WARN]{_RESET} 未找到哈希配置文件，将全量刷入")
+            log.warning("未找到哈希配置文件，将全量刷入")
             stored_hashes = {}
 
-        # 扫描当前项目文件
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
         if not entries:
-            print("  没有需要刷入的文件。", file=__import__('sys').stderr)
+            log.info("没有需要刷入的文件")
             return []
 
-        # 计算当前哈希并比对
-        changed: List[Tuple[str, str, str]] = []  # [(local_abs_path, remote_path, reason)]
+        changed: List[Tuple[str, str, str]] = []
         unchanged_count = 0
         current_hashes: Dict[str, str] = {}
 
@@ -136,7 +142,6 @@ class ProjectSyncManager:
             rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
             cur_hash = compute_file_hash(lp)
             current_hashes[rel_path] = cur_hash
-
             remote_path = os.path.join(remote_prefix, rp_part).replace("\\", "/")
 
             stored = stored_hashes.get(rel_path)
@@ -147,35 +152,33 @@ class ProjectSyncManager:
             else:
                 unchanged_count += 1
 
-        # 报告已删除文件
         removed = [k for k in stored_hashes if k not in current_hashes]
         if removed:
-            log(f"  {_YELLOW}[INFO]{_RESET} {len(removed)} 个文件已从项目中移除（将从配置中清除）")
+            log.info("%d 个文件已从项目中移除（将从配置中清除）", len(removed))
             for rf in sorted(removed):
-                log(f"    - {rf}")
+                log.debug("  - %s", rf)
 
         if not changed:
-            log(f"  {_GREEN}所有文件均未更改 ({unchanged_count} 个文件)，无需刷入{_RESET}")
-            return [(lp, os.path.join(remote_prefix, rp_part).replace("\\", "/"), True)
-                    for lp, rp_part in entries]
+            log.info("所有文件均未更改 (%d 个文件)，无需刷入", unchanged_count)
+            return [
+                (lp, os.path.join(remote_prefix, rp_part).replace("\\", "/"), True)
+                for lp, rp_part in entries
+            ]
 
-        log(f"  {_GREEN}需要刷入 {len(changed)} 个文件:{_RESET}")
+        log.info("需要刷入 %d 个文件:", len(changed))
         for lp, rp, reason in changed:
-            log(f"    [{reason}] {os.path.relpath(lp, local_dir)} -> {rp}")
+            log.info("  [%s] %s → %s", reason, os.path.relpath(lp, local_dir), rp)
         if unchanged_count:
-            log(f"  {_GREEN}{unchanged_count} 个文件未更改，跳过{_RESET}")
+            log.info("%d 个文件未更改，跳过", unchanged_count)
 
         if dry_run:
-            log(f"  {_YELLOW}[DRY-RUN]{_RESET} 以上 {len(changed)} 个文件将被刷入（未实际执行）")
+            log.info("[DRY-RUN] 以上 %d 个文件将被刷入（未实际执行）", len(changed))
             return []
 
-        # 逐个刷入变更文件
         results: List[Tuple[str, str, bool]] = []
-        ok = 0
-        fail = 0
+        ok = fail = 0
 
         for lp, remote_path, _reason in changed:
-            log("")
             try:
                 self.mp.flash_file(
                     lp, remote_path,
@@ -187,11 +190,10 @@ class ProjectSyncManager:
                 results.append((lp, remote_path, True))
                 ok += 1
             except Exception as e:
-                log(f"  {_RED}刷入失败: {e}{_RESET}")
+                log.error("刷入失败 %s: %s", remote_path, e)
                 results.append((lp, remote_path, False))
                 fail += 1
 
-        # 更新哈希配置（仅成功刷入的文件）
         if ok > 0:
             updated: Dict[str, str] = {}
             for lp, rp_part in entries:
@@ -213,25 +215,22 @@ class ProjectSyncManager:
                     "hash_algorithm": "sha256",
                     "files": updated,
                 }, f, indent=2, ensure_ascii=False)
-
-            log(f"\n  {_GREEN}哈希配置已更新:{_RESET} {hash_config_path}")
+            log.info("哈希配置已更新: %s", hash_config_path)
 
         parts = []
         if ok:
-            parts.append(f"\033[32m{ok} 成功\033[0m")
+            parts.append(f"{ok} 成功")
         if fail:
-            parts.append(f"\033[31m{fail} 失败\033[0m")
-        log(f"\n增量刷入完成: {', '.join(parts)}")
+            parts.append(f"{fail} 失败")
+        log.info("增量刷入完成: %s", ", ".join(parts))
         return results
 
     # ── 设备端辅助查询 ────────────────────────────────
 
-    def _check_device_files(self, remote_paths: List[str]) -> Dict[str, int]:
-        """批量检查设备文件存在性和大小。
-
-        Returns:
-            {remote_path: size}，不存在的文件 size 为 -1
-        """
+    def _check_device_files(
+        self, remote_paths: List[str],
+    ) -> Dict[str, int]:
+        """批量检查设备文件存在性和大小。"""
         if not remote_paths:
             return {}
         paths_repr = repr(remote_paths)
@@ -246,17 +245,19 @@ class ProjectSyncManager:
             "print(','.join(r))\n"
         )
         out = self.mp.run(script)
-        sizes = out.strip().split(',')
+        sizes = out.strip().split(",")
         result: Dict[str, int] = {}
         for i, rp in enumerate(remote_paths):
-            if i < len(sizes) and sizes[i] != '-':
+            if i < len(sizes) and sizes[i] != "-":
                 result[rp] = int(sizes[i])
             else:
                 result[rp] = -1
         return result
 
-    def _discover_device_files(self, remote_prefix: str) -> List[Tuple[str, int]]:
-        """递归发现设备上的所有文件，返回 [(full_remote_path, size), ...]."""
+    def _discover_device_files(
+        self, remote_prefix: str,
+    ) -> List[Tuple[str, int]]:
+        """递归发现设备上的所有文件。"""
         script = (
             "import os\n"
             "def _walk(d):\n"
@@ -274,8 +275,8 @@ class ProjectSyncManager:
         files: List[Tuple[str, int]] = []
         for line in out.strip().splitlines():
             line = line.strip()
-            if '|' in line:
-                sz, _, fp = line.partition('|')
+            if "|" in line:
+                sz, _, fp = line.partition("|")
                 if sz.isdigit():
                     files.append((fp, int(sz)))
         return files
@@ -283,40 +284,37 @@ class ProjectSyncManager:
     # ── project status ──────────────────────────────
 
     def status(
-        self, local_dir: str, remote_prefix: str,
+        self,
+        local_dir: str,
+        remote_prefix: str,
         hash_config_path: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
         fmt: str = "text",
     ) -> bool:
-        """比对本地哈希和设备端文件，显示差异清单（不刷入）。返回是否有差异。"""
+        """比对本地哈希和设备端文件，显示差异清单（不刷入）。"""
         if hash_config_path is None:
             hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
 
-        # 加载哈希配置
         if os.path.exists(hash_config_path):
             with open(hash_config_path, "r", encoding="utf-8") as f:
                 stored = json.load(f).get("files", {})
         else:
             stored = {}
 
-        # 扫描本地文件
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
         if not entries:
             if fmt == "json":
                 print_json({
-                    "added": [],
-                    "changed": [],
-                    "removed": [],
-                    "ok_count": 0,
+                    "added": [], "changed": [], "removed": [], "ok_count": 0,
                 })
                 return False
-            log("  没有可刷入的文件。")
+            log.info("没有可刷入的文件")
             return False
 
         current_hashes: Dict[str, str] = {}
         remote_paths: List[str] = []
-        local_map: Dict[str, str] = {}  # {remote_path: local_rel_path}
+        local_map: Dict[str, str] = {}
         for lp, rp_part in entries:
             rel = os.path.relpath(lp, local_dir).replace("\\", "/")
             remote = os.path.join(remote_prefix, rp_part).replace("\\", "/")
@@ -324,13 +322,11 @@ class ProjectSyncManager:
             remote_paths.append(remote)
             local_map[remote] = rel
 
-        # 查询设备端文件
         dev_sizes = self._check_device_files(remote_paths)
 
-        # 构建差异列表
-        added: List[Tuple[str, str]] = []     # 本地有，设备无
-        changed: List[Tuple[str, str]] = []   # 哈希不同
-        removed: List[str] = []               # 配置有，本地无
+        added: List[Tuple[str, str]] = []
+        changed: List[Tuple[str, str]] = []
+        removed_list: List[str] = []
         ok_count = 0
 
         for rp in remote_paths:
@@ -349,46 +345,47 @@ class ProjectSyncManager:
 
         for rel in stored:
             if rel not in [local_map[r] for r in remote_paths]:
-                removed.append(rel)
+                removed_list.append(rel)
 
-        has_diff = bool(added or changed or removed)
+        has_diff = bool(added or changed or removed_list)
 
         if fmt == "json":
             print_json({
                 "added":   [{"local": r, "remote": rp} for r, rp in added],
                 "changed": [{"local": r, "remote": rp} for r, rp in changed],
-                "removed": removed,
+                "removed": removed_list,
                 "ok_count": ok_count,
             })
             return has_diff
 
-        # 打印差异清单
+        # 打印差异清单（用户可见表格）
         header = f"{'状态':6}  {'本地文件':40}  {'设备路径':40}"
-        sep = f"{'──':6}  {'─'*40}  {'─'*40}"
-        log(f"\n  {header}")
-        log(f"  {sep}")
+        sep = f"{'──':6}  {'─' * 40}  {'─' * 40}"
+        output_log(f"\n  {header}")
+        output_log(f"  {sep}")
 
         for rel, rp in added:
-            log(f"  {_YELLOW}[ADD]{_RESET}  {rel:<40}  {rp:<40}")
+            output_log(f"  \033[33m[ADD]\033[0m  {rel:<40}  {rp:<40}")
         for rel, rp in changed:
-            log(f"  {_YELLOW}[MOD]{_RESET}  {rel:<40}  {rp:<40}")
-        for rel in removed:
-            log(f"  {_RED}[DEL]{_RESET}  {rel:<40}  {'(不在项目中)':40}")
+            output_log(f"  \033[33m[MOD]\033[0m  {rel:<40}  {rp:<40}")
+        for rel in removed_list:
+            output_log(f"  \033[31m[DEL]\033[0m  {rel:<40}  {'(不在项目中)':40}")
 
         if not has_diff:
-            log(f"  {_GREEN}所有文件一致 ({ok_count} 个文件){_RESET}")
+            log.info("所有文件一致 (%d 个文件)", ok_count)
         else:
-            log(f"  {_GREEN}一致: {ok_count}{_RESET}  "
-                f"{_YELLOW}新增: {len(added)}{_RESET}  "
-                f"{_YELLOW}变更: {len(changed)}{_RESET}  "
-                f"{_RED}删除: {len(removed)}{_RESET}")
-        log()
+            log.info(
+                "一致: %d  新增: %d  变更: %d  删除: %d",
+                ok_count, len(added), len(changed), len(removed_list),
+            )
         return has_diff
 
     # ── project pull ────────────────────────────────
 
     def pull(
-        self, local_dir: str, remote_prefix: str,
+        self,
+        local_dir: str,
+        remote_prefix: str,
         hash_config_path: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
@@ -396,13 +393,12 @@ class ProjectSyncManager:
         fmt: str = "text",
     ) -> bool:
         """从设备下载文件到本地（批量传输）。"""
-        # 尝试从本地项目收集文件清单
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
         from_device = False
 
         if not entries:
             if fmt != "json":
-                log(f"  {_YELLOW}[INFO]{_RESET} 本地目录为空，从设备发现文件...")
+                log.info("本地目录为空，从设备发现文件...")
             dev_files = self._discover_device_files(remote_prefix)
             if not dev_files:
                 if fmt == "json":
@@ -411,16 +407,19 @@ class ProjectSyncManager:
                     else:
                         print_json({"downloaded": [], "skipped": [], "failed": []})
                 else:
-                    log(f"  {_YELLOW}[INFO]{_RESET} 设备上未发现文件。")
+                    log.info("设备上未发现文件")
                 return True
             from_device = True
             entries = []
             for rp, sz in dev_files:
-                rel = rp[len(remote_prefix):].lstrip('/') if rp.startswith(remote_prefix) else rp.lstrip('/')
+                rel = (
+                    rp[len(remote_prefix):].lstrip("/")
+                    if rp.startswith(remote_prefix)
+                    else rp.lstrip("/")
+                )
                 lp = os.path.join(local_dir, rel).replace("\\", "/")
                 entries.append((lp, rel))
 
-        # 构建远程文件路径列表
         remote_files: List[str] = []
         local_paths: List[str] = []
         for lp, rp_part in entries:
@@ -430,15 +429,18 @@ class ProjectSyncManager:
 
         if dry_run:
             if fmt == "json":
-                print_json({"preview": [{"remote": rp, "local": lp}
-                                        for rp, lp in zip(remote_files, local_paths)]})
+                print_json({
+                    "preview": [
+                        {"remote": rp, "local": lp}
+                        for rp, lp in zip(remote_files, local_paths)
+                    ],
+                })
             else:
-                log(f"  {_YELLOW}[PREVIEW]{_RESET} 将下载 {len(remote_files)} 个文件:")
+                log.info("[PREVIEW] 将下载 %d 个文件:", len(remote_files))
                 for rp, lp in zip(remote_files, local_paths):
-                    log(f"    {rp} -> {lp}")
+                    log.info("  %s → %s", rp, lp)
             return True
 
-        # ── 批量获取 ──
         self.mp._enter_raw_repl()
         script = (
             "import os,sys\n"
@@ -462,7 +464,6 @@ class ProjectSyncManager:
         self.mp._write(script.encode() + SET_EXECUTE)
         time.sleep(0.3)
 
-        # ── 读取设备返回 ──
         buf = b""
         deadline = time.time() + max(30, len(remote_files) * 8)
         sizes: List[int] = []
@@ -480,7 +481,10 @@ class ProjectSyncManager:
                         nl = buf.find(b"\n", sz_marker)
                         if nl >= 0:
                             try:
-                                sizes = [int(x) for x in buf[sz_marker + 3:nl].decode().split(',')]
+                                sizes = [
+                                    int(x)
+                                    for x in buf[sz_marker + 3 : nl].decode().split(",")
+                                ]
                                 expected_total = sum(s for s in sizes if s >= 0)
                                 raw_start = nl + 1
                             except Exception:
@@ -490,42 +494,33 @@ class ProjectSyncManager:
                     raw = _strip_repl_trailer(buf[raw_start:])
                     if len(raw) >= expected_total:
                         time.sleep(0.05)
-                        buf += self.mp.transport.read(self.mp.transport.in_waiting)
+                        buf += self.mp.transport.read(
+                            self.mp.transport.in_waiting,
+                        )
                         break
             else:
                 time.sleep(0.02)
 
         if expected_total < 0:
             return self._pull_transfer_error(
-                fmt,
-                "size_info_missing",
-                "无法获取文件大小信息",
+                fmt, "size_info_missing", "无法获取文件大小信息",
             )
 
         if len(sizes) != len(remote_files):
             return self._pull_transfer_error(
-                fmt,
-                "file_count_mismatch",
-                "设备返回文件数量不匹配",
-                expected=len(remote_files),
-                received=len(sizes),
+                fmt, "file_count_mismatch", "设备返回文件数量不匹配",
+                expected=len(remote_files), received=len(sizes),
             )
 
-        # ── 解析原始数据 ──
         raw = _strip_repl_trailer(buf[raw_start:])
-
         if len(raw) < expected_total:
             return self._pull_transfer_error(
-                fmt,
-                "incomplete_data",
-                "数据不完整",
-                expected_bytes=expected_total,
-                received_bytes=len(raw),
+                fmt, "incomplete_data", "数据不完整",
+                expected_bytes=expected_total, received_bytes=len(raw),
             )
 
         raw = raw[:expected_total]
 
-        # ── 按大小分割并写入本地文件 ──
         ok = fail = 0
         offset = 0
         downloaded = []
@@ -533,34 +528,40 @@ class ProjectSyncManager:
         failed = []
         for i, (lp, size) in enumerate(zip(local_paths, sizes)):
             if size < 0:
-                log(f"  {_YELLOW}[SKIP]{_RESET} {remote_files[i]} (设备上不存在)")
+                log.warning("[SKIP] %s (设备上不存在)", remote_files[i])
                 skipped.append(remote_files[i])
                 fail += 1
                 continue
-            file_data = raw[offset:offset + size]
+            file_data = raw[offset : offset + size]
             offset += size
             try:
-                os.makedirs(os.path.dirname(lp) or '.', exist_ok=True)
+                os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
                 with open(lp, "wb") as f:
                     f.write(file_data)
-                log(f"  {_GREEN}✓{_RESET} {remote_files[i]} -> {lp} ({size} 字节)")
-                downloaded.append({"remote": remote_files[i], "local": lp, "size": size})
+                log.info("✓ %s → %s (%d 字节)", remote_files[i], lp, size)
+                downloaded.append({
+                    "remote": remote_files[i], "local": lp, "size": size,
+                })
                 ok += 1
             except Exception as e:
-                log(f"  {_RED}✗{_RESET} {remote_files[i]} -> {lp}: {e}")
+                log.error("✗ %s → %s: %s", remote_files[i], lp, e)
                 failed.append({"remote": remote_files[i], "error": str(e)})
                 fail += 1
 
         if fmt == "json":
-            print_json({"downloaded": downloaded, "skipped": skipped, "failed": failed})
+            print_json({
+                "downloaded": downloaded, "skipped": skipped, "failed": failed,
+            })
         else:
-            log(f"\n  {_GREEN}下载完成: {ok} 成功{_RESET}", end="")
+            parts = [f"{ok} 成功"]
             if fail:
-                log(f"  {_RED}{fail} 失败{_RESET}", end="")
-            log()
+                parts.append(f"{fail} 失败")
+            log.info("下载完成: %s", ", ".join(parts))
         return True
 
-    def _pull_transfer_error(self, fmt: str, code: str, message: str, **details: int) -> bool:
+    def _pull_transfer_error(
+        self, fmt: str, code: str, message: str, **details: int,
+    ) -> bool:
         if fmt == "json":
             payload = {"error": code, "message": message}
             payload.update(details)
@@ -568,9 +569,14 @@ class ProjectSyncManager:
         else:
             extra = ""
             if code == "file_count_mismatch":
-                extra = f"（期望 {details.get('expected')}，收到 {details.get('received')}）"
+                extra = (
+                    f"（期望 {details.get('expected')}，"
+                    f"收到 {details.get('received')}）"
+                )
             elif code == "incomplete_data":
-                extra = (f": 期望 {details.get('expected_bytes')} 字节, "
-                         f"收到 {details.get('received_bytes')} 字节")
-            log(f"  {_RED}[ERROR]{_RESET} {message}{extra}")
+                extra = (
+                    f": 期望 {details.get('expected_bytes')} 字节, "
+                    f"收到 {details.get('received_bytes')} 字节"
+                )
+            log.error("%s%s", message, extra)
         return False

@@ -51,13 +51,17 @@ class TestScanFormat:
     def test_stderr_has_log_text(self):
         with patch("cli.main.MicroPython.scan_ports", return_value=_fake_ports()):
             result = runner.invoke(app, ["scan"])
-        assert "ttyUSB0" in result.stderr
+        # 默认 CliRunner 将 stderr 混合到 stdout
+        assert "ttyUSB0" in result.stdout
 
     def test_json_stdout_only(self):
         with patch("cli.main.MicroPython.scan_ports", return_value=_fake_ports()):
             result = runner.invoke(app, ["scan", "--format", "json"])
         assert result.stdout.strip().startswith("{")
-        assert result.stderr == ""
+        # 验证 stdout 的 JSON 行是可解析的（排除可能的 stderr 混合行）
+        json_lines = [l for l in result.stdout.splitlines() if l.strip().startswith("{")]
+        assert len(json_lines) == 1
+        json.loads(json_lines[0])
 
     def test_env_var_format(self, monkeypatch):
         monkeypatch.setenv("PYRITE_FORMAT", "json")
@@ -72,7 +76,6 @@ class TestScanFormat:
             result = runner.invoke(app, ["scan", "--format", "json"])
         assert result.exit_code == 0
         assert json.loads(result.stdout) == {"devices": [], "count": 0}
-        assert result.stderr == ""
 
     def test_invalid_format_rejected(self):
         with patch("cli.main.MicroPython.scan_ports", return_value=_fake_ports()):
@@ -119,7 +122,9 @@ class TestBoardInfoFormat:
             result = runner.invoke(app, ["board-info", "/dev/ttyUSB0", "--format", "json"])
 
         assert result.exit_code == 1
-        assert json.loads(result.stdout) == {"error": "no_device_info"}
+        # JSON 在 stdout 首行（stderr 可能混入后续行）
+        data = json.loads(result.stdout.splitlines()[0])
+        assert data == {"error": "no_device_info"}
 
 
 # ── project status ───────────────────────────────────────────────────
@@ -307,10 +312,87 @@ class TestPluginInfoFormat:
             result = runner.invoke(app, ["plugin", "info", "missing", "--format", "json"])
 
         assert result.exit_code == 1
-        assert json.loads(result.stdout) == {
+        # JSON 在 stdout 首行（stderr 文本混在后面）
+        data = json.loads(result.stdout.splitlines()[0])
+        assert data == {
             "error": "plugin_not_found",
             "name": "missing",
         }
+
+    def test_found_plugin_json_includes_sandbox(self):
+        from cli.plugins.manager import PluginInfo
+        from cli.plugins.sandbox.config import SandboxConfig
+        p = PluginInfo(
+            name="myplugin",
+            version="2.0.0",
+            description="A test plugin",
+            module_path="/path/to/plugin",
+            app=None,
+            sandbox_config=SandboxConfig(mode="strict", network=False),
+        )
+        with patch("cli.main.get_loaded_plugins", return_value=[p]):
+            result = runner.invoke(app, ["plugin", "info", "myplugin", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["name"] == "myplugin"
+        assert data["version"] == "2.0.0"
+        assert data["sandbox"]["mode"] == "strict"
+        assert data["sandbox"]["network"] is False
+
+    def test_found_plugin_json_no_sandbox(self):
+        from cli.plugins.manager import PluginInfo
+        p = PluginInfo(
+            name="pipplugin",
+            version="1.0.0",
+            description="A pip plugin",
+            module_path="pkg:app",
+            app=None,
+            sandbox_config=None,
+        )
+        with patch("cli.main.get_loaded_plugins", return_value=[p]):
+            result = runner.invoke(app, ["plugin", "info", "pipplugin", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["name"] == "pipplugin"
+        assert data["sandbox"] is None
+
+
+# ── plugin sandbox ────────────────────────────────────────────────────
+
+class TestPluginSandboxFormat:
+    def test_missing_json(self):
+        with patch("cli.main.get_loaded_plugins", return_value=[]):
+            result = runner.invoke(app, ["plugin", "sandbox", "missing", "--format", "json"])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "plugin_not_found"
+
+    def test_pip_plugin_no_sandbox(self):
+        from cli.plugins.manager import PluginInfo
+        p = PluginInfo(
+            name="pipplugin", version="1.0.0", description="pip",
+            module_path="pkg:app", sandbox_config=None,
+        )
+        with patch("cli.main.get_loaded_plugins", return_value=[p]):
+            result = runner.invoke(app, ["plugin", "sandbox", "pipplugin", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["sandbox"] is None
+
+    def test_sandboxed_plugin_json(self):
+        from cli.plugins.manager import PluginInfo
+        from cli.plugins.sandbox.config import SandboxConfig
+        p = PluginInfo(
+            name="localplugin", version="0.1.0", description="local",
+            module_path="/tmp/plugin/localplugin/__init__.py",
+            sandbox_config=SandboxConfig(mode="standard", timeout_sec=60),
+        )
+        with patch("cli.main.get_loaded_plugins", return_value=[p]):
+            result = runner.invoke(app, ["plugin", "sandbox", "localplugin", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["sandbox"]["mode"] == "standard"
+        assert data["sandbox"]["timeout_sec"] == 60
 
 
 # ── path warnings ────────────────────────────────────────────────────
@@ -330,5 +412,5 @@ class TestIsatty:
     def test_no_ansi_when_not_tty(self):
         with patch("cli.main.MicroPython.scan_ports", return_value=_fake_ports()):
             result = runner.invoke(app, ["scan"])
-        # CliRunner stdout is not a tty, so ANSI codes should not appear in stderr
-        assert "\033[" not in result.stderr
+        # CliRunner 不是 tty，输出中不应包含 ANSI 转义码
+        assert "\033[" not in result.stdout

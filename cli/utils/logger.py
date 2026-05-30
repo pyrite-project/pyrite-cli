@@ -1,92 +1,51 @@
-"""Logging utilities for pyrite-cli.
+"""日志兼容层 — 重导出自 ``cli.utils.log``。
 
-Provides a simple logging facade that wraps print() with level-based filtering.
-Usage::
+原有 ``from .logger import configure_from_verbosity`` 和模块级函数
+``debug/info/warning/error`` 均可继续使用，无需改动 import 路径。
 
-    from .logger import log
+新代码建议直接使用::
 
-    log.debug("connecting to %s", port)
-    log.info("device found")
-    log.warning("timeout, retrying")
-    log.error("connection failed")
-
-Levels are controlled by ``--verbose`` / ``--quiet`` CLI flags.
+    from cli.utils.log import get_logger
+    log = get_logger(__name__)
 """
+
 from __future__ import annotations
 
-import sys
-from typing import Dict
+from .log import (
+    # 级别常量
+    DEBUG,
+    ERROR,
+    FATAL,
+    INFO,
+    SILENT,
+    TRACE,
+    WARN,
+    WARNING,
+    # 配置
+    configure,
+    configure_from_verbosity,
+    # 级别管理
+    get_level,
+    set_level,
+    # 模块级便捷函数
+    debug,
+    error,
+    info,
+    warning,
+    # 类
+    Logger,
+    TrafficMonitor,
+    # 工厂
+    get_logger,
+    # 生命周期
+    shutdown,
+)
 
-
-# Log levels
-DEBUG = 10
-INFO = 20
-WARNING = 30
-ERROR = 40
-SILENT = 100
-
-_LEVEL_NAMES: Dict[int, str] = {
-    DEBUG: "DEBUG",
-    INFO: "INFO",
-    WARNING: "WARN",
-    ERROR: "ERROR",
-}
-
-# Global mutable state: current effective level
-_current_level = WARNING  # show warnings+ by default
-
-
-def set_level(level: int) -> None:
-    """Set the global log level threshold."""
-    global _current_level
-    _current_level = level
-
-
-def get_level() -> int:
-    return _current_level
-
-
-def _format(level: int, msg: str, *args) -> str:
-    if args:
-        msg = msg % args
-    name = _LEVEL_NAMES.get(level, "?")
-    return f"  [{name}] {msg}"
-
-
-def debug(msg: str, *args) -> None:
-    if _current_level <= DEBUG:
-        sys.stderr.write(_format(DEBUG, msg, *args) + "\n")
-
-
-def info(msg: str, *args) -> None:
-    if _current_level <= INFO:
-        # info goes to stdout (normal output)
-        print(_format(INFO, msg, *args))
-
-
-def warning(msg: str, *args) -> None:
-    if _current_level <= WARNING:
-        sys.stderr.write(_format(WARNING, msg, *args) + "\n")
-
-
-def error(msg: str, *args) -> None:
-    if _current_level <= ERROR:
-        sys.stderr.write(_format(ERROR, msg, *args) + "\n")
-
-
-def configure_from_verbosity(verbose: int, quiet: bool) -> None:
-    """Translate CLI ``--verbose`` count and ``--quiet`` flag into a level.
-
-    * ``-q``        -> SILENT  (no output except errors)
-    * (default)     -> WARNING (warnings + errors)
-    * ``-v``        -> INFO
-    * ``-vv``       -> DEBUG
-    """
-    if quiet:
-        set_level(SILENT)
-    elif verbose >= 2:
-        set_level(DEBUG)
-    elif verbose >= 1:
-        set_level(INFO)
-    else:
-        set_level(WARNING)
+__all__ = [
+    "DEBUG", "ERROR", "FATAL", "INFO", "SILENT", "TRACE", "WARN", "WARNING",
+    "configure", "configure_from_verbosity",
+    "get_level", "set_level",
+    "debug", "error", "info", "warning",
+    "Logger", "TrafficMonitor",
+    "get_logger", "shutdown",
+]

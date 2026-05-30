@@ -1,26 +1,35 @@
-"""固件刷写模块 — 通过 esptool 烧录 MicroPython/ESP 固件。
+"""
+固件刷写模块 — 通过 esptool 烧录 MicroPython/ESP 固件。
 
 esptool 为可选依赖，未安装时会给出安装提示。
 通过子进程调用 esptool，避免强制依赖和版本冲突。
 """
 
+from __future__ import annotations
+
+import shutil
 import subprocess
 import sys
-import shutil
 from typing import List, Optional
+
+from .log import get_logger
+
+log = get_logger(__name__)
 
 
 def _find_esptool_cmd() -> Optional[List[str]]:
     """查找可用的 esptool 命令行路径。"""
-    # 1. 优先尝试 python -m esptool（安装为 Python 包时）
+    # 1. 优先尝试 python -m esptool
     try:
         import esptool  # noqa: F401
+        log.trace("找到 esptool (python -m esptool)")
         return [sys.executable, "-m", "esptool"]
     except ImportError:
         pass
     # 2. 回退: PATH 中的 standalone esptool.py
     path = shutil.which("esptool.py")
     if path:
+        log.trace("找到 esptool.py: %s", path)
         return [path]
     return None
 
@@ -50,22 +59,7 @@ def flash_firmware(
     before: str = "default_reset",
     after: str = "hard_reset",
 ) -> subprocess.CompletedProcess:
-    """烧录固件到设备。
-
-    Args:
-        port: 串口号（如 COM3, /dev/ttyUSB0）
-        firmware: 固件 .bin 文件路径
-        baudrate: 波特率
-        address: 烧录起始地址（默认 0x0）
-        flash_mode: Flash 模式 (qio/qout/dio/dout/keep)
-        flash_size: Flash 大小 (1MB/2MB/4MB/8MB/16MB/detect/keep)
-        erase_first: 烧录前是否全片擦除
-        before: 连接前操作 (default_reset/no_reset/no_reset_no_sync)
-        after: 烧录后操作 (hard_reset/soft_reset/no_reset)
-
-    Returns:
-        subprocess.CompletedProcess
-    """
+    """烧录固件到设备。"""
     esptool = _ensure_esptool()
     cmd: List[str] = [
         *esptool,
@@ -80,6 +74,8 @@ def flash_firmware(
     if erase_first:
         cmd.append("--erase-all")
     cmd += [address, firmware]
+    log.info("烧录固件: %s → %s (端口=%s, 波特率=%d)", firmware, port, baudrate)
+    log.debug("esptool 命令: %s", " ".join(cmd))
     return subprocess.run(cmd, check=True)
 
 
@@ -87,17 +83,10 @@ def erase_flash(
     port: str,
     baudrate: int = 460800,
 ) -> subprocess.CompletedProcess:
-    """擦除设备整个 Flash。
-
-    Args:
-        port: 串口号
-        baudrate: 波特率
-
-    Returns:
-        subprocess.CompletedProcess
-    """
+    """擦除设备整个 Flash。"""
     esptool = _ensure_esptool()
     cmd = [*esptool, "--port", port, "--baud", str(baudrate), "erase_flash"]
+    log.info("擦除 Flash (端口=%s)", port)
     return subprocess.run(cmd, check=True)
 
 
@@ -105,17 +94,10 @@ def chip_info(
     port: str,
     baudrate: int = 460800,
 ) -> str:
-    """读取芯片和 Flash 信息。
-
-    Args:
-        port: 串口号
-        baudrate: 波特率
-
-    Returns:
-        标准输出+标准错误文本
-    """
+    """读取芯片和 Flash 信息。"""
     esptool = _ensure_esptool()
     cmd = [*esptool, "--port", port, "--baud", str(baudrate), "flash_id"]
+    log.debug("读取芯片信息 (端口=%s)", port)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
@@ -130,21 +112,13 @@ def verify_firmware(
     baudrate: int = 460800,
     address: str = "0x0",
 ) -> subprocess.CompletedProcess:
-    """验证固件已正确烧录到设备。
-
-    通过 esptool verify_flash 比对本地文件与 Flash 内容。
-
-    Args:
-        port: 串口号
-        firmware: 固件 .bin 文件路径
-        baudrate: 波特率
-        address: 起始地址
-
-    Returns:
-        subprocess.CompletedProcess
-    """
+    """验证固件已正确烧录到设备。"""
     esptool = _ensure_esptool()
-    cmd = [*esptool, "--port", port, "--baud", str(baudrate), "verify_flash", address, firmware]
+    cmd = [
+        *esptool, "--port", port, "--baud", str(baudrate),
+        "verify_flash", address, firmware,
+    ]
+    log.info("验证固件: %s (端口=%s)", firmware, port)
     return subprocess.run(cmd, check=True)
 
 
@@ -155,20 +129,13 @@ def read_flash(
     output: Optional[str] = None,
     baudrate: int = 460800,
 ) -> str:
-    """从设备 Flash 读取内容到本地文件。
-
-    Args:
-        port: 串口号
-        size: 读取字节数（支持 0x100000 等 hex 格式）
-        address: 起始地址
-        output: 输出文件路径，默认 auto 生成
-        baudrate: 波特率
-
-    Returns:
-        输出文件路径
-    """
+    """从设备 Flash 读取内容到本地文件。"""
     dst = output or f"flash_dump_{address}.bin"
     esptool = _ensure_esptool()
-    cmd = [*esptool, "--port", port, "--baud", str(baudrate), "read_flash", address, size, dst]
+    cmd = [
+        *esptool, "--port", port, "--baud", str(baudrate),
+        "read_flash", address, size, dst,
+    ]
+    log.info("读取 Flash: 地址=%s 大小=%s → %s (端口=%s)", address, size, dst, port)
     subprocess.run(cmd, check=True)
     return dst

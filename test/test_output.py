@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from cli.main import app, _norm_path
 from cli.project.sync import ProjectSyncManager
+from cli.utils.errors import humanize_exception
 
 runner = CliRunner()
 
@@ -190,6 +191,25 @@ class TestProjectStatusFormat:
         }
         assert captured.err == ""
 
+    def test_status_reads_device_file_and_prints_unified_diff(self, tmp_path, capsys):
+        local = tmp_path / "main.py"
+        local.write_text("print('new')\n", encoding="utf-8")
+        mp = MagicMock()
+        mp.run.return_value = "13"
+        mp._read_device_file.return_value = b"print('old')\n"
+        mgr = ProjectSyncManager(mp)
+
+        has_diff = mgr.status(str(tmp_path), "/app")
+
+        captured = capsys.readouterr()
+        assert has_diff is True
+        assert "[MOD]" in captured.err
+        assert "--- /app/main.py" in captured.err
+        assert "+++ main.py" in captured.err
+        assert "-print('old')" in captured.err
+        assert "+print('new')" in captured.err
+        mp._read_device_file.assert_called_once_with("/app/main.py")
+
 
 # ── project pull ─────────────────────────────────────────────────────
 
@@ -208,6 +228,66 @@ class TestProjectPullFormat:
             "failed": [],
         }
         assert captured.err == ""
+
+    def test_backup_always_discovers_device_files(self, tmp_path):
+        mp = MagicMock()
+        mgr = ProjectSyncManager(mp)
+        with patch.object(mgr, "_discover_device_files", return_value=[("/cfg.json", 2)]), \
+             patch.object(mgr, "_download_device_files", return_value=True) as download:
+            ok = mgr.backup(str(tmp_path), "/", fmt="json")
+
+        assert ok is True
+        download.assert_called_once()
+        assert download.call_args.args[0] == ["/cfg.json"]
+        assert download.call_args.args[1] == [str(tmp_path / "cfg.json").replace("\\", "/")]
+
+
+class TestDeviceCommands:
+    def test_device_backup_uses_project_manager_backup(self, tmp_path):
+        mp = MagicMock()
+        mgr = MagicMock()
+        mgr.backup.return_value = True
+        with patch("cli.main._mp_factory", return_value=mp), \
+             patch("cli.main.ProjectSyncManager", return_value=mgr):
+            result = runner.invoke(app, [
+                "device", "backup", "/dev/ttyUSB0", str(tmp_path), "/",
+                "--format", "json",
+            ])
+
+        assert result.exit_code == 0
+        mgr.backup.assert_called_once()
+        assert mgr.backup.call_args.args[:2] == (str(tmp_path), "/")
+        assert mgr.backup.call_args.kwargs["fmt"] == "json"
+
+    def test_device_restore_uses_project_manager_restore(self, tmp_path):
+        mp = MagicMock()
+        mgr = MagicMock()
+        mgr.restore.return_value = [("a.txt", "/a.txt", True)]
+        with patch("cli.main._mp_factory", return_value=mp), \
+             patch("cli.main.ProjectSyncManager", return_value=mgr):
+            result = runner.invoke(app, [
+                "device", "restore", "/dev/ttyUSB0", str(tmp_path), "/",
+                "--dry-run",
+            ])
+
+        assert result.exit_code == 0
+        mgr.restore.assert_called_once()
+        assert mgr.restore.call_args.args[:2] == (str(tmp_path), "/")
+        assert mgr.restore.call_args.kwargs["dry_run"] is True
+
+
+class TestHumanErrors:
+    def test_timeout_has_actionable_hint(self):
+        message = humanize_exception(TimeoutError("read timed out"))
+
+        assert "操作超时" in message
+        assert "--timeout" in message
+
+    def test_raw_repl_no_response_has_device_hint(self):
+        message = humanize_exception(RuntimeError("无法进入原始 REPL 模式，设备响应: b''"))
+
+        assert "设备没有进入原始 REPL" in message
+        assert "Ctrl+C" in message
 
     def test_empty_dry_run_pull_outputs_preview_json(self, tmp_path, capsys):
         mp = MagicMock()

@@ -22,6 +22,7 @@ from . import __version__
 from .project.project import init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
 from .utils.config import create_default_config
+from .utils.errors import humanize_exception
 from .utils.firmware import (
     chip_info,
     erase_flash,
@@ -597,6 +598,8 @@ def mount(
     timeout: int = typer.Option(
         10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
     ),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
     """通过 PC 侧 WebDAV 桥把设备文件系统挂到默认文件管理器。
 
@@ -616,7 +619,7 @@ def mount(
         map_drive=not no_map,
     )
 
-    mp = _mp_factory(port, baudrate, timeout, None, None)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
         log.info("已连接到 %s", port)
@@ -906,6 +909,69 @@ def project_run(
             mp.repl_()
     finally:
         mp.disconnect()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# device — 设备备份与恢复
+# ═══════════════════════════════════════════════════════════════════
+
+device_app = typer.Typer(help="设备文件备份与恢复", add_completion=False)
+app.add_typer(device_app, name="device")
+
+
+@device_app.command("backup")
+def device_backup(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    directory: str = typer.Argument(..., help="本地备份目录"),
+    remote_path: str = typer.Argument("/", help="设备上的备份根路径"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    fmt: str = _FORMAT_OPTION,
+    json_output: bool = _JSON_OPTION,
+) -> None:
+    """批量导出设备文件到本地目录。"""
+    fmt = _resolve_format(fmt, json_output)
+    remote_path = _norm_path(remote_path)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        ok = ProjectSyncManager(mp).backup(
+            directory, remote_path, dry_run=dry_run, fmt=fmt,
+        )
+    finally:
+        mp.disconnect()
+    if ok is False:
+        raise typer.Exit(1)
+
+
+@device_app.command("restore")
+def device_restore(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    directory: str = typer.Argument(..., help="本地待恢复目录"),
+    remote_path: str = typer.Argument("/", help="设备上的恢复根路径"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
+    no_overwrite: bool = typer.Option(False, "--no-overwrite", help="跳过设备上已存在的文件"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+) -> None:
+    """批量导入本地目录文件到设备。"""
+    remote_path = _norm_path(remote_path)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        results = ProjectSyncManager(mp).restore(
+            directory, remote_path,
+            dry_run=dry_run, overwrite=not no_overwrite,
+        )
+    finally:
+        mp.disconnect()
+    if any(not success for _lp, _rp, success in results):
+        raise typer.Exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1401,6 +1467,9 @@ def main() -> None:
         app()
     except BrokenPipeError:
         sys.exit(0)
+    except Exception as exc:
+        log.error("%s", humanize_exception(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

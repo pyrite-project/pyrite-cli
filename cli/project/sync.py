@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -281,6 +282,24 @@ class ProjectSyncManager:
                     files.append((fp, int(sz)))
         return files
 
+    @staticmethod
+    def _unified_diff(
+        remote_path: str,
+        rel_path: str,
+        remote_data: bytes,
+        local_data: bytes,
+    ) -> str:
+        """Build a line-level unified diff between device and local content."""
+        remote_text = remote_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        local_text = local_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        return "".join(difflib.unified_diff(
+            remote_text,
+            local_text,
+            fromfile=remote_path,
+            tofile=rel_path,
+            lineterm="",
+        ))
+
     # ── project status ──────────────────────────────
 
     def status(
@@ -325,21 +344,36 @@ class ProjectSyncManager:
         dev_sizes = self._check_device_files(remote_paths)
 
         added: List[Tuple[str, str]] = []
-        changed: List[Tuple[str, str]] = []
+        changed: List[Tuple[str, str, str]] = []
         removed_list: List[str] = []
         ok_count = 0
 
         for rp in remote_paths:
             rel = local_map[rp]
+            local_path = os.path.join(local_dir, rel)
             cur_hash = current_hashes.get(rp)
             old_hash = stored.get(rel)
             dev_size = dev_sizes.get(rp, -1)
             if dev_size < 0:
                 added.append((rel, rp))
-            elif old_hash is not None and cur_hash != old_hash:
-                changed.append((rel, rp))
+                continue
+
+            with open(local_path, "rb") as f:
+                local_data = f.read()
+            try:
+                remote_data = self.mp._read_device_file(rp)
+            except Exception as e:
+                log.warning("读取设备文件失败，退回哈希判断: %s (%s)", rp, e)
+                if old_hash is not None and cur_hash != old_hash:
+                    changed.append((rel, rp, ""))
+                else:
+                    ok_count += 1
+                continue
+
+            if remote_data != local_data:
+                changed.append((rel, rp, self._unified_diff(rp, rel, remote_data, local_data)))
             elif old_hash is None:
-                added.append((rel, rp))
+                ok_count += 1
             else:
                 ok_count += 1
 
@@ -352,7 +386,10 @@ class ProjectSyncManager:
         if fmt == "json":
             print_json({
                 "added":   [{"local": r, "remote": rp} for r, rp in added],
-                "changed": [{"local": r, "remote": rp} for r, rp in changed],
+                "changed": [
+                    {"local": r, "remote": rp, "diff": diff}
+                    for r, rp, diff in changed
+                ],
                 "removed": removed_list,
                 "ok_count": ok_count,
             })
@@ -366,10 +403,16 @@ class ProjectSyncManager:
 
         for rel, rp in added:
             output_log(f"  \033[33m[ADD]\033[0m  {rel:<40}  {rp:<40}")
-        for rel, rp in changed:
+        for rel, rp, _diff in changed:
             output_log(f"  \033[33m[MOD]\033[0m  {rel:<40}  {rp:<40}")
         for rel in removed_list:
             output_log(f"  \033[31m[DEL]\033[0m  {rel:<40}  {'(不在项目中)':40}")
+
+        for _rel, _rp, diff in changed:
+            if diff:
+                output_log("")
+                for line in diff.splitlines():
+                    output_log(f"    {line}")
 
         if not has_diff:
             log.info("所有文件一致 (%d 个文件)", ok_count)
@@ -394,8 +437,6 @@ class ProjectSyncManager:
     ) -> bool:
         """从设备下载文件到本地（批量传输）。"""
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
-        from_device = False
-
         if not entries:
             if fmt != "json":
                 log.info("本地目录为空，从设备发现文件...")
@@ -427,6 +468,130 @@ class ProjectSyncManager:
             remote_files.append(remote)
             local_paths.append(lp)
 
+        return self._download_device_files(remote_files, local_paths, dry_run=dry_run, fmt=fmt)
+
+    # ── device backup / restore ─────────────────────
+
+    def backup(
+        self,
+        local_dir: str,
+        remote_prefix: str = "/",
+        dry_run: bool = False,
+        fmt: str = "text",
+    ) -> bool:
+        """Back up every file below a device path into a local directory."""
+        dev_files = self._discover_device_files(remote_prefix)
+        if not dev_files:
+            if fmt == "json":
+                if dry_run:
+                    print_json({"preview": []})
+                else:
+                    print_json({"downloaded": [], "skipped": [], "failed": []})
+            else:
+                log.info("设备上未发现文件")
+            return True
+
+        remote_files = [rp for rp, _sz in dev_files]
+        local_paths = [
+            os.path.join(
+                local_dir,
+                (
+                    rp[len(remote_prefix):].lstrip("/")
+                    if rp.startswith(remote_prefix)
+                    else rp.lstrip("/")
+                ),
+            ).replace("\\", "/")
+            for rp in remote_files
+        ]
+        return bool(self._download_device_files(
+            remote_files, local_paths, dry_run=dry_run, fmt=fmt,
+        ))
+
+    def restore(
+        self,
+        local_dir: str,
+        remote_prefix: str = "/",
+        dry_run: bool = False,
+        overwrite: bool = True,
+    ) -> List[Tuple[str, str, bool]]:
+        """Restore every local file below a directory onto the device."""
+        if not os.path.isdir(local_dir):
+            raise NotADirectoryError(f"不是有效目录: {local_dir}")
+
+        entries: List[Tuple[str, str]] = []
+        for root, _dirs, files in os.walk(local_dir):
+            for fn in files:
+                lp = os.path.join(root, fn)
+                rel = os.path.relpath(lp, local_dir).replace("\\", "/")
+                rp = os.path.join(remote_prefix, rel).replace("\\", "/")
+                entries.append((lp, rp))
+
+        if not entries:
+            log.info("本地目录为空，无需恢复")
+            return []
+
+        dirs = sorted({
+            os.path.dirname(rp)
+            for _lp, rp in entries
+            if os.path.dirname(rp)
+        })
+        if dirs and not dry_run:
+            self._ensure_device_dirs(dirs)
+
+        results: List[Tuple[str, str, bool]] = []
+        for lp, rp in entries:
+            if dry_run:
+                log.info("[PREVIEW] 将恢复 %s → %s", lp, rp)
+                results.append((lp, rp, True))
+                continue
+            if not overwrite:
+                try:
+                    size = self._check_device_files([rp]).get(rp, -1)
+                    if size >= 0:
+                        log.warning("[SKIP] %s 已存在", rp)
+                        results.append((lp, rp, False))
+                        continue
+                except Exception:
+                    pass
+            try:
+                self.mp.flash_file(lp, rp, compile=False)
+                results.append((lp, rp, True))
+            except Exception as e:
+                log.error("恢复失败 %s → %s: %s", lp, rp, e)
+                results.append((lp, rp, False))
+
+        ok = sum(1 for _lp, _rp, success in results if success)
+        fail = len(results) - ok
+        parts = [f"{ok} 成功"]
+        if fail:
+            parts.append(f"{fail} 失败")
+        log.info("恢复完成: %s", ", ".join(parts))
+        return results
+
+    def _ensure_device_dirs(self, dirs: List[str]) -> None:
+        script = (
+            "import os\n"
+            f"dirs={dirs!r}\n"
+            "for d in dirs:\n"
+            " parts=[p for p in d.split('/') if p]\n"
+            " cur=''\n"
+            " for p in parts:\n"
+            "  cur=cur+'/'+p\n"
+            "  try:\n"
+            "   os.mkdir(cur)\n"
+            "  except OSError:\n"
+            "   pass\n"
+        )
+        self.mp.run(script)
+
+    def _download_device_files(
+        self,
+        remote_files: List[str],
+        local_paths: List[str],
+        dry_run: bool = False,
+        fmt: str = "text",
+    ) -> bool:
+        """Download a known device file list using one raw byte stream."""
         if dry_run:
             if fmt == "json":
                 print_json({

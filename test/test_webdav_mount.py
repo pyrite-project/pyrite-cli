@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import http.client
 import threading
+from unittest.mock import MagicMock, patch
 
+from typer.testing import CliRunner
+
+from cli.main import app
 from cli.utils import webdav_mount
 from cli.utils.webdav_mount import (
     DeviceFileStat,
@@ -15,6 +19,9 @@ from cli.utils.webdav_mount import (
     warm_up_directory_listing,
     webdav_file_manager_url,
 )
+
+
+runner = CliRunner()
 
 
 class FakeAdapter:
@@ -310,3 +317,33 @@ def test_macos_file_manager_uses_open_with_webdav_url(monkeypatch):
     assert location == "webdav://127.0.0.1:8765/"
     assert cleanup is None
     assert popen_calls == [["/usr/bin/open", "webdav://127.0.0.1:8765/"]]
+
+
+def test_mount_accepts_webrepl_options_and_uses_mp_factory():
+    mp = MagicMock()
+
+    with patch("cli.main._mp_factory", return_value=mp) as factory, \
+         patch("cli.utils.webdav_mount.serve_webdav") as serve:
+        result = runner.invoke(app, [
+            "mount",
+            "COM4",
+            "--ws",
+            "ws://esp32.local:8266",
+            "--password",
+            "secret",
+            "--no-map",
+        ])
+
+    assert result.exit_code == 0
+    factory.assert_called_once_with("COM4", 115200, 10, "ws://esp32.local:8266", "secret")
+    mp.connect.assert_called_once()
+    serve.assert_called_once()
+    mp.disconnect.assert_called_once()
+
+
+def test_mount_help_includes_webrepl_options():
+    result = runner.invoke(app, ["mount", "--help"])
+
+    assert result.exit_code == 0
+    assert "--ws" in result.stdout
+    assert "--password" in result.stdout

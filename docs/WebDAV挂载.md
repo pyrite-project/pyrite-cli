@@ -1,8 +1,8 @@
 # WebDAV 挂载
 
-`pyrcli mount` 在 PC 侧启动一个 WebDAV 服务，把系统文件管理器的文件操作转换为 MicroPython 设备上的 UART/Raw REPL 文件操作。
+`pyrcli mount` 在 PC 侧启动一个 WebDAV 服务，把系统文件管理器的文件操作转换为 MicroPython 设备上的 Raw REPL 文件操作。
 
-这个方案不依赖设备固件的 USB MTP 支持，也不需要在设备端运行常驻服务。只要设备能通过现有串口进入 Raw REPL，就可以使用。
+这个方案不依赖设备固件的 USB MTP 支持，也不需要在设备端运行常驻服务。只要设备能通过现有串口或 WebREPL 进入 Raw REPL，就可以使用。
 
 ---
 
@@ -13,14 +13,14 @@ Windows Explorer / macOS Finder / Linux 文件管理器
         ↓ WebDAV
 本机 WebDAV 服务: http://127.0.0.1:8765/
         ↓ pyrcli mount
-UART Raw REPL
+UART Raw REPL / WebREPL
         ↓
 MicroPython 文件系统
 ```
 
 `pyrcli mount` 做三件事：
 
-1. 连接串口设备。
+1. 连接串口设备，或通过 `--ws` 连接 WebREPL 设备。
 2. 在 PC 上启动本地 WebDAV 服务。
 3. 尝试把这个 WebDAV 地址交给系统默认文件管理器。
 
@@ -51,6 +51,14 @@ pyrcli mount COM4
 - WebDAV 地址：`http://127.0.0.1:8765/`
 - 自动连接默认文件管理器
 - 读写模式
+
+通过 WebREPL 挂载时，`COM4` 仍作为兼容其他设备命令的占位端口参数，实际连接地址由 `--ws` 指定：
+
+```powershell
+pyrcli mount COM4 --ws ws://192.168.4.1:8266 --password mypass
+```
+
+如果省略 `--password`，密码解析顺序与其他 WebREPL 命令一致：`PYRITE_WEBREPL_PASSWORD` 环境变量，最后交互输入。
 
 停止服务：
 

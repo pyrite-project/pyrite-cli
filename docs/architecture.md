@@ -24,7 +24,11 @@ pyrite-cli/
 │       ├── compiler.py      # mpy-cross compilation wrapper (parallel support)
 │       ├── ansi.py          # ANSI terminal color constants
 │       ├── preprocessor.py  # Conditional compilation (libcst CST transforms)
-│       └── manifest_loader.py # Secure manifest.py parser
+│       ├── manifest_loader.py # Secure manifest.py parser
+│       ├── log.py           # Unified logging: 6 levels, JSONL, operation timing,
+│       │                       traffic monitor (serial/WebSocket)
+│       ├── logger.py        # Logging compatibility shim (re-exports from log.py)
+│       └── output.py        # JSON output formatting, TTY detection
 │   └── project/
 │       ├── project.py       # Project scaffolding, interactive hardware selection
 │       ├── stubs.py         # GitHub API stub downloader
@@ -34,7 +38,9 @@ pyrite-cli/
 │   ├── test_config.py       # Config loading edge-case tests
 │   ├── test_flash_utils.py  # REPL coloring, CRC32, file hash tests
 │   ├── test_protocol_helpers.py # Protocol parsing function tests
-│   └── test_manifest_loader.py  # Manifest parser tests
+│   ├── test_manifest_loader.py  # Manifest parser tests
+│   ├── test_logger.py       # Unified logging system tests
+│   └── test_output.py       # JSON output & TTY detection tests
 └── docs/
     └── ...
 ```

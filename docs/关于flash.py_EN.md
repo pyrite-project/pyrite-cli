@@ -107,7 +107,7 @@ Configuration is auto-loaded on construction (`_load_config`).
 | `timeout` | `int` | Timeout |
 | `_in_raw` | `bool` | Whether in raw REPL mode |
 | `_kbd_set` | `bool` | Whether `kbd_intr(-1)` has been set |
-| `_repl_log_file` | `TextIO` or `None` | REPL raw data log file handle |
+| `transport` | `Transport` | Transport layer instance (SerialTransport / WebREPLTransport) |
 
 ---
 
@@ -144,10 +144,9 @@ Opens a serial connection to the device. If already connected, disconnects first
 
 #### `disconnect()`
 
-Disconnects the serial port. Executes in order:
-
-1. Restore `kbd_intr(3)` (if `kbd_intr(-1)` was previously set)
-2. Exit raw REPL mode
+Disconnects from the device. Delegates to `self.transport.disconnect()`. Serial transport will:
+1. Exit raw REPL mode (if in it)
+2. Restore `kbd_intr(3)` (if `kbd_intr(-1)` was previously set)
 3. Close the serial port
 
 #### `is_connected` (property)
@@ -219,40 +218,32 @@ Procedure:
 
 ---
 
-### REPL Serial Logging System
+### Unified Logging System
 
-Used for debugging and troubleshooting flash operations. Automatically records all serial TX/RX data to `./log/`.
+Logging is now handled by `cli/utils/log.py` — a unified logging system shared across all modules.
 
-#### `_open_repl_log()`
+The `MicroPython` class uses `get_logger("cli.flash")` for structured logging with:
 
-Creates a timestamped log file (`flash_YYYYMMDD_HHMMSS.log`) in `./log/` and opens it for writing.
+- 6 log levels: `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `FATAL`
+- Console output with ANSI colors and JSONL file recording
+- `Logger.operation()` context manager for automatic start/end/duration logging
+- `TrafficMonitor` for serial/WebSocket flow capture (recorded as JSONL with `type: "traffic"`)
+- Control characters replaced with readable names (`\x01` → `<RAW>`, `\x03` → `<C>`, etc.)
 
-- Returns: `Path` — log file path
+The old `_repl_log_ctx()`, `_open_repl_log()`, `_close_repl_log()`, `_drain_rx_log()`, and `_log_repl_data()` methods have been **removed** in favor of the centralized logging system.
 
-#### `_close_repl_log()`
+**Usage**:
 
-Closes the current log file handle (if open).
+```python
+from cli.utils.log import get_logger
 
-#### `_repl_log_ctx()` (context manager)
+log = get_logger("cli.flash")
+log.info("Flashing file %s", path)
 
-Automatically manages the log lifecycle: opens the log on enter (if not already open), closes on exit. Prints the file path when the log is first created.
-
-#### `_drain_rx_log()`
-
-Non-blocking read of all remaining data in the serial RX buffer, recording it to the log. Useful for clearing residual data while keeping a log record.
-
-#### `_log_repl_data(direction, data)`
-
-Records a single serial TX/RX operation to the log file.
-
-| Parameter | Description |
-|-----------|-------------|
-| `direction` | `"tx"` for write, `"rx"` for read |
-| `data` | Raw `bytes` data |
-
-- Log format: `[HH:MM:SS] >> (tx) or << (rx) text content`
-- Control characters (`\x01`–`\x05`) replaced with readable names `<RAW>`, `<B>`, `<C>`, `<D>`, `<E>`
-- Bare control-character/blank lines additionally output as hex
+with log.operation("flash_file", path=path, size=size):
+    # operation timing automatically recorded
+    ...
+```
 
 ---
 

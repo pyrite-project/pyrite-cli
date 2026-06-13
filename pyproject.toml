@@ -7,6 +7,7 @@ name = "pyrite-cli"
 version = "0.0.1"
 requires-python = ">=3.10"
 dependencies = [
+    "click>=8.0",
     "typer>=0.9.0",
     "pyserial>=3.5",
     "requests>=2.28.0",
@@ -42,6 +43,7 @@ testpaths = [
     "test/test_preprocessor.py",
     "test/test_serial_transport.py",
     "test/test_output.py",
+    "test/test_webdav_mount.py",
 ]
 
 [tool.mypy]

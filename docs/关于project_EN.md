@@ -12,6 +12,8 @@ cli/
 │   ├── __init__.py        # Empty (no exports)
 │   ├── project.py         # High-level API: init_project / init_stubs / new_project_interactive
 │   ├── stubs.py           # Stub query, matching, download (multi-threaded), VS Code config
+│   ├── sync.py            # ProjectSyncManager — hash-based incremental sync,
+│   │                          status comparison, batch file pull from device
 │   └── feature_stub.pyi   # .pyi stubs for preprocessor feature/target
 └── utils/
     ├── selector.py        # Interactive selection list (arrow key navigation)

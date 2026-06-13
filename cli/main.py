@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 import click
@@ -391,27 +392,8 @@ def flash_program(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# run — 执行代码
+# 注意: run 已移至 project run 子命令
 # ═══════════════════════════════════════════════════════════════════
-
-@app.command()
-def run(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    code: str = typer.Argument(..., help="要执行的 Python 代码"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
-    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
-    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
-) -> None:
-    """连接设备并执行一行 Python 代码，打印输出。"""
-    mp = _mp_factory(port, baudrate, timeout, ws, password)
-    try:
-        mp.connect()
-        output = mp.run(code)
-        if output:
-            print(output)
-    finally:
-        mp.disconnect()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -576,6 +558,83 @@ except:pass
     if "FLASH" in info:
         row("Flash", f"{int(info['FLASH']) // 1024} KB")
     typer.echo()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# mount — PC 侧 WebDAV 挂载
+# ═══════════════════════════════════════════════════════════════════
+
+@app.command()
+def mount(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    root: str = typer.Option(
+        "/", "--root", "-r",
+        help="暴露给 WebDAV 的设备端根目录",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="WebDAV 监听地址",
+    ),
+    port_http: int = typer.Option(
+        8765, "--http-port", "-p",
+        help="WebDAV 监听端口",
+    ),
+    drive: Optional[str] = typer.Option(
+        None, "--drive", "-d",
+        help="Windows 驱动器盘符，如 P 或 P:（Linux/macOS 忽略）",
+    ),
+    readonly: bool = typer.Option(
+        False, "--readonly",
+        help="以只读模式提供 WebDAV 服务",
+    ),
+    no_map: bool = typer.Option(
+        False, "--no-map",
+        help="只启动 WebDAV 服务，不自动连接默认文件管理器",
+    ),
+    baudrate: int = typer.Option(
+        115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
+    ),
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
+    ),
+) -> None:
+    """通过 PC 侧 WebDAV 桥把设备文件系统挂到默认文件管理器。
+
+    设备端不需要固件级 MTP 支持。本命令在 PC 上启动 WebDAV 服务，
+    将文件管理器请求转换为现有 UART/Raw REPL 文件操作。Windows 下
+    默认会用 net use 映射驱动器盘符；Linux/macOS 下会尝试打开系统
+    默认文件管理器的 WebDAV 位置。按 Ctrl+C 停止并清理挂载。
+    """
+    from .utils.webdav_mount import WebDavConfig, serve_webdav
+
+    config = WebDavConfig(
+        host=host,
+        port=port_http,
+        root=_norm_path(root),
+        readonly=readonly,
+        drive=drive,
+        map_drive=not no_map,
+    )
+
+    mp = _mp_factory(port, baudrate, timeout, None, None)
+    try:
+        mp.connect()
+        log.info("已连接到 %s", port)
+        serve_webdav(mp, config)
+
+    except KeyboardInterrupt:
+        log.info("用户中断")
+    except (click.exceptions.Exit, typer.Exit):
+        raise
+    except Exception as e:
+        log.error("挂载服务异常: %s", e)
+        raise
+    finally:
+        try:
+            mp.disconnect()
+        except Exception:
+            pass
+        log.info("已断开连接")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -795,6 +854,58 @@ def project_pull(
         mp.disconnect()
     if ok is False:
         raise typer.Exit(1)
+
+
+@project_app.command("run")
+def project_run(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    directory: str = typer.Argument("./", help="本地项目目录路径"),
+    remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
+    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
+    manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
+    hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式（仅显示差异，不刷入不进入 REPL）"),
+) -> None:
+    """增量刷入项目文件后进入交互式 REPL 监控。"""
+    remote_path = _norm_path(remote_path)
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        if no_compile:
+            mp.config.auto_compile = False
+        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
+        if target:
+            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
+            active_tags.add(target.upper())
+        else:
+            active_tags = mp.detect_tags()
+            if not active_tags:
+                log.error("无法识别设备 target，请使用 --target 手动指定")
+                raise typer.Exit(1)
+        if feature:
+            active_tags.update(t.strip() for t in feature.split(","))
+        if no_feature:
+            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+
+        ProjectSyncManager(mp).flash(
+            directory, remote_path, hash_config_path=hash_config,
+            bytecode_ver=ver, arch=arch,
+            active_tags=active_tags or None,
+            manifest_path=manifest, dry_run=dry_run,
+        )
+
+        if not dry_run:
+            log.info("刷入完成，进入 REPL 监控...")
+            mp.repl_()
+    finally:
+        mp.disconnect()
 
 
 # ═══════════════════════════════════════════════════════════════════

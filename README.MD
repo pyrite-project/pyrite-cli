@@ -1,6 +1,6 @@
 # ✦ Pyrite-CLI
 
-MicroPython 设备串口工具集。通过 UART raw REPL 协议或 WebREPL (WebSocket) 与设备通信，支持文件刷入、交互式 REPL、自动/条件编译、增量同步、项目脚手架、固件烧录、设备文件浏览器等。
+MicroPython 设备串口工具集。通过 UART raw REPL 协议或 WebREPL (WebSocket) 与设备通信，支持文件刷入、交互式 REPL、自动/条件编译、增量同步、项目脚手架、固件烧录、设备文件浏览器，以及通过 WebDAV 把设备文件系统挂到系统默认文件管理器。
 
 ---
 
@@ -12,7 +12,7 @@ pip install pyrite-cli
 pip install esptool
 ```
 
-核心依赖：`typer`、`pyserial`、`requests`、`tqdm`、`mpy-cross`、`libcst`
+核心依赖：`typer`、`pyserial`、`requests`、`tqdm`、`mpy-cross`、`libcst`、`websocket-client`
 
 ---
 
@@ -25,7 +25,21 @@ pip install esptool
 | **入门** | [快速上手](docs/快速上手.md) | 首次使用，从安装到第一个刷入示例 |
 | **进阶** | [设备刷入与项目同步](docs/设备刷入与项目同步.md) | 深入刷入原理、增量同步、manifest 清单 |
 | **进阶** | [条件编译实战](docs/条件编译实战.md) | 一份源码管理多平台、按功能裁剪固件 |
-| **扩展** | [插件开发指南](docs/插件开发指南.md) | 开发 pyrite-cli 第三方插件 |
+| **桌面集成** | [WebDAV 挂载](docs/WebDAV挂载.md) | 用 Windows Explorer / Finder / Linux 文件管理器浏览设备 |
+
+---
+
+## 能力地图
+
+| 场景 | 推荐命令 | 说明 |
+|------|----------|------|
+| 发现设备 | `pyrcli scan` | 扫描串口、输出 VID/PID、可选 JSON |
+| 单文件刷入 | `pyrcli flash COM3 main.py /main.py` | 自动编译、条件编译、校验 |
+| 批量刷入 | `pyrcli project flash COM3 . /` | 基于哈希的增量同步 |
+| 文件浏览 | `pyrcli fs ls COM3 /` | 命令行文件浏览器 |
+| 桌面挂载 | `pyrcli mount COM3` | PC 侧 WebDAV 桥接到默认文件管理器 |
+| 交互调试 | `pyrcli repl COM3` | 进入 MicroPython REPL |
+| 固件烧录 | `pyrcli firmware flash COM3 firmware.bin` | esptool 封装 |
 
 ---
 
@@ -39,9 +53,9 @@ pip install esptool
 | `flash` | 刷入单个文件（自动编译 + 条件编译） |
 | `flash-program` | 递归刷入整个本地目录，支持 manifest 清单过滤 |
 | `repl` | 交互式 MicroPython REPL |
-| `run` | 在设备上执行一行 Python 代码 |
 | `reset` | 通过原始 REPL 软重启设备 |
 | `board-info` | 获取固件、CPU、内存、Flash 等详细板级信息 |
+| `mount` | 通过 PC 侧 WebDAV 桥把设备文件系统挂到默认文件管理器 |
 | `config` | 生成默认 `.pyrite_config.json` |
 
 ### 项目命令组 `pyrcli project`
@@ -54,6 +68,7 @@ pip install esptool
 | `project flash` | 根据哈希配置增量刷入新增/变更的文件 |
 | `project status` | 比对本地哈希与设备文件，显示差异清单 |
 | `project pull` | 从设备拉取文件到本地目录 |
+| `project run` | 增量刷入项目后进入 REPL 监控 |
 
 ### 文件浏览命令组 `pyrcli fs`
 
@@ -84,6 +99,7 @@ pip install esptool
 pyrcli scan
 pyrcli scan -a                    # 显示所有设备（含无 VID/PID 的）
 pyrcli scan -i                    # 连设备并显示板子信息
+pyrcli scan --format json         # JSON 格式输出（适合脚本/CI）
 
 # 获取设备详细信息
 pyrcli board-info COM3
@@ -110,6 +126,11 @@ pyrcli fs ls COM3 /lib -r              # 递归
 pyrcli fs ls COM3 / --sort size        # 按大小排序
 pyrcli fs ls COM3 / -p                 # 分页
 
+# 用默认文件管理器浏览设备文件系统
+pyrcli mount COM3
+pyrcli mount COM3 --drive P            # Windows 指定盘符
+pyrcli mount COM3 --readonly           # 只读挂载
+
 # 上传/下载文件
 pyrcli fs put COM3 local.py /remote.py
 pyrcli fs get COM3 /remote.py backup.py
@@ -124,9 +145,6 @@ pyrcli repl COM3 --ws ws://esp32.local:8266
 
 # 打开交互式 REPL
 pyrcli repl COM3
-
-# 执行单行代码
-pyrcli run COM3 "import machine; print(machine.freq())"
 ```
 
 ---
@@ -145,6 +163,8 @@ pyrcli run COM3 "import machine; print(machine.freq())"
 
 **设备文件浏览器** — `fs ls/rm/cat/put/get` 完整文件操作，支持递归列表、排序、分页
 
+**桌面文件管理器挂载** — `mount` 在 PC 侧启动 WebDAV 桥，Windows 映射盘符，Linux/macOS 打开默认文件管理器，无需固件 MTP 支持
+
 **固件烧录** — 通过 esptool 子进程封装，支持烧录/擦除/验证/读取
 
 **传输层抽象** — 支持串口 (pyserial) 和 WebREPL (WebSocket) 两种传输方式，所有命令均可通过 `--ws` 切换
@@ -153,7 +173,11 @@ pyrcli run COM3 "import machine; print(machine.freq())"
 
 **Shell 自动补全** — 串口号 Tab 自动补全（`pyrcli flash <TAB>`）
 
-**MSYS2 兼容** — 自动检测 Git Bash 路径转换，恢复原始设备路径
+**JSON 输出模式** — 部分命令支持 `--format json`，可集成到脚本/CI 流水线
+
+**MSYS2 兼容** — 自动检测 Git Bash 路径转换，恢复原始设备路径，对claude code等工具友好
+
+**统一日志系统** — 6 级日志、JSONL 文件记录、操作计时上下文管理器、串口/WebSocket 流量监控
 
 ---
 
@@ -219,4 +243,4 @@ pyrcli board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
 pyrcli flash COM3 main.py /main.py --ws ws://esp32.local:8266
 ```
 
-WebREPL 传输基于 `websockets` 库，协议兼容 MicroPython 官方 webrepl 固件。
+WebREPL 传输基于 `websocket-client` 库，协议兼容 MicroPython 官方 webrepl 固件。

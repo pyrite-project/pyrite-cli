@@ -12,7 +12,9 @@ import re
 import subprocess
 import sys
 import time
+import http.client
 from typing import List, Optional
+from urllib.parse import urlencode
 
 import click
 import typer
@@ -602,6 +604,22 @@ def mount(
     timeout: int = typer.Option(
         10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
     ),
+    run_timeout: int = typer.Option(
+        300, "--run-timeout", help="mount-run 执行脚本的超时秒数",
+    ),
+    run_queue_max: int = typer.Option(
+        64, "--run-queue-max", help="脚本运行期间最多排队的 WebDAV 写请求数",
+    ),
+    run_queue_max_bytes: int = typer.Option(
+        64 * 1024 * 1024,
+        "--run-queue-max-bytes",
+        help="脚本运行期间排队 PUT 临时文件总字节上限",
+    ),
+    startup_empty_list_grace: float = typer.Option(
+        5.0,
+        "--startup-empty-list-grace",
+        help="mount 启动期根目录为空时返回重试而不是发布空目录的秒数",
+    ),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
@@ -622,6 +640,10 @@ def mount(
         drive=drive,
         map_drive=not no_map,
         load_all=load_all,
+        run_timeout=run_timeout,
+        run_queue_max_operations=run_queue_max,
+        run_queue_max_bytes=run_queue_max_bytes,
+        startup_empty_list_grace=startup_empty_list_grace,
     )
 
     mp = _mp_factory(port, baudrate, timeout, ws, password)
@@ -643,6 +665,50 @@ def mount(
         except Exception:
             pass
         log.info("已断开连接")
+
+
+@app.command("mount-run")
+def mount_run(
+    path: str = typer.Option(
+        "/main.py", "--path",
+        help="让当前 mount 会话在设备端 execfile() 的路径",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="mount WebDAV 监听地址",
+    ),
+    port_http: int = typer.Option(
+        8765, "--http-port", "-p",
+        help="mount WebDAV 监听端口",
+    ),
+    timeout: int = typer.Option(
+        300, "--timeout", "-t",
+        help="等待脚本执行完成的秒数",
+    ),
+) -> None:
+    """请求正在运行的 pyrcli mount 会话执行设备端脚本。"""
+    from .utils.webdav_mount import mount_run_executable_for_system
+
+    run_executable = mount_run_executable_for_system()
+    if run_executable is None:
+        log.error("mount-run 仅支持 Windows/macOS/Linux")
+        raise typer.Exit(1)
+    target = "/" + run_executable.name + "?" + urlencode({"path": _norm_path(path)})
+    conn = http.client.HTTPConnection(host, port_http, timeout=timeout)
+    try:
+        conn.request("GET", target)
+        resp = conn.getresponse()
+        body = resp.read()
+    except OSError as exc:
+        log.error("无法连接 mount 会话: %s", exc)
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+
+    text = body.decode("utf-8", errors="replace")
+    if resp.status >= 400:
+        log.error("mount-run 失败: HTTP %d %s", resp.status, text.strip())
+        raise typer.Exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════════

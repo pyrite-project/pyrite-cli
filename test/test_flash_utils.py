@@ -118,6 +118,27 @@ class TestComputeCrc32:
         assert result >= 0
 
 
+class TestFilesystemMountGuard:
+    def test_ensure_filesystem_mounted_supports_mpython_flashbdev_list(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        calls = []
+
+        def fake_execute(code, **kwargs):
+            calls.append((code, kwargs))
+            return "FS_READY"
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+
+        mp._ensure_filesystem_mounted()
+
+        code, kwargs = calls[0]
+        assert "flashbdev.bdev" in code
+        assert "isinstance(b,(list,tuple))" in code
+        assert "b=b[0]" in code
+        assert "os.VfsLfs2(b)" in code
+        assert kwargs == {"timeout": 5, "raise_on_error": False}
+
+
 # ── _compute_file_hash ──────────────────────────────────────────────
 
 

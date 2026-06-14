@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import email.utils
+import hashlib
 import os
 import platform
 import posixpath
@@ -20,11 +21,12 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 
 from .flash import MicroPython
 from .log import get_logger
@@ -38,6 +40,13 @@ _CLIENT_DISCONNECT_EXCEPTIONS = (
     ConnectionAbortedError,
     ConnectionResetError,
 )
+_RUN_PROMPT = "已开始运行main.py"
+
+
+def _normalize_url_path(raw_path: str) -> str:
+    path = unquote(raw_path or "/").replace("\\", "/")
+    normalized = posixpath.normpath(path)
+    return "/" if normalized == "." else normalized
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,18 @@ class DeviceFileStat:
     path: str
     is_dir: bool
     size: int
+
+
+@dataclass(frozen=True)
+class MountRunExecutable:
+    name: str
+    body: bytes
+    sha256: str
+    content_type: str
+
+    @property
+    def stat(self) -> DeviceFileStat:
+        return DeviceFileStat(path="/" + self.name, is_dir=False, size=len(self.body))
 
 
 @dataclass(frozen=True)
@@ -58,8 +79,154 @@ class WebDavConfig:
     empty_list_retries: int = 1
     empty_list_retry_delay: float = 0.08
     startup_empty_list_retries: int = 5
+    startup_empty_list_grace: float = 5.0
     directory_cache: bool = True
     load_all: bool = False
+    run_trigger_name: str = "_run"
+    run_default_path: str = "/main.py"
+    run_timeout: int = 300
+    run_queue_max_operations: int = 64
+    run_queue_max_bytes: int = 64 * 1024 * 1024
+
+
+def mount_run_executable_for_system(
+    system: Optional[str] = None,
+    trigger_name: str = "_run",
+) -> Optional[MountRunExecutable]:
+    target_system = system or platform.system()
+    stem = (trigger_name or "_run").strip("/") or "_run"
+    if target_system == "Windows":
+        suffix = ".bat"
+        body = f"@echo off\r\necho {_RUN_PROMPT}\r\npause".encode("utf-8")
+        content_type = "application/x-msdos-program"
+    elif target_system == "Darwin":
+        suffix = ".command"
+        body = f"#!/bin/sh\nprintf '%s\\n' '{_RUN_PROMPT}'\n".encode("utf-8")
+        content_type = "application/x-sh"
+    elif target_system == "Linux":
+        suffix = ".sh"
+        body = f"#!/bin/sh\nprintf '%s\\n' '{_RUN_PROMPT}'\n".encode("utf-8")
+        content_type = "application/x-sh"
+    else:
+        return None
+    name = stem if stem.lower().endswith(suffix) else stem + suffix
+    digest = hashlib.sha256(body).hexdigest()
+    return MountRunExecutable(name=name, body=body, sha256=digest, content_type=content_type)
+
+
+@dataclass
+class _QueuedMountOperation:
+    description: str
+    callback: Callable[[], Any]
+    done: threading.Event
+    size_bytes: int = 0
+    result: Any = None
+    error: Optional[BaseException] = None
+
+
+class MountRunBusyError(RuntimeError):
+    """Raised when a run request arrives while another run is active."""
+
+
+class DirectoryListingNotReady(RuntimeError):
+    """Raised when startup root listing is still empty and should be retried."""
+
+
+class MountRunState:
+    """PC-side run lock for pausing WebDAV file operations during execfile()."""
+
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    DRAINING = "DRAINING"
+
+    def __init__(self, max_operations: int = 64, max_bytes: int = 64 * 1024 * 1024) -> None:
+        self._condition = threading.Condition()
+        self._state = self.IDLE
+        self._max_operations = max(1, max_operations)
+        self._max_bytes = max(1, max_bytes)
+        self._queued_bytes = 0
+        self._queue: deque[_QueuedMountOperation] = deque()
+
+    @property
+    def state(self) -> str:
+        with self._condition:
+            return self._state
+
+    def wait_until_idle(self, method: str = "WebDAV") -> None:
+        logged = False
+        with self._condition:
+            while self._state != self.IDLE:
+                if not logged:
+                    log.warning("%s 请求等待用户脚本结束，mount 文件通道已暂停", method)
+                    logged = True
+                self._condition.wait()
+
+    def run(self, path: str, callback: Callable[[str], str]) -> str:
+        with self._condition:
+            if self._state != self.IDLE:
+                raise MountRunBusyError(path)
+            self._state = self.RUNNING
+            log.warning("mount 文件通道已暂停，正在运行 %s", path)
+        try:
+            return callback(path)
+        finally:
+            self._drain_queue()
+            with self._condition:
+                self._state = self.IDLE
+                self._condition.notify_all()
+            log.info("用户脚本已结束，mount 文件通道已恢复")
+
+    def execute_or_queue(
+        self,
+        description: str,
+        callback: Callable[[], Any],
+        size_bytes: int = 0,
+    ) -> Any:
+        should_execute_now = False
+        with self._condition:
+            while self._state == self.DRAINING:
+                self._condition.wait()
+            if self._state == self.IDLE:
+                should_execute_now = True
+            elif (
+                len(self._queue) >= self._max_operations
+                or self._queued_bytes + size_bytes > self._max_bytes
+            ):
+                raise MountRunBusyError(description)
+            else:
+                item = _QueuedMountOperation(
+                    description=description,
+                    callback=callback,
+                    done=threading.Event(),
+                    size_bytes=size_bytes,
+                )
+                self._queue.append(item)
+                self._queued_bytes += size_bytes
+                log.warning("WebDAV 写请求已排队，等待用户脚本结束: %s", description)
+
+        if should_execute_now:
+            return callback()
+        item.done.wait()
+        if item.error is not None:
+            raise item.error
+        return item.result
+
+    def _drain_queue(self) -> None:
+        with self._condition:
+            self._state = self.DRAINING
+        while True:
+            with self._condition:
+                if not self._queue:
+                    return
+                item = self._queue.popleft()
+                self._queued_bytes -= item.size_bytes
+            log.info("replay WebDAV 写请求: %s", item.description)
+            try:
+                item.result = item.callback()
+            except BaseException as exc:
+                item.error = exc
+            finally:
+                item.done.set()
 
 
 class WebDavThreadingHTTPServer(ThreadingHTTPServer):
@@ -118,9 +285,10 @@ class DevicePathMapper:
 class MicroPythonWebDavAdapter:
     """串行化访问 MicroPython 文件系统。"""
 
-    def __init__(self, mp: MicroPython) -> None:
+    def __init__(self, mp: MicroPython, run_timeout: int = 300) -> None:
         self._mp = mp
         self._lock = threading.RLock()
+        self._run_timeout = run_timeout
 
     def stat(self, path: str) -> Optional[DeviceFileStat]:
         script = (
@@ -229,6 +397,12 @@ class MicroPythonWebDavAdapter:
         with self._lock:
             self._mp.fs_cp(src, dst)
 
+    def run_file(self, path: str) -> str:
+        with self._lock:
+            if self.stat(path) is None:
+                raise FileNotFoundError(path)
+            return self._mp.run(f"execfile({path!r})\n", timeout=self._run_timeout)
+
 
 def _http_date() -> str:
     return email.utils.formatdate(time.time(), usegmt=True)
@@ -296,6 +470,8 @@ class DirectoryCachingWebDavAdapter:
         self._stats: dict[str, DeviceFileStat] = {}
         self._scan_thread: Optional[threading.Thread] = None
         self._generation = 0
+        self._root_empty_since: Optional[float] = None
+        self._root_listing_ready = False
 
     def stat(self, path: str) -> Optional[DeviceFileStat]:
         normalized = self._normalize(path)
@@ -320,7 +496,14 @@ class DirectoryCachingWebDavAdapter:
 
         with self._lock:
             generation = self._generation
-        children = self._fetch_and_cache_dir(normalized, generation)
+        children = self._fetch_and_cache_dir(
+            normalized,
+            generation,
+            retries=self._startup_retries_for(normalized),
+            cache_empty=self._can_cache_empty(normalized),
+        )
+        if normalized == self._root and not children and not self._root_listing_ready:
+            raise DirectoryListingNotReady(normalized)
         if normalized == self._root:
             self._ensure_background_scan()
         return children
@@ -335,6 +518,8 @@ class DirectoryCachingWebDavAdapter:
             cache_empty=False,
         )
         if children:
+            self._root_listing_ready = True
+            self._root_empty_since = None
             self._ensure_background_scan()
         return bool(children)
 
@@ -368,6 +553,8 @@ class DirectoryCachingWebDavAdapter:
             self._generation += 1
             self._dirs = {path: list(children) for path, children in dirs.items()}
             self._stats = stats
+            self._root_listing_ready = True
+            self._root_empty_since = None
             generation = self._generation
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -471,13 +658,30 @@ class DirectoryCachingWebDavAdapter:
                 )
                 return list(children)
             if not children and not cache_empty:
+                if path == self._root and self._root_empty_since is None:
+                    self._root_empty_since = time.monotonic()
                 log.debug("WebDAV CACHE skip-empty path=%s", path)
                 return []
             self._dirs[path] = list(children)
             self._stats[path] = DeviceFileStat(path=path, is_dir=True, size=0)
+            if path == self._root and (children or cache_empty):
+                self._root_listing_ready = True
+                self._root_empty_since = None
             for child in children:
                 self._stats[self._normalize(child.path)] = child
         return list(children)
+
+    def _startup_retries_for(self, path: str) -> Optional[int]:
+        if path == self._root and not self._root_listing_ready:
+            return max(self._config.empty_list_retries, self._config.startup_empty_list_retries)
+        return None
+
+    def _can_cache_empty(self, path: str) -> bool:
+        if path != self._root or self._root_listing_ready:
+            return True
+        if self._root_empty_since is None:
+            return False
+        return time.monotonic() - self._root_empty_since >= self._config.startup_empty_list_grace
 
     def _ensure_background_scan(self) -> None:
         with self._lock:
@@ -527,10 +731,27 @@ class DirectoryCachingWebDavAdapter:
             log.debug("WebDAV CACHE invalidated generation=%d", self._generation)
 
 
-def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDavConfig) -> type[BaseHTTPRequestHandler]:
+def make_webdav_handler(
+    adapter: object,
+    mapper: DevicePathMapper,
+    config: WebDavConfig,
+    run_state: Optional[MountRunState] = None,
+    run_controller: Optional[object] = None,
+) -> type[BaseHTTPRequestHandler]:
+    run_executable = mount_run_executable_for_system(trigger_name=config.run_trigger_name)
+    trigger_href = "/" + quote(run_executable.name, safe="/") if run_executable else ""
+
     class WebDavHandler(BaseHTTPRequestHandler):
         server_version = "PyriteWebDAV/0.1"
         protocol_version = "HTTP/1.1"
+
+        @property
+        def _parsed_path(self):
+            parsed = getattr(self, "_cached_parsed_path", None)
+            if parsed is None:
+                parsed = urlsplit(self.path)
+                self._cached_parsed_path = parsed
+            return parsed
 
         def log_message(self, fmt: str, *args: object) -> None:
             log.debug("WebDAV %s - %s", self.client_address[0], fmt % args)
@@ -550,7 +771,7 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
             log.info(
                 "WebDAV %s %s -> %s %d %dB %.1fms client=%s",
                 self.command,
-                urlsplit(self.path).path or "/",
+                self._parsed_path.path or "/",
                 remote,
                 status,
                 body_size,
@@ -578,7 +799,117 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
                 self.wfile.write(body)
 
         def _remote(self) -> str:
-            return mapper.to_remote(self.path)
+            remote = getattr(self, "_cached_remote_path", None)
+            if remote is None:
+                remote = mapper.to_remote(self.path)
+                self._cached_remote_path = remote
+            return remote
+
+        def _request_path(self) -> str:
+            path = getattr(self, "_cached_request_path", None)
+            if path is None:
+                path = _normalize_url_path(self._parsed_path.path)
+                self._cached_request_path = path
+            return path
+
+        def _is_run_trigger(self) -> bool:
+            return run_executable is not None and self._request_path() == "/" + run_executable.name
+
+        def _path_is_run_trigger(self, raw_path: str) -> bool:
+            if run_executable is None:
+                return False
+            return _normalize_url_path(raw_path) == "/" + run_executable.name
+
+        def _destination_is_run_trigger(self) -> bool:
+            dst = self.headers.get("Destination", "")
+            if not dst:
+                return False
+            return self._path_is_run_trigger(urlsplit(dst).path)
+
+        def _reject_run_trigger_mutation(self) -> bool:
+            if self._is_run_trigger() or self._destination_is_run_trigger():
+                self._send_bytes(HTTPStatus.FORBIDDEN, b"mount run executable is protected")
+                return True
+            return False
+
+        def _wait_mount_idle(self) -> None:
+            if run_state is not None:
+                run_state.wait_until_idle(self.command)
+
+        def _execute_write(
+            self,
+            description: str,
+            callback: Callable[[], Any],
+            size_bytes: int = 0,
+        ) -> Any:
+            if run_state is None:
+                return callback()
+            return run_state.execute_or_queue(description, callback, size_bytes=size_bytes)
+
+        def _run_target_path(self) -> str:
+            query = parse_qs(self._parsed_path.query)
+            raw = query.get("path", [config.run_default_path])[0] or config.run_default_path
+            raw = raw.replace("\\", "/")
+            if not raw.startswith("/"):
+                raw = "/" + raw
+            normalized = posixpath.normpath(raw)
+            return "/" if normalized == "." else normalized
+
+        def _send_run_trigger_file(self, status: int = HTTPStatus.OK) -> None:
+            if run_executable is None:
+                self._send_bytes(HTTPStatus.NOT_FOUND, b"not found")
+                return
+            self._send_bytes(
+                status,
+                run_executable.body,
+                run_executable.content_type,
+                {
+                    "Last-Modified": _http_date(),
+                    "ETag": f'"sha256:{run_executable.sha256}"',
+                    "X-Pyrite-Run-Executable-SHA256": run_executable.sha256,
+                },
+            )
+
+        def _verify_run_trigger_integrity(self) -> bool:
+            if run_executable is None:
+                return False
+            actual = hashlib.sha256(run_executable.body).hexdigest()
+            if actual == run_executable.sha256:
+                return True
+            log.error(
+                "mount run executable hash mismatch path=/%s expected=%s actual=%s",
+                run_executable.name,
+                run_executable.sha256,
+                actual,
+            )
+            self._send_bytes(HTTPStatus.CONFLICT, b"mount run executable hash mismatch")
+            return False
+
+        def _handle_run_trigger(self) -> None:
+            if run_state is None or run_controller is None or not hasattr(run_controller, "run_file"):
+                self._send_bytes(HTTPStatus.NOT_IMPLEMENTED, b"mount run is not available")
+                return
+            if not self._verify_run_trigger_integrity():
+                return
+            target = self._run_target_path()
+            try:
+                output = run_state.run(target, run_controller.run_file)
+            except MountRunBusyError:
+                self._send_bytes(HTTPStatus.LOCKED, b"script is already running")
+                return
+            except FileNotFoundError:
+                self._send_bytes(HTTPStatus.NOT_FOUND, b"run target not found")
+                return
+            except Exception as exc:
+                body = f"run failed: {exc}\n".encode("utf-8", errors="replace")
+                self._send_bytes(HTTPStatus.INTERNAL_SERVER_ERROR, body, "text/plain; charset=utf-8")
+                return
+
+            body = output.encode("utf-8", errors="replace") if isinstance(output, str) else bytes(output or b"")
+            if body:
+                sys.stdout.write(body.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
+            self._send_run_trigger_file()
 
         def _destination(self) -> str:
             dst = self.headers.get("Destination", "")
@@ -586,15 +917,71 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
                 raise ValueError("missing Destination header")
             return mapper.to_remote(urlsplit(dst).path)
 
-        def _read_body(self) -> bytes:
+        def _read_body_to_temp(self) -> tuple[str, int]:
             length = int(self.headers.get("Content-Length", "0") or "0")
-            return self.rfile.read(length) if length else b""
+            fd, path = tempfile.mkstemp(prefix="pyrite_webdav_queue_", suffix=".bin")
+            remaining = length
+            written = 0
+            with os.fdopen(fd, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 64 * 1024))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+            return path, written
 
         def _reject_readonly(self) -> bool:
             if config.readonly:
                 self._send_bytes(HTTPStatus.FORBIDDEN, b"readonly")
                 return True
             return False
+
+        def _list_children(self, remote: str) -> list[DeviceFileStat]:
+            if getattr(adapter, "handles_empty_list_retry", False):
+                return adapter.list_dir(remote)
+            return list_dir_with_empty_retry(
+                adapter,
+                remote,
+                config.empty_list_retries,
+                config.empty_list_retry_delay,
+            )
+
+        def _send_queue_full(self) -> None:
+            self._send_bytes(HTTPStatus.SERVICE_UNAVAILABLE, b"mount run queue is full")
+
+        def _send_listing_not_ready(self) -> None:
+            self._send_bytes(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                b"root directory listing is not ready",
+                "text/plain; charset=utf-8",
+                {"Retry-After": "1"},
+            )
+
+        def _move_or_copy(self, method: str, action: Callable[[str, str], None]) -> None:
+            dst = self._destination()
+            src = self._remote()
+            overwrite = self.headers.get("Overwrite", "T").upper()
+
+            def operation() -> HTTPStatus:
+                exists = adapter.stat(dst)
+                if exists and overwrite == "F":
+                    return HTTPStatus.PRECONDITION_FAILED
+                if exists:
+                    adapter.delete(dst)
+                action(src, dst)
+                return HTTPStatus.CREATED
+
+            try:
+                status = self._execute_write(f"{method} {src} -> {dst}", operation)
+            except MountRunBusyError:
+                self._send_queue_full()
+                return
+            if status == HTTPStatus.PRECONDITION_FAILED:
+                self._send_bytes(status, b"destination exists")
+                return
+            self._send_bytes(status)
 
         def do_OPTIONS(self) -> None:
             self._send_bytes(
@@ -606,6 +993,13 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
             )
 
         def do_PROPFIND(self) -> None:
+            self._wait_mount_idle()
+            if self._is_run_trigger():
+                multistatus = ET.Element("{DAV:}multistatus")
+                multistatus.append(_xml_response(run_executable.stat, trigger_href))
+                body = ET.tostring(multistatus, encoding="utf-8", xml_declaration=True)
+                self._send_bytes(207, body, "application/xml; charset=utf-8")
+                return
             remote = self._remote()
             stat = adapter.stat(remote)
             if stat is None:
@@ -615,24 +1009,29 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
             multistatus = ET.Element("{DAV:}multistatus")
             multistatus.append(_xml_response(stat, mapper.href_for(remote)))
             if stat.is_dir and depth != "0":
-                if getattr(adapter, "handles_empty_list_retry", False):
-                    children = adapter.list_dir(remote)
-                else:
-                    children = list_dir_with_empty_retry(
-                        adapter,
-                        remote,
-                        config.empty_list_retries,
-                        config.empty_list_retry_delay,
-                    )
+                try:
+                    children = self._list_children(remote)
+                except DirectoryListingNotReady:
+                    self._send_listing_not_ready()
+                    return
                 for child in children:
                     multistatus.append(_xml_response(child, mapper.href_for(child.path)))
+                if run_controller is not None and run_executable is not None and remote == mapper.root:
+                    multistatus.append(_xml_response(run_executable.stat, trigger_href))
             body = ET.tostring(multistatus, encoding="utf-8", xml_declaration=True)
             self._send_bytes(207, body, "application/xml; charset=utf-8")
 
         def do_HEAD(self) -> None:
+            if self._is_run_trigger():
+                self._send_run_trigger_file()
+                return
             self.do_GET()
 
         def do_GET(self) -> None:
+            if self._is_run_trigger():
+                self._handle_run_trigger()
+                return
+            self._wait_mount_idle()
             stat = adapter.stat(self._remote())
             if stat is None:
                 self._send_bytes(HTTPStatus.NOT_FOUND, b"not found")
@@ -650,51 +1049,74 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
         def do_PUT(self) -> None:
             if self._reject_readonly():
                 return
+            if self._reject_run_trigger_mutation():
+                return
             remote = self._remote()
-            existed = adapter.stat(remote) is not None
-            adapter.write_file(remote, self._read_body())
-            self._send_bytes(HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED)
+            temp_path, size = self._read_body_to_temp()
+
+            def write() -> HTTPStatus:
+                existed = adapter.stat(remote) is not None
+                with open(temp_path, "rb") as f:
+                    data = f.read()
+                adapter.write_file(remote, data)
+                return HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED
+
+            try:
+                status = self._execute_write(f"PUT {remote}", write, size_bytes=size)
+            except MountRunBusyError:
+                self._send_queue_full()
+                return
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(temp_path)
+            self._send_bytes(status)
 
         def do_DELETE(self) -> None:
             if self._reject_readonly():
                 return
+            if self._reject_run_trigger_mutation():
+                return
+            remote = self._remote()
+
+            def delete() -> None:
+                try:
+                    adapter.delete(remote)
+                except FileNotFoundError:
+                    log.debug("WebDAV DELETE already absent path=%s", remote)
+
             try:
-                adapter.delete(self._remote())
-            except FileNotFoundError:
-                log.debug("WebDAV DELETE already absent path=%s", self._remote())
+                self._execute_write(f"DELETE {remote}", delete)
+            except MountRunBusyError:
+                self._send_queue_full()
+                return
             self._send_bytes(HTTPStatus.NO_CONTENT)
 
         def do_MKCOL(self) -> None:
             if self._reject_readonly():
                 return
-            adapter.make_dir(self._remote())
+            if self._reject_run_trigger_mutation():
+                return
+            remote = self._remote()
+            try:
+                self._execute_write(f"MKCOL {remote}", lambda: adapter.make_dir(remote))
+            except MountRunBusyError:
+                self._send_queue_full()
+                return
             self._send_bytes(HTTPStatus.CREATED)
 
         def do_MOVE(self) -> None:
             if self._reject_readonly():
                 return
-            dst = self._destination()
-            exists = adapter.stat(dst)
-            if exists and self.headers.get("Overwrite", "T").upper() == "F":
-                self._send_bytes(HTTPStatus.PRECONDITION_FAILED, b"destination exists")
+            if self._reject_run_trigger_mutation():
                 return
-            if exists:
-                adapter.delete(dst)
-            adapter.move(self._remote(), dst)
-            self._send_bytes(HTTPStatus.CREATED)
+            self._move_or_copy("MOVE", adapter.move)
 
         def do_COPY(self) -> None:
             if self._reject_readonly():
                 return
-            dst = self._destination()
-            exists = adapter.stat(dst)
-            if exists and self.headers.get("Overwrite", "T").upper() == "F":
-                self._send_bytes(HTTPStatus.PRECONDITION_FAILED, b"destination exists")
+            if self._reject_run_trigger_mutation():
                 return
-            if exists:
-                adapter.delete(dst)
-            adapter.copy(self._remote(), dst)
-            self._send_bytes(HTTPStatus.CREATED)
+            self._move_or_copy("COPY", adapter.copy)
 
         def do_LOCK(self) -> None:
             if self._reject_readonly():
@@ -863,7 +1285,7 @@ def warm_up_directory_listing(adapter: object, root: str, config: WebDavConfig) 
 
 def serve_webdav(mp: MicroPython, config: WebDavConfig) -> None:
     mapper = DevicePathMapper(config.root)
-    device_adapter = MicroPythonWebDavAdapter(mp)
+    device_adapter = MicroPythonWebDavAdapter(mp, run_timeout=config.run_timeout)
     adapter = (
         DirectoryCachingWebDavAdapter(device_adapter, mapper.root, config)
         if config.directory_cache
@@ -874,7 +1296,17 @@ def serve_webdav(mp: MicroPython, config: WebDavConfig) -> None:
             adapter.prime_from_recursive_listing()
         else:
             adapter.prime_root_listing()
-    handler = make_webdav_handler(adapter, mapper, config)
+    run_state = MountRunState(
+        max_operations=config.run_queue_max_operations,
+        max_bytes=config.run_queue_max_bytes,
+    )
+    handler = make_webdav_handler(
+        adapter,
+        mapper,
+        config,
+        run_state=run_state,
+        run_controller=device_adapter,
+    )
     server = WebDavThreadingHTTPServer((config.host, config.port), handler)
     actual_host, actual_port = server.server_address
     url = f"http://{actual_host}:{actual_port}/"

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import http.client
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
@@ -11,11 +13,14 @@ from cli.utils import webdav_mount
 from cli.utils.webdav_mount import (
     DeviceFileStat,
     DevicePathMapper,
+    DirectoryListingNotReady,
     DirectoryCachingWebDavAdapter,
     MicroPythonWebDavAdapter,
+    MountRunState,
     WebDavConfig,
     WebDavThreadingHTTPServer,
     make_webdav_handler,
+    mount_run_executable_for_system,
     open_linux_file_manager,
     open_macos_file_manager,
     warm_up_directory_listing,
@@ -26,6 +31,12 @@ from cli.utils.webdav_mount import (
 runner = CliRunner()
 
 
+def _run_entry():
+    entry = mount_run_executable_for_system()
+    assert entry is not None
+    return entry
+
+
 class FakeAdapter:
     def __init__(self):
         self.files = {
@@ -34,6 +45,7 @@ class FakeAdapter:
         self.dirs = {"/flash"}
         self.writes = []
         self.moves = []
+        self.operations = []
 
     def stat(self, path: str):
         if path in self.dirs:
@@ -59,21 +71,49 @@ class FakeAdapter:
     def write_file(self, path: str, data: bytes) -> None:
         self.files[path] = data
         self.writes.append((path, data))
+        self.operations.append(("write", path))
 
     def make_dir(self, path: str) -> None:
         self.dirs.add(path)
+        self.operations.append(("mkdir", path))
 
     def delete(self, path: str) -> None:
         self.files.pop(path, None)
         self.dirs.discard(path)
+        self.operations.append(("delete", path))
 
     def move(self, src: str, dst: str) -> None:
         self.moves.append((src, dst))
         if src in self.files:
             self.files[dst] = self.files.pop(src)
+        self.operations.append(("move", src, dst))
 
     def copy(self, src: str, dst: str) -> None:
         self.files[dst] = self.files[src]
+        self.operations.append(("copy", src, dst))
+
+
+class RunCapableAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.run_calls = []
+
+    def run_file(self, path: str) -> str:
+        self.run_calls.append(path)
+        return f"ran {path}\n"
+
+
+class BlockingRunAdapter(RunCapableAdapter):
+    def __init__(self):
+        super().__init__()
+        self.run_started = threading.Event()
+        self.release_run = threading.Event()
+
+    def run_file(self, path: str) -> str:
+        self.run_calls.append(path)
+        self.run_started.set()
+        assert self.release_run.wait(2)
+        return "done\n"
 
 
 def _request(server, method, path, body=b"", headers=None):
@@ -91,6 +131,22 @@ def _serve(adapter: FakeAdapter, readonly: bool = False):
         adapter,
         mapper,
         WebDavConfig(readonly=readonly, empty_list_retry_delay=0),
+    )
+    server = WebDavThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def _serve_with_run(adapter: FakeAdapter):
+    mapper = DevicePathMapper("/flash")
+    run_state = MountRunState()
+    handler = make_webdav_handler(
+        adapter,
+        mapper,
+        WebDavConfig(empty_list_retry_delay=0),
+        run_state=run_state,
+        run_controller=adapter,
     )
     server = WebDavThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -272,6 +328,167 @@ def test_propfind_depth_one_lists_directory_children():
     assert "<D:getcontentlength>15</D:getcontentlength>" in text
 
 
+def test_propfind_injects_run_trigger_file():
+    adapter = RunCapableAdapter()
+    entry = _run_entry()
+    server = _serve_with_run(adapter)
+    try:
+        status, _headers, body = _request(server, "PROPFIND", "/", headers={"Depth": "1"})
+    finally:
+        server.shutdown()
+
+    assert status == 207
+    assert f"<D:href>/{entry.name}</D:href>" in body.decode("utf-8")
+
+
+def test_run_trigger_uses_platform_executable_names():
+    assert mount_run_executable_for_system("Windows").name == "_run.bat"
+    assert mount_run_executable_for_system("Darwin").name == "_run.command"
+    assert mount_run_executable_for_system("Linux").name == "_run.sh"
+    assert mount_run_executable_for_system("FreeBSD") is None
+
+
+def test_run_trigger_executes_default_main_py_and_returns_output():
+    adapter = RunCapableAdapter()
+    entry = _run_entry()
+    server = _serve_with_run(adapter)
+    try:
+        status, headers, body = _request(server, "GET", "/" + entry.name)
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    assert body == entry.body
+    assert headers["ETag"] == f'"sha256:{entry.sha256}"'
+    assert headers["X-Pyrite-Run-Executable-SHA256"] == entry.sha256
+    assert adapter.run_calls == ["/main.py"]
+
+
+def test_run_trigger_file_body_contains_only_start_prompt():
+    entry = mount_run_executable_for_system("Linux")
+
+    assert entry is not None
+    body = entry.body.decode("utf-8")
+    assert "已开始运行main.py" in body
+    assert "execfile" not in body
+    assert "curl" not in body
+    assert "http" not in body
+
+
+def test_run_trigger_rejects_webdav_mutations_to_protect_hash():
+    adapter = RunCapableAdapter()
+    entry = _run_entry()
+    server = _serve_with_run(adapter)
+    try:
+        put_status, _headers, _body = _request(
+            server,
+            "PUT",
+            "/" + entry.name,
+            body=b"tampered",
+            headers={"Content-Length": "8"},
+        )
+        move_status, _headers, _body = _request(
+            server,
+            "MOVE",
+            "/main.py",
+            headers={"Destination": f"http://{server.server_address[0]}:{server.server_address[1]}/{entry.name}"},
+        )
+    finally:
+        server.shutdown()
+
+    assert put_status == 403
+    assert move_status == 403
+    assert adapter.writes == []
+    assert adapter.moves == []
+
+
+def test_webdav_requests_wait_while_mount_run_is_running():
+    adapter = BlockingRunAdapter()
+    server = _serve_with_run(adapter)
+    run_done = threading.Event()
+    read_done = threading.Event()
+    read_result = {}
+
+    def run_request():
+        try:
+            _request(server, "GET", "/" + _run_entry().name)
+        finally:
+            run_done.set()
+
+    def read_request():
+        read_result["response"] = _request(server, "GET", "/main.py")
+        read_done.set()
+
+    run_thread = threading.Thread(target=run_request, daemon=True)
+    read_thread = threading.Thread(target=read_request, daemon=True)
+    try:
+        run_thread.start()
+        assert adapter.run_started.wait(1)
+        read_thread.start()
+        assert not read_done.wait(0.1)
+
+        adapter.release_run.set()
+        assert run_done.wait(1)
+        assert read_done.wait(1)
+    finally:
+        server.shutdown()
+
+    status, _headers, body = read_result["response"]
+    assert status == 200
+    assert body == b"print('hello')\n"
+
+
+def test_write_requests_queue_and_replay_in_order_while_mount_run_is_running():
+    adapter = BlockingRunAdapter()
+    server = _serve_with_run(adapter)
+    run_done = threading.Event()
+    first_done = threading.Event()
+    second_done = threading.Event()
+    results = {}
+
+    def run_request():
+        try:
+            _request(server, "GET", "/" + _run_entry().name)
+        finally:
+            run_done.set()
+
+    def put_request(name, body, done):
+        results[name] = _request(
+            server,
+            "PUT",
+            f"/{name}.txt",
+            body=body,
+            headers={"Content-Length": str(len(body))},
+        )
+        done.set()
+
+    run_thread = threading.Thread(target=run_request, daemon=True)
+    first_thread = threading.Thread(target=put_request, args=("first", b"1", first_done), daemon=True)
+    second_thread = threading.Thread(target=put_request, args=("second", b"2", second_done), daemon=True)
+    try:
+        run_thread.start()
+        assert adapter.run_started.wait(1)
+        first_thread.start()
+        time.sleep(0.05)
+        second_thread.start()
+        assert not first_done.wait(0.05)
+        assert not second_done.wait(0.05)
+
+        adapter.release_run.set()
+        assert run_done.wait(1)
+        assert first_done.wait(1)
+        assert second_done.wait(1)
+    finally:
+        server.shutdown()
+
+    assert results["first"][0] == 201
+    assert results["second"][0] == 201
+    assert adapter.operations == [
+        ("write", "/flash/first.txt"),
+        ("write", "/flash/second.txt"),
+    ]
+
+
 def test_propfind_uses_unicode_displayname_for_chinese_paths():
     adapter = FakeAdapter()
     adapter.files = {"/flash/中文.txt": "你好".encode("utf-8")}
@@ -325,8 +542,74 @@ def test_directory_cache_root_prime_does_not_cache_empty_root():
     assert not cache.prime_root_listing()
     assert "/flash" not in cache._dirs
 
-    cache.list_dir("/flash")
-    assert adapter.list_calls == 5
+    with pytest.raises(DirectoryListingNotReady):
+        cache.list_dir("/flash")
+    assert "/flash" not in cache._dirs
+    assert adapter.list_calls == 6
+
+
+def test_directory_cache_keeps_startup_empty_root_unpublished_until_files_appear():
+    adapter = RepeatedTransientEmptyListAdapter(empty_times=6)
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(
+            empty_list_retries=1,
+            startup_empty_list_retries=2,
+            empty_list_retry_delay=0,
+            startup_empty_list_grace=60,
+        ),
+    )
+
+    assert not cache.prime_root_listing()
+    with pytest.raises(DirectoryListingNotReady):
+        cache.list_dir("/flash")
+    assert "/flash" not in cache._dirs
+
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+
+
+def test_directory_cache_empty_root_grace_starts_when_empty_listing_is_seen(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(webdav_mount.time, "monotonic", lambda: now)
+    adapter = AlwaysEmptyRootAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retries=0, startup_empty_list_retries=0, startup_empty_list_grace=5),
+    )
+
+    now = 200.0
+    assert not cache.prime_root_listing()
+    now = 204.0
+    with pytest.raises(DirectoryListingNotReady):
+        cache.list_dir("/flash")
+
+    now = 206.0
+    assert cache.list_dir("/flash") == []
+
+
+def test_propfind_returns_retry_when_startup_root_listing_is_not_ready():
+    adapter = AlwaysEmptyRootAdapter()
+    mapper = DevicePathMapper("/flash")
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        mapper.root,
+        WebDavConfig(empty_list_retries=0, startup_empty_list_retries=0, startup_empty_list_grace=60),
+    )
+    handler = make_webdav_handler(cache, mapper, WebDavConfig(empty_list_retry_delay=0))
+    server = WebDavThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, headers, body = _request(server, "PROPFIND", "/", headers={"Depth": "1"})
+    finally:
+        server.shutdown()
+
+    assert status == 503
+    assert headers["Retry-After"] == "1"
+    assert b"root directory listing is not ready" in body
 
 
 def test_warm_up_retries_transient_empty_root_listing():
@@ -654,13 +937,36 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
             "--password",
             "secret",
             "--no-map",
+            "--startup-empty-list-grace",
+            "12.5",
         ])
 
     assert result.exit_code == 0
     factory.assert_called_once_with("COM4", 115200, 10, "ws://esp32.local:8266", "secret")
     mp.connect.assert_called_once()
     serve.assert_called_once()
+    assert serve.call_args.args[1].startup_empty_list_grace == 12.5
     mp.disconnect.assert_called_once()
+
+
+def test_mount_run_requests_current_mount_session():
+    adapter = RunCapableAdapter()
+    server = _serve_with_run(adapter)
+    _host, port = server.server_address
+    try:
+        result = runner.invoke(app, [
+            "mount-run",
+            "--http-port",
+            str(port),
+            "--path",
+            "/app.py",
+        ])
+    finally:
+        server.shutdown()
+
+    assert result.exit_code == 0
+    assert result.stdout == "ran /app.py\n"
+    assert adapter.run_calls == ["/app.py"]
 
 
 def test_mount_help_includes_webrepl_options():

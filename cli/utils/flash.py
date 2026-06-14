@@ -101,11 +101,6 @@ except Exception as e:
     raise
 """
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 协议辅助函数（模块级）
-# ═══════════════════════════════════════════════════════════════════
-
 def _strip_repl_trailer(buf: bytes) -> bytes:
     """去除原始 REPL 响应尾部的协议标记。"""
     for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
@@ -129,11 +124,6 @@ def _colorize_repl_output(text: str, in_error: bool) -> Tuple[str, bool]:
             return "\033[31m" + text[:m.end()] + "\033[0m" + text[m.end():], False
         return "\033[31m" + text + "\033[0m", True
     return text, False
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MicroPython 主类
-# ═══════════════════════════════════════════════════════════════════
 
 class MicroPython:
     """通过串口原始 REPL 与 MicroPython 设备交互。
@@ -273,16 +263,81 @@ class MicroPython:
             time.sleep(0.02)
         return False, buf
 
+    def _interrupt_running_program(
+        self,
+        attempts: int = 12,
+        interval: float = 0.03,
+        settle: float = 0.15,
+    ) -> None:
+        """持续发送 Ctrl+C，让正在运行的 main.py 有时间退出到普通 REPL。"""
+        for _ in range(attempts):
+            self._write(SET_RESET)
+            time.sleep(interval)
+        time.sleep(settle)
+        self.transport.reset_input_buffer()
+
+    def _reset_and_interrupt_boot(self) -> bool:
+        """硬复位后抢占启动窗口，避免 main.py 先禁用 Ctrl+C。"""
+        if not isinstance(self.transport, SerialTransport):
+            return False
+        try:
+            self.transport.set_rts(True)
+            self.transport.set_dtr(False)
+            time.sleep(0.1)
+            self.transport.set_rts(False)
+            deadline = time.time() + 1.2
+            while time.time() < deadline:
+                self._write(SET_RESET)
+                time.sleep(0.03)
+            self.transport.reset_input_buffer()
+            return True
+        except Exception as exc:
+            log.trace("硬复位启动中断失败: %s", exc)
+            return False
+
+    def _ensure_filesystem_mounted(self) -> None:
+        """确保标准 VFS 已挂载。
+
+        某些 mPython 固件在启动窗口被打断后会进入 Raw REPL，但根 VFS 还未挂载。
+        这时 os.listdir('/') 返回空，statvfs('/') 也全 0，需要手动挂载 flashbdev。
+        """
+        script = (
+            "import os\n"
+            "def _fs_ready():\n"
+            " try:\n"
+            "  s=os.statvfs('/')\n"
+            "  return bool(s[0] and s[2])\n"
+            " except Exception:\n"
+            "  return False\n"
+            "def _mount_flashbdev():\n"
+            " try:\n"
+            "  import flashbdev\n"
+            "  b=flashbdev.bdev\n"
+            "  if isinstance(b,(list,tuple)):\n"
+            "   b=b[0]\n"
+            "  for candidate in (b, os.VfsLfs2(b)):\n"
+            "   try:\n"
+            "    os.mount(candidate,'/')\n"
+            "    return\n"
+            "   except Exception:\n"
+            "    pass\n"
+            " except Exception:\n"
+            "  pass\n"
+            "if not _fs_ready():\n"
+            " _mount_flashbdev()\n"
+            "print('FS_READY' if _fs_ready() else 'FS_NOT_READY')\n"
+        )
+        out = self._execute(script, timeout=5, raise_on_error=False)
+        if "FS_NOT_READY" in out:
+            log.debug("设备文件系统未就绪，后续文件操作可能返回空目录")
+
     def _init_device_state(self) -> None:
         """初始化设备到原始 REPL 模式并设置 kbd_intr(-1)。
 
-        序列：Ctrl+C × 5 → Ctrl+A → 兜底 Ctrl+D → Ctrl+A → kbd_intr(-1)
+        序列：持续 Ctrl+C → Ctrl+A → 兜底 Ctrl+D → 持续 Ctrl+C → Ctrl+A → kbd_intr(-1)
         """
         log.trace("初始化设备状态 → 原始 REPL")
-        for _ in range(5):
-            self._write(SET_RESET)
-            time.sleep(0.02)
-        self.transport.reset_input_buffer()
+        self._interrupt_running_program()
 
         self._write(ENTER_RAW_REPL)
         ok, data = self._read_until_raw_repl(timeout=2)
@@ -291,32 +346,32 @@ class MicroPython:
             log.debug("首次进入原始 REPL 失败，尝试兜底...")
             self._write(SET_EXECUTE)
             time.sleep(0.8)
-            self.transport.reset_input_buffer()
+            self._interrupt_running_program()
             self._write(ENTER_RAW_REPL)
             ok, data = self._read_until_raw_repl(timeout=3)
 
         if not ok:
             # 尝试 DTR/RTS 硬件复位兜底
             if isinstance(self.transport, SerialTransport):
-                log.debug("尝试 DTR/RTS 硬件复位兜底...")
+                log.debug("尝试 DTR/RTS 硬件复位并抢占启动中断窗口...")
                 try:
-                    self.transport.dtr_rts_reset()
-                    time.sleep(0.5)
-                    self.transport.reset_input_buffer()
-                    self._write(ENTER_RAW_REPL)
-                    ok, data = self._read_until_raw_repl(timeout=3)
-                    if ok:
-                        self._execute(
-                            "import micropython; micropython.kbd_intr(-1)",
-                            timeout=3, raise_on_error=False,
-                        )
-                        return
+                    if self._reset_and_interrupt_boot():
+                        self._write(ENTER_RAW_REPL)
+                        ok, data = self._read_until_raw_repl(timeout=3)
+                        if ok:
+                            self._ensure_filesystem_mounted()
+                            self._execute(
+                                "import micropython; micropython.kbd_intr(-1)",
+                                timeout=3, raise_on_error=False,
+                            )
+                            return
                 except Exception:
                     pass
             raise RuntimeError(
                 f"无法进入原始 REPL 模式，设备响应: {data[:100]!r}"
             )
 
+        self._ensure_filesystem_mounted()
         self._execute(
             "import micropython; micropython.kbd_intr(-1)",
             timeout=3, raise_on_error=False,

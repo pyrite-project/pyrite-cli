@@ -88,6 +88,48 @@ pyrcli mount COM4 --http-port 8766
 
 如果默认端口 `8765` 被占用，可以换一个端口。
 
+### 启动期根目录稳定性
+
+`pyrcli mount` 启动后会先预热根目录列表。若设备刚从用户程序切回 Raw REPL，根目录短时间返回空列表，WebDAV 会先返回 `503 Retry-After`，避免文件管理器缓存一个假的空目录。默认保护窗口为 5 秒：
+
+```powershell
+pyrcli mount COM4 --startup-empty-list-grace 10
+```
+
+如果设备确实是空文件系统，保护窗口结束后会正常显示空目录。
+
+### 通过当前 mount 会话运行脚本
+
+`pyrcli mount` 会在 WebDAV 根目录注入一个受保护的虚拟可执行文件。文件名按当前系统选择：
+
+| 系统 | 文件名 |
+| --- | --- |
+| Windows | `_run.bat` |
+| macOS | `_run.command` |
+| Linux | `_run.sh` |
+
+请求这个文件会让当前 mount 会话在设备端执行：
+
+```python
+execfile("/main.py")
+```
+
+推荐用命令行触发：
+
+```powershell
+pyrcli mount-run --path /main.py
+```
+
+如果 mount 服务使用了自定义端口：
+
+```powershell
+pyrcli mount-run --http-port 8766 --path /main.py
+```
+
+脚本运行期间，mount 文件通道会暂停；新的 WebDAV 文件读请求会等待，写请求会先保存到 PC 临时文件并排队，直到脚本退出后按顺序 replay 到设备。脚本 stdout/stderr 会输出到正在运行 `pyrcli mount` 的控制台。可用 `pyrcli mount --run-timeout 600` 调整脚本执行超时，用 `--run-queue-max` 和 `--run-queue-max-bytes` 限制运行期写队列。
+
+虚拟可执行文件的内容只显示 `已开始运行main.py`，真正执行由 mount 服务在收到该文件请求时完成。mount 服务会为该文件计算 SHA-256，并通过 ETag 和 `X-Pyrite-Run-Executable-SHA256` 返回；涉及该虚拟文件的 PUT、DELETE、MOVE、COPY、MKCOL 会被拒绝，以防入口文件被篡改。
+
 ### 只读模式
 
 ```powershell

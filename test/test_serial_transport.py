@@ -3,8 +3,48 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli.utils.transport import Transport
 from cli.utils.serial_transport import SerialTransport
 from cli.utils.flash import MicroPython, SerialTransport as ST
+
+
+class InterruptHungryTransport(Transport):
+    def __init__(self, required_interrupts: int = 8):
+        super().__init__()
+        self.connected = True
+        self.required_interrupts = required_interrupts
+        self.interrupts = 0
+        self.writes = []
+        self.rx = b""
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def _raw_write(self, data: bytes) -> None:
+        self.writes.append(data)
+        if data == b"\x03":
+            self.interrupts += 1
+            return
+        if data == b"\x01":
+            if self.interrupts >= self.required_interrupts:
+                self.rx += b"raw REPL; CTRL-B to exit\r\n>"
+            else:
+                self.rx += b"$#mac:3C61052C5A4C#$\r\n"
+            return
+        if data == b"\x04":
+            self.rx += b"OK\x04"
+
+    def _raw_read(self, size: int) -> bytes:
+        data = self.rx[:size]
+        self.rx = self.rx[size:]
+        return data
+
+    def _raw_in_waiting(self) -> int:
+        return len(self.rx)
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
 
 
 class TestSerialTransportDtrRts:
@@ -117,6 +157,17 @@ class TestMicroPythonConnectDtrRts:
         mp = MicroPython(port="COM99", transport=mock_transport)
         mp.connect()
         # isinstance(mock, SerialTransport) == False，不会调用 dtr_rts_reset
+
+
+class TestMicroPythonRawReplEntry:
+    def test_enter_raw_repl_sends_sustained_interrupts_before_ctrl_a(self):
+        transport = InterruptHungryTransport(required_interrupts=8)
+        mp = MicroPython(port="COM99", transport=transport)
+
+        mp._enter_raw_repl()
+
+        assert transport.interrupts >= 8
+        assert b"\x01" in transport.writes
 
 
 class TestMicroPythonResetDtrRts:

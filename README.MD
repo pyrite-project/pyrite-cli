@@ -1,6 +1,6 @@
 # Pyrite CLI
 
-[English](README.md) | [中文](README.zh-CN.md)
+Welcome👋! [English](README.md) | [中文](README.zh-CN.md)
 
 Pyrite CLI is a MicroPython device toolkit for flashing code or , browsing files, opening a REPL, syncing projects, and mounting the device filesystem in your system. It talks to boards through UART raw REPL or WebREPL over WebSocket, so the same command surface works over USB serial and Wi-Fi.
 
@@ -245,7 +245,7 @@ Start here if you want a guided path:
 | `firmware verify` | Verify firmware contents |
 | `firmware read` | Read flash contents to a file |
 
-## Under the Hood
+## How it work
 
 Pyrite CLI uses MicroPython raw REPL as the common execution layer.
 
@@ -264,15 +264,6 @@ Run the pure logic tests without a device:
 
 ```bash
 pytest test/test_protocol_helpers.py test/test_flash_utils.py test/test_config.py test/test_manifest_loader.py test/test_logger.py test/test_output.py test/test_webdav_mount.py -v
-```
-
-Useful smoke checks:
-
-```bash
-python -c "from cli.main import app; from cli.utils.flash import MicroPython"
-pyrcli --help
-pyrcli scan
-pyrcli scan --version
 ```
 
 Device validation requires an attached MicroPython board:

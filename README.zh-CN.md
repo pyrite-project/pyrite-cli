@@ -245,7 +245,7 @@ C3 = ["ESP32", "wifi"]
 | `firmware verify` | 验证固件内容 |
 | `firmware read` | 读取 Flash 内容到文件 |
 
-## 微硬核：内部工作方式
+## 内部工作方式
 
 Pyrite CLI 以 MicroPython raw REPL 作为统一执行层。
 
@@ -264,15 +264,6 @@ Pyrite CLI 以 MicroPython raw REPL 作为统一执行层。
 
 ```bash
 pytest test/test_protocol_helpers.py test/test_flash_utils.py test/test_config.py test/test_manifest_loader.py test/test_logger.py test/test_output.py test/test_webdav_mount.py -v
-```
-
-常用冒烟检查：
-
-```bash
-python -c "from cli.main import app; from cli.utils.flash import MicroPython"
-pyrcli --help
-pyrcli scan
-pyrcli scan --version
 ```
 
 实机验证需要连接 MicroPython 开发板：

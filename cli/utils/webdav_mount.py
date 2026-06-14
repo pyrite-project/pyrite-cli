@@ -57,14 +57,14 @@ class WebDavConfig:
     map_drive: bool = True
     empty_list_retries: int = 1
     empty_list_retry_delay: float = 0.08
+    startup_empty_list_retries: int = 5
+    directory_cache: bool = True
+    load_all: bool = False
 
 
 class WebDavThreadingHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer that treats client disconnects as normal.
-
-    Windows Explorer/WebClient often opens localhost WebDAV sockets and then
-    closes them while probing capabilities. The default socketserver behavior
-    prints a traceback for those resets, which is noisy but not actionable.
+    """ThreadingHTTPServer 将客户端断开连接视为正常情况。
+    Windows 资源管理器/Web 客户端经常打开本地 WebDAV 套接字，然后在探测功能时将其关闭。默认的套接字服务器行为会打印这些重置的回溯信息，虽然信息量很大，但无法采取任何行动。
     """
 
     daemon_threads = True
@@ -152,6 +152,24 @@ class MicroPythonWebDavAdapter:
             result.append(DeviceFileStat(path=child, is_dir=item["type"] == "D", size=size))
         return result
 
+    def list_dir_recursive(self, path: str) -> list[DeviceFileStat]:
+        with self._lock:
+            items = self._mp.fs_ls_recursive(path)
+        result: list[DeviceFileStat] = []
+        for item in items:
+            item_type = item["type"]
+            if item_type not in ("D", "F"):
+                continue
+            size = int(item["size"]) if item["size"].isdigit() else 0
+            result.append(
+                DeviceFileStat(
+                    path=posixpath.normpath(item["name"].replace("\\", "/")),
+                    is_dir=item_type == "D",
+                    size=size,
+                )
+            )
+        return result
+
     def read_file(self, path: str) -> bytes:
         with self._lock:
             return self._mp._read_device_file(path)
@@ -176,8 +194,32 @@ class MicroPythonWebDavAdapter:
         stat = self.stat(path)
         if stat is None:
             raise FileNotFoundError(path)
+        if stat.is_dir and self._remove_empty_dir(path):
+            return
         with self._lock:
-            self._mp.fs_rm(path, recursive=stat.is_dir, force=False)
+            ok = self._mp.fs_rm(path, recursive=stat.is_dir, force=False)
+        if ok:
+            return
+        if self.stat(path) is None:
+            log.debug("WebDAV delete verified removed despite missing OK path=%s", path)
+            return
+        raise OSError(f"failed to delete {path}")
+
+    def _remove_empty_dir(self, path: str) -> bool:
+        script = (
+            "import os\n"
+            f"p={path!r}\n"
+            "try:\n"
+            " os.rmdir(p)\n"
+            " print('OK')\n"
+            "except Exception as e:\n"
+            " print('ERR|'+repr(e))\n"
+        )
+        with self._lock:
+            out = self._mp.run(script, timeout=10)
+        if "OK" in out:
+            return True
+        return self.stat(path) is None
 
     def move(self, src: str, dst: str) -> None:
         with self._lock:
@@ -197,7 +239,7 @@ def _xml_response(stat: DeviceFileStat, href: str) -> ET.Element:
     ET.SubElement(response, "{DAV:}href").text = href + ("/" if stat.is_dir and href != "/" and not href.endswith("/") else "")
     propstat = ET.SubElement(response, "{DAV:}propstat")
     prop = ET.SubElement(propstat, "{DAV:}prop")
-    ET.SubElement(prop, "{DAV:}displayname").text = href.strip("/").rsplit("/", 1)[-1]
+    ET.SubElement(prop, "{DAV:}displayname").text = _display_name(stat, href)
     resource_type = ET.SubElement(prop, "{DAV:}resourcetype")
     if stat.is_dir:
         ET.SubElement(resource_type, "{DAV:}collection")
@@ -208,6 +250,12 @@ def _xml_response(stat: DeviceFileStat, href: str) -> ET.Element:
     ET.SubElement(prop, "{DAV:}getetag").text = f'"{stat.size:x}-{abs(hash(stat.path)) & 0xffff:x}"'
     ET.SubElement(propstat, "{DAV:}status").text = "HTTP/1.1 200 OK"
     return response
+
+
+def _display_name(stat: DeviceFileStat, href: str) -> str:
+    if href == "/":
+        return ""
+    return posixpath.basename(stat.path.rstrip("/"))
 
 
 def list_dir_with_empty_retry(
@@ -230,6 +278,253 @@ def list_dir_with_empty_retry(
             len(children),
         )
     return children
+
+
+class DirectoryCachingWebDavAdapter:
+    """PC-side directory tree cache for WebDAV directory listings."""
+
+    handles_empty_list_retry = True
+
+    def __init__(self, adapter: object, root: str, config: WebDavConfig) -> None:
+        self._adapter = adapter
+        self._root = posixpath.normpath(root or "/")
+        if self._root == ".":
+            self._root = "/"
+        self._config = config
+        self._lock = threading.RLock()
+        self._dirs: dict[str, list[DeviceFileStat]] = {}
+        self._stats: dict[str, DeviceFileStat] = {}
+        self._scan_thread: Optional[threading.Thread] = None
+        self._generation = 0
+
+    def stat(self, path: str) -> Optional[DeviceFileStat]:
+        normalized = self._normalize(path)
+        with self._lock:
+            cached = self._stats.get(normalized)
+            if cached is not None:
+                log.debug("WebDAV CACHE stat-hit path=%s", normalized)
+                return cached
+
+        stat = self._adapter.stat(normalized)
+        if stat is not None:
+            self._cache_stat(stat)
+        return stat
+
+    def list_dir(self, path: str) -> list[DeviceFileStat]:
+        normalized = self._normalize(path)
+        with self._lock:
+            cached = self._dirs.get(normalized)
+            if cached is not None:
+                log.debug("WebDAV CACHE list-hit path=%s entries=%d", normalized, len(cached))
+                return list(cached)
+
+        with self._lock:
+            generation = self._generation
+        children = self._fetch_and_cache_dir(normalized, generation)
+        if normalized == self._root:
+            self._ensure_background_scan()
+        return children
+
+    def prime_root_listing(self) -> bool:
+        with self._lock:
+            generation = self._generation
+        children = self._fetch_and_cache_dir(
+            self._root,
+            generation,
+            retries=max(self._config.empty_list_retries, self._config.startup_empty_list_retries),
+            cache_empty=False,
+        )
+        if children:
+            self._ensure_background_scan()
+        return bool(children)
+
+    def prime_from_recursive_listing(self) -> bool:
+        if not hasattr(self._adapter, "list_dir_recursive"):
+            return False
+        started = time.perf_counter()
+        try:
+            entries = self._adapter.list_dir_recursive(self._root)
+        except Exception as exc:
+            log.debug("WebDAV recursive cache preload skipped root=%s reason=%s", self._root, exc)
+            return False
+
+        dirs: dict[str, list[DeviceFileStat]] = {self._root: []}
+        stats: dict[str, DeviceFileStat] = {self._root: DeviceFileStat(path=self._root, is_dir=True, size=0)}
+        for entry in entries:
+            path = self._normalize(entry.path)
+            if path == self._root or not self._is_inside_root(path):
+                continue
+            normalized_entry = DeviceFileStat(path=path, is_dir=entry.is_dir, size=entry.size)
+            stats[path] = normalized_entry
+            if normalized_entry.is_dir:
+                dirs.setdefault(path, [])
+            parent = self._parent_dir(path)
+            dirs.setdefault(parent, []).append(normalized_entry)
+
+        for children in dirs.values():
+            children.sort(key=lambda item: (not item.is_dir, item.path.lower()))
+
+        with self._lock:
+            self._generation += 1
+            self._dirs = {path: list(children) for path, children in dirs.items()}
+            self._stats = stats
+            generation = self._generation
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "WebDAV 目录缓存预加载完成 root=%s entries=%d dirs=%d generation=%d %.1fms",
+            self._root,
+            len(entries),
+            len(dirs),
+            generation,
+            elapsed_ms,
+        )
+        return True
+
+    def read_file(self, path: str) -> bytes:
+        return self._adapter.read_file(path)
+
+    def write_file(self, path: str, data: bytes) -> None:
+        try:
+            self._adapter.write_file(path, data)
+        finally:
+            self._invalidate()
+
+    def make_dir(self, path: str) -> None:
+        try:
+            self._adapter.make_dir(path)
+        finally:
+            self._invalidate()
+
+    def delete(self, path: str) -> None:
+        try:
+            self._adapter.delete(path)
+        finally:
+            self._invalidate()
+
+    def move(self, src: str, dst: str) -> None:
+        try:
+            self._adapter.move(src, dst)
+        finally:
+            self._invalidate()
+
+    def copy(self, src: str, dst: str) -> None:
+        try:
+            self._adapter.copy(src, dst)
+        finally:
+            self._invalidate()
+
+    def close(self) -> None:
+        self._invalidate()
+
+    def wait_for_background_scan(self, timeout: Optional[float] = None) -> bool:
+        with self._lock:
+            thread = self._scan_thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def _normalize(self, path: str) -> str:
+        normalized = posixpath.normpath((path or "/").replace("\\", "/"))
+        return "/" if normalized == "." else normalized
+
+    def _is_inside_root(self, path: str) -> bool:
+        if self._root == "/":
+            return path.startswith("/")
+        return path == self._root or path.startswith(self._root.rstrip("/") + "/")
+
+    def _parent_dir(self, path: str) -> str:
+        parent = posixpath.dirname(path.rstrip("/"))
+        if not parent:
+            parent = "/"
+        if self._root != "/" and not self._is_inside_root(parent):
+            return self._root
+        return parent
+
+    def _cache_stat(self, stat: DeviceFileStat) -> None:
+        with self._lock:
+            self._stats[self._normalize(stat.path)] = stat
+
+    def _fetch_and_cache_dir(
+        self,
+        path: str,
+        generation: Optional[int] = None,
+        retries: Optional[int] = None,
+        delay: Optional[float] = None,
+        cache_empty: bool = True,
+    ) -> list[DeviceFileStat]:
+        log.debug("WebDAV CACHE list-miss path=%s", path)
+        children = list_dir_with_empty_retry(
+            self._adapter,
+            path,
+            self._config.empty_list_retries if retries is None else retries,
+            self._config.empty_list_retry_delay if delay is None else delay,
+        )
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                log.debug(
+                    "WebDAV CACHE discard-stale path=%s generation=%d current=%d",
+                    path,
+                    generation,
+                    self._generation,
+                )
+                return list(children)
+            if not children and not cache_empty:
+                log.debug("WebDAV CACHE skip-empty path=%s", path)
+                return []
+            self._dirs[path] = list(children)
+            self._stats[path] = DeviceFileStat(path=path, is_dir=True, size=0)
+            for child in children:
+                self._stats[self._normalize(child.path)] = child
+        return list(children)
+
+    def _ensure_background_scan(self) -> None:
+        with self._lock:
+            if self._scan_thread and self._scan_thread.is_alive():
+                return
+            generation = self._generation
+            self._scan_thread = threading.Thread(
+                target=self._scan_directory_tree,
+                args=(generation,),
+                name="pyrite-webdav-cache",
+                daemon=True,
+            )
+            self._scan_thread.start()
+            log.info("WebDAV 目录缓存后台扫描已启动 root=%s", self._root)
+
+    def _scan_directory_tree(self, generation: int) -> None:
+        scanned_dirs = 0
+        try:
+            with self._lock:
+                if generation != self._generation:
+                    log.debug("WebDAV 目录缓存后台扫描已取消 root=%s", self._root)
+                    return
+                root_children = list(self._dirs.get(self._root, []))
+            stack = [child.path for child in root_children if child.is_dir]
+            seen = {self._root}
+            while stack:
+                with self._lock:
+                    if generation != self._generation:
+                        log.debug("WebDAV 目录缓存后台扫描已取消 root=%s", self._root)
+                        return
+                path = stack.pop()
+                if path in seen:
+                    continue
+                seen.add(path)
+                children = self._fetch_and_cache_dir(path, generation)
+                scanned_dirs += 1
+                stack.extend(child.path for child in children if child.is_dir)
+            log.info("WebDAV 目录缓存后台扫描完成 root=%s dirs=%d", self._root, scanned_dirs)
+        except Exception as exc:
+            log.debug("WebDAV 目录缓存后台扫描失败 root=%s reason=%s", self._root, exc)
+
+    def _invalidate(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._dirs.clear()
+            self._stats.clear()
+            log.debug("WebDAV CACHE invalidated generation=%d", self._generation)
 
 
 def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDavConfig) -> type[BaseHTTPRequestHandler]:
@@ -320,12 +615,16 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
             multistatus = ET.Element("{DAV:}multistatus")
             multistatus.append(_xml_response(stat, mapper.href_for(remote)))
             if stat.is_dir and depth != "0":
-                for child in list_dir_with_empty_retry(
-                    adapter,
-                    remote,
-                    config.empty_list_retries,
-                    config.empty_list_retry_delay,
-                ):
+                if getattr(adapter, "handles_empty_list_retry", False):
+                    children = adapter.list_dir(remote)
+                else:
+                    children = list_dir_with_empty_retry(
+                        adapter,
+                        remote,
+                        config.empty_list_retries,
+                        config.empty_list_retry_delay,
+                    )
+                for child in children:
                     multistatus.append(_xml_response(child, mapper.href_for(child.path)))
             body = ET.tostring(multistatus, encoding="utf-8", xml_declaration=True)
             self._send_bytes(207, body, "application/xml; charset=utf-8")
@@ -359,7 +658,10 @@ def make_webdav_handler(adapter: object, mapper: DevicePathMapper, config: WebDa
         def do_DELETE(self) -> None:
             if self._reject_readonly():
                 return
-            adapter.delete(self._remote())
+            try:
+                adapter.delete(self._remote())
+            except FileNotFoundError:
+                log.debug("WebDAV DELETE already absent path=%s", self._remote())
             self._send_bytes(HTTPStatus.NO_CONTENT)
 
         def do_MKCOL(self) -> None:
@@ -560,9 +862,18 @@ def warm_up_directory_listing(adapter: object, root: str, config: WebDavConfig) 
 
 
 def serve_webdav(mp: MicroPython, config: WebDavConfig) -> None:
-    adapter = MicroPythonWebDavAdapter(mp)
     mapper = DevicePathMapper(config.root)
-    warm_up_directory_listing(adapter, mapper.root, config)
+    device_adapter = MicroPythonWebDavAdapter(mp)
+    adapter = (
+        DirectoryCachingWebDavAdapter(device_adapter, mapper.root, config)
+        if config.directory_cache
+        else device_adapter
+    )
+    if isinstance(adapter, DirectoryCachingWebDavAdapter):
+        if config.load_all:
+            adapter.prime_from_recursive_listing()
+        else:
+            adapter.prime_root_listing()
     handler = make_webdav_handler(adapter, mapper, config)
     server = WebDavThreadingHTTPServer((config.host, config.port), handler)
     actual_host, actual_port = server.server_address
@@ -587,6 +898,8 @@ def serve_webdav(mp: MicroPython, config: WebDavConfig) -> None:
         with contextlib.suppress(NameError):
             thread.join(timeout=5)
         server.server_close()
+        if hasattr(adapter, "close"):
+            adapter.close()
         if cleanup_file_manager:
             cleanup_file_manager()
             log.info("已断开默认文件管理器: %s", file_manager_target)

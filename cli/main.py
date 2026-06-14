@@ -592,6 +592,10 @@ def mount(
         False, "--no-map",
         help="只启动 WebDAV 服务，不自动连接默认文件管理器",
     ),
+    load_all: bool = typer.Option(
+        False, "--load-all",
+        help="挂载前先递归读取并缓存完整目录结构",
+    ),
     baudrate: int = typer.Option(
         115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
     ),
@@ -617,6 +621,7 @@ def mount(
         readonly=readonly,
         drive=drive,
         map_drive=not no_map,
+        load_all=load_all,
     )
 
     mp = _mp_factory(port, baudrate, timeout, ws, password)

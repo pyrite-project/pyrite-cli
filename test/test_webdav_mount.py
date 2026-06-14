@@ -11,6 +11,8 @@ from cli.utils import webdav_mount
 from cli.utils.webdav_mount import (
     DeviceFileStat,
     DevicePathMapper,
+    DirectoryCachingWebDavAdapter,
+    MicroPythonWebDavAdapter,
     WebDavConfig,
     WebDavThreadingHTTPServer,
     make_webdav_handler,
@@ -42,7 +44,14 @@ class FakeAdapter:
 
     def list_dir(self, path: str):
         assert path == "/flash"
-        return [DeviceFileStat(path="/flash/main.py", is_dir=False, size=len(self.files["/flash/main.py"]))]
+        children = [DeviceFileStat(path=child, is_dir=True, size=0) for child in sorted(self.dirs) if child != path]
+        children.extend(
+            DeviceFileStat(path=file_path, is_dir=False, size=len(data))
+            for file_path, data in sorted(self.files.items())
+            if file_path.startswith(path.rstrip("/") + "/")
+            and "/" not in file_path[len(path.rstrip("/") + "/"):]
+        )
+        return children
 
     def read_file(self, path: str) -> bytes:
         return self.files[path]
@@ -101,6 +110,143 @@ class TransientEmptyListAdapter(FakeAdapter):
         return super().list_dir(path)
 
 
+class RepeatedTransientEmptyListAdapter(FakeAdapter):
+    def __init__(self, empty_times: int):
+        super().__init__()
+        self.empty_times = empty_times
+        self.list_calls = 0
+
+    def list_dir(self, path: str):
+        self.list_calls += 1
+        if self.list_calls <= self.empty_times:
+            return []
+        return super().list_dir(path)
+
+
+class AlwaysEmptyRootAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.list_calls = 0
+
+    def list_dir(self, path: str):
+        self.list_calls += 1
+        return []
+
+
+class MissingOnDeleteAdapter(FakeAdapter):
+    def delete(self, path: str) -> None:
+        raise FileNotFoundError(path)
+
+
+class RecursiveListingAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.list_calls = 0
+        self.recursive_calls = []
+
+    def list_dir(self, path: str):
+        self.list_calls += 1
+        return super().list_dir(path)
+
+    def list_dir_recursive(self, path: str):
+        self.recursive_calls.append(path)
+        return [
+            DeviceFileStat(path="/flash/lib", is_dir=True, size=0),
+            DeviceFileStat(path="/flash/lib/pkg.py", is_dir=False, size=7),
+            DeviceFileStat(path="/flash/main.py", is_dir=False, size=len(self.files["/flash/main.py"])),
+        ]
+
+
+class DeleteReturnsFalseButRemovedMicroPython:
+    def __init__(self):
+        self.removed = False
+        self.fs_rm_calls = []
+
+    def run(self, script: str, timeout: int = 10):
+        if "os.rmdir" in script:
+            return "ERR|OSError(39)\n"
+        if self.removed:
+            return "ERR|OSError('ENOENT')\n"
+        return "D|0\n"
+
+    def fs_rm(self, path: str, recursive: bool = False, force: bool = False):
+        self.fs_rm_calls.append((path, recursive, force))
+        self.removed = True
+        return False
+
+
+class EmptyDirRemoveMicroPython:
+    def __init__(self):
+        self.removed = False
+        self.fs_rm_calls = []
+
+    def run(self, script: str, timeout: int = 10):
+        if "os.rmdir" in script:
+            self.removed = True
+            return "OK\n"
+        if self.removed:
+            return "ERR|OSError('ENOENT')\n"
+        return "D|0\n"
+
+    def fs_rm(self, path: str, recursive: bool = False, force: bool = False):
+        self.fs_rm_calls.append((path, recursive, force))
+        return True
+
+
+class BlockingTreeAdapter:
+    def __init__(self):
+        self.files = {
+            "/flash/main.py": b"print('hello')\n",
+        }
+        self.dirs = {"/flash", "/flash/lib"}
+        self.list_calls = {}
+        self.dir_scan_started = threading.Event()
+        self.release_dir_scan = threading.Event()
+
+    def stat(self, path: str):
+        if path in self.dirs:
+            return DeviceFileStat(path=path, is_dir=True, size=0)
+        if path in self.files:
+            return DeviceFileStat(path=path, is_dir=False, size=len(self.files[path]))
+        return None
+
+    def list_dir(self, path: str):
+        self.list_calls[path] = self.list_calls.get(path, 0) + 1
+        if path == "/flash":
+            children = []
+            for child in sorted(self.dirs):
+                if child != "/flash" and child.count("/") == 2:
+                    children.append(DeviceFileStat(path=child, is_dir=True, size=0))
+            children.append(DeviceFileStat(path="/flash/main.py", is_dir=False, size=len(self.files["/flash/main.py"])))
+            return children
+        if path.startswith("/flash/"):
+            self.dir_scan_started.set()
+            assert self.release_dir_scan.wait(2)
+            child_file = path + "/pkg.py"
+            return [DeviceFileStat(path=child_file, is_dir=False, size=7)] if path == "/flash/lib" else []
+        raise AssertionError(path)
+
+    def read_file(self, path: str) -> bytes:
+        return self.files[path]
+
+    def write_file(self, path: str, data: bytes) -> None:
+        self.files[path] = data
+
+    def make_dir(self, path: str) -> None:
+        self.dirs.add(path)
+
+    def delete(self, path: str) -> None:
+        self.files.pop(path, None)
+        self.dirs.discard(path)
+
+    def move(self, src: str, dst: str) -> None:
+        if src in self.files:
+            self.files[dst] = self.files.pop(src)
+
+    def copy(self, src: str, dst: str) -> None:
+        self.files[dst] = self.files[src]
+
+
 def test_path_mapper_keeps_requests_inside_device_root():
     mapper = DevicePathMapper("/flash")
 
@@ -126,6 +272,21 @@ def test_propfind_depth_one_lists_directory_children():
     assert "<D:getcontentlength>15</D:getcontentlength>" in text
 
 
+def test_propfind_uses_unicode_displayname_for_chinese_paths():
+    adapter = FakeAdapter()
+    adapter.files = {"/flash/中文.txt": "你好".encode("utf-8")}
+    server = _serve(adapter)
+    try:
+        status, _headers, body = _request(server, "PROPFIND", "/", headers={"Depth": "1"})
+    finally:
+        server.shutdown()
+
+    text = body.decode("utf-8")
+    assert status == 207
+    assert "<D:displayname>中文.txt</D:displayname>" in text
+    assert "%E4%B8%AD%E6%96%87" in text
+
+
 def test_propfind_retries_transient_empty_directory_listing():
     adapter = TransientEmptyListAdapter()
     server = _serve(adapter)
@@ -139,6 +300,35 @@ def test_propfind_retries_transient_empty_directory_listing():
     assert "<D:href>/main.py</D:href>" in body.decode("utf-8")
 
 
+def test_directory_cache_root_prime_retries_more_than_request_listing():
+    adapter = RepeatedTransientEmptyListAdapter(empty_times=3)
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retries=1, startup_empty_list_retries=4, empty_list_retry_delay=0),
+    )
+
+    assert cache.prime_root_listing()
+
+    assert adapter.list_calls == 4
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+
+
+def test_directory_cache_root_prime_does_not_cache_empty_root():
+    adapter = AlwaysEmptyRootAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retries=1, startup_empty_list_retries=2, empty_list_retry_delay=0),
+    )
+
+    assert not cache.prime_root_listing()
+    assert "/flash" not in cache._dirs
+
+    cache.list_dir("/flash")
+    assert adapter.list_calls == 5
+
+
 def test_warm_up_retries_transient_empty_root_listing():
     adapter = TransientEmptyListAdapter()
 
@@ -149,6 +339,119 @@ def test_warm_up_retries_transient_empty_root_listing():
     )
 
     assert adapter.list_calls == 2
+
+
+def test_directory_cache_returns_root_before_background_scan_finishes():
+    adapter = BlockingTreeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    children = cache.list_dir("/flash")
+
+    assert [child.path for child in children] == ["/flash/lib", "/flash/main.py"]
+    assert adapter.dir_scan_started.wait(1)
+    assert adapter.list_calls["/flash"] == 1
+
+    adapter.release_dir_scan.set()
+    assert cache.wait_for_background_scan(2)
+    before = adapter.list_calls["/flash/lib"]
+    cached_children = cache.list_dir("/flash/lib")
+
+    assert [child.path for child in cached_children] == ["/flash/lib/pkg.py"]
+    assert adapter.list_calls["/flash/lib"] == before
+
+
+def test_directory_cache_invalidates_after_write():
+    adapter = BlockingTreeAdapter()
+    adapter.dirs = {"/flash"}
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    cache.list_dir("/flash")
+    assert adapter.list_calls["/flash"] == 1
+
+    cache.write_file("/flash/new.py", b"print(1)\n")
+    cache.list_dir("/flash")
+
+    assert adapter.list_calls["/flash"] == 2
+
+
+def test_directory_cache_primes_from_recursive_listing_without_incremental_ls():
+    adapter = RecursiveListingAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    assert cache.prime_from_recursive_listing()
+
+    assert adapter.recursive_calls == ["/flash"]
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/lib", "/flash/main.py"]
+    assert [child.path for child in cache.list_dir("/flash/lib")] == ["/flash/lib/pkg.py"]
+    assert cache.stat("/flash/lib/pkg.py") == DeviceFileStat(path="/flash/lib/pkg.py", is_dir=False, size=7)
+    assert adapter.list_calls == 0
+
+
+def test_directory_cache_discards_background_scan_after_delete_invalidation():
+    adapter = BlockingTreeAdapter()
+    adapter.dirs = {"/flash", "/flash/test"}
+    adapter.files = {"/flash/main.py": b"print('hello')\n"}
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    root_children = cache.list_dir("/flash")
+    assert [child.path for child in root_children] == ["/flash/test", "/flash/main.py"]
+    assert adapter.dir_scan_started.wait(1)
+
+    adapter.dirs.remove("/flash/test")
+    cache.delete("/flash/test")
+    adapter.release_dir_scan.set()
+    assert cache.wait_for_background_scan(2)
+
+    refreshed_children = cache.list_dir("/flash")
+
+    assert [child.path for child in refreshed_children] == ["/flash/main.py"]
+    assert cache.stat("/flash/test") is None
+
+
+def test_device_delete_treats_missing_after_false_result_as_success():
+    mp = DeleteReturnsFalseButRemovedMicroPython()
+    adapter = MicroPythonWebDavAdapter(mp)
+
+    adapter.delete("/test")
+
+    assert mp.fs_rm_calls == [("/test", True, False)]
+
+
+def test_device_delete_uses_rmdir_for_empty_directory_before_recursive_rm():
+    mp = EmptyDirRemoveMicroPython()
+    adapter = MicroPythonWebDavAdapter(mp)
+
+    adapter.delete("/test")
+
+    assert mp.fs_rm_calls == []
+
+
+def test_delete_is_idempotent_when_file_manager_retries_missing_path():
+    adapter = MissingOnDeleteAdapter()
+    server = _serve(adapter)
+    try:
+        status, _headers, body = _request(server, "DELETE", "/test")
+    finally:
+        server.shutdown()
+
+    assert status == 204
+    assert body == b""
 
 
 def test_put_writes_uploaded_body_to_device_path():
@@ -167,6 +470,25 @@ def test_put_writes_uploaded_body_to_device_path():
 
     assert status == 201
     assert adapter.writes == [("/flash/new.txt", b"abc")]
+
+
+def test_put_preserves_utf8_chinese_body_bytes():
+    adapter = FakeAdapter()
+    server = _serve(adapter)
+    body = "中文内容".encode("utf-8")
+    try:
+        status, _headers, _body = _request(
+            server,
+            "PUT",
+            "/cn.txt",
+            body=body,
+            headers={"Content-Length": str(len(body))},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 201
+    assert adapter.writes == [("/flash/cn.txt", body)]
 
 
 def test_move_uses_destination_header_path():

@@ -20,6 +20,7 @@ from .stubs import (
     list_stub_dirs,
     version_to_dir,
 )
+from ..utils.config import DEFAULT_BAUDRATE
 from ..utils.log import get_logger
 from ..utils.selector import interactive_select
 
@@ -28,7 +29,7 @@ log = get_logger(__name__)
 
 def detect_device_info(
     port: str,
-    baudrate: int = 115200,
+    baudrate: int = DEFAULT_BAUDRATE,
     timeout: int = 10,
 ) -> tuple[str, str]:
     """连接到 MicroPython 设备并自动检测硬件类型和固件版本。"""

@@ -24,6 +24,7 @@ log = get_logger(__name__)
 
 CONFIG_FILE = ".pyrite_config.json"
 DEFAULT_CHUNK_SIZE = 4096
+DEFAULT_BAUDRATE = 921600
 HASH_CONFIG_FILE = "pyrite_file_config.json"
 _HASH_VERSION = 1
 
@@ -108,6 +109,7 @@ def create_default_config() -> str:
             "auto_compile": True,
             "verify": "size",
             "max_retries": 2,
+            "baudrate": DEFAULT_BAUDRATE,
         }, indent=2),
         encoding="utf-8",
     )
@@ -117,4 +119,5 @@ def create_default_config() -> str:
     print("  auto_compile = true（自动编译 .py -> .mpy，设为 false 可关闭）")
     print('  verify = "size"（校验模式：off=不校验, size=文件大小, crc32=文件大小+CRC32）')
     print("  max_retries = 2（校验失败时最大重试次数，设为 0 关闭重试）")
+    print(f"  baudrate = {DEFAULT_BAUDRATE}（默认串口波特率，可按板子稳定性调整）")
     return str(cfg_path)

@@ -57,6 +57,12 @@ class DeviceFileStat:
 
 
 @dataclass(frozen=True)
+class DeviceFilesystemUsage:
+    used: int
+    free: int
+
+
+@dataclass(frozen=True)
 class MountRunExecutable:
     name: str
     body: bytes
@@ -338,6 +344,14 @@ class MicroPythonWebDavAdapter:
             )
         return result
 
+    def fs_usage(self) -> DeviceFilesystemUsage:
+        with self._lock:
+            usage = self._mp.fs_df()
+        return DeviceFilesystemUsage(
+            used=max(0, int(usage.get("used", 0))),
+            free=max(0, int(usage.get("free", 0))),
+        )
+
     def read_file(self, path: str) -> bytes:
         with self._lock:
             return self._mp._read_device_file(path)
@@ -408,7 +422,11 @@ def _http_date() -> str:
     return email.utils.formatdate(time.time(), usegmt=True)
 
 
-def _xml_response(stat: DeviceFileStat, href: str) -> ET.Element:
+def _xml_response(
+    stat: DeviceFileStat,
+    href: str,
+    usage: Optional[DeviceFilesystemUsage] = None,
+) -> ET.Element:
     response = ET.Element("{DAV:}response")
     ET.SubElement(response, "{DAV:}href").text = href + ("/" if stat.is_dir and href != "/" and not href.endswith("/") else "")
     propstat = ET.SubElement(response, "{DAV:}propstat")
@@ -422,6 +440,9 @@ def _xml_response(stat: DeviceFileStat, href: str) -> ET.Element:
         ET.SubElement(prop, "{DAV:}getcontenttype").text = "application/octet-stream"
     ET.SubElement(prop, "{DAV:}getlastmodified").text = _http_date()
     ET.SubElement(prop, "{DAV:}getetag").text = f'"{stat.size:x}-{abs(hash(stat.path)) & 0xffff:x}"'
+    if usage is not None:
+        ET.SubElement(prop, "{DAV:}quota-used-bytes").text = str(usage.used)
+        ET.SubElement(prop, "{DAV:}quota-available-bytes").text = str(usage.free)
     ET.SubElement(propstat, "{DAV:}status").text = "HTTP/1.1 200 OK"
     return response
 
@@ -567,6 +588,11 @@ class DirectoryCachingWebDavAdapter:
             elapsed_ms,
         )
         return True
+
+    def fs_usage(self) -> Optional[DeviceFilesystemUsage]:
+        if not hasattr(self._adapter, "fs_usage"):
+            return None
+        return self._adapter.fs_usage()
 
     def read_file(self, path: str) -> bytes:
         return self._adapter.read_file(path)
@@ -938,6 +964,23 @@ def make_webdav_handler(
                 return True
             return False
 
+        def _filesystem_usage(self, remote: str) -> Optional[DeviceFilesystemUsage]:
+            if remote != mapper.root or not hasattr(adapter, "fs_usage"):
+                return None
+            try:
+                usage = adapter.fs_usage()
+            except Exception as exc:
+                log.debug("WebDAV quota unavailable root=%s reason=%s", remote, exc)
+                return None
+            if usage is None:
+                return None
+            if isinstance(usage, DeviceFilesystemUsage):
+                return usage
+            return DeviceFilesystemUsage(
+                used=max(0, int(usage.get("used", 0))),
+                free=max(0, int(usage.get("free", 0))),
+            )
+
         def _list_children(self, remote: str) -> list[DeviceFileStat]:
             if getattr(adapter, "handles_empty_list_retry", False):
                 return adapter.list_dir(remote)
@@ -1007,7 +1050,7 @@ def make_webdav_handler(
                 return
             depth = self.headers.get("Depth", "1")
             multistatus = ET.Element("{DAV:}multistatus")
-            multistatus.append(_xml_response(stat, mapper.href_for(remote)))
+            multistatus.append(_xml_response(stat, mapper.href_for(remote), self._filesystem_usage(remote)))
             if stat.is_dir and depth != "0":
                 try:
                     children = self._list_children(remote)

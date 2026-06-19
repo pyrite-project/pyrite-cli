@@ -8,6 +8,8 @@ MicroPython 设备串口通信模块。
 from __future__ import annotations
 
 import binascii
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import os
 import re
 import shutil
@@ -16,14 +18,14 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import serial
 import serial.tools.list_ports
 
 from .ansi import _RESET
 from .compiler import _compile_files_parallel, _compile_to_mpy
-from .config import DEFAULT_CHUNK_SIZE, _load_config
+from .config import DEFAULT_BAUDRATE, DEFAULT_CHUNK_SIZE, _load_config
 from .log import TrafficMonitor, get_logger
 from .serial_transport import SerialTransport
 from .transport import Transport
@@ -36,6 +38,16 @@ except ImportError:
 
 # ── 模块日志器 ──
 log = get_logger(__name__)
+BATCH_ACK_EVERY = 8
+
+
+@dataclass
+class _PreparedFlashFile:
+    source_path: str
+    remote_path: str
+    local_path: str
+    content: bytes
+    size: int
 
 # ── 原始 REPL 协议常量 ──
 ENTER_RAW_REPL = b"\x01"
@@ -84,6 +96,9 @@ try:
     sys.stdout.write('READY')
 
     entries = FILES
+    ack_every = ACK_EVERY
+    ack_count = 0
+    total_left = sum(file_size for file_size, file_path in entries)
     for file_size, file_path in entries:
         with open(file_path, 'wb') as f:
             remaining = file_size
@@ -94,7 +109,10 @@ try:
                     f.write(d)
                     f.flush()
                     remaining -= len(d)
-                    sys.stdout.write('+')
+                    total_left -= len(d)
+                    ack_count += 1
+                    if ack_every and ack_count % ack_every == 0 and total_left:
+                        sys.stdout.write('+')
     micropython.kbd_intr(3)
 except Exception as e:
     sys.stdout.write('FLASH_ERR:' + str(e) + '\\n')
@@ -134,15 +152,15 @@ class MicroPython:
     def __init__(
         self,
         port: Optional[str] = None,
-        baudrate: int = 115200,
+        baudrate: int = DEFAULT_BAUDRATE,
         timeout: int = 10,
         transport: Optional["Transport"] = None,
     ) -> None:
         self.config: PyriteConfig = _load_config()
         self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.transport = transport or SerialTransport(port, baudrate, timeout)  # type: ignore[arg-type]
+        self.baudrate = baudrate or self.config.baudrate or DEFAULT_BAUDRATE
+        self.timeout = timeout or self.config.timeout or 10
+        self.transport = transport or SerialTransport(port, self.baudrate, self.timeout)  # type: ignore[arg-type]
         self._traffic_monitor: Optional[TrafficMonitor] = None
         self._suppress_traffic = False
 
@@ -188,6 +206,10 @@ class MicroPython:
             self.port = port
         if baudrate:
             self.baudrate = baudrate
+        if isinstance(self.transport, SerialTransport):
+            self.transport.port = self.port
+            self.transport.baudrate = self.baudrate
+            self.transport.timeout = self.timeout
         if not self.port:
             raise ValueError("未提供串口号，请先调用 scan_ports() 或指定 port")
 
@@ -661,6 +683,51 @@ class MicroPython:
         finally:
             self._suppress_traffic = False
 
+    def _send_data_with_sparse_ack(
+        self,
+        data_iter: Iterable[bytes],
+        total: int,
+        ack_every: int = BATCH_ACK_EVERY,
+        desc: str = "batch transfer",
+    ) -> None:
+        ack_every = max(1, ack_every)
+        self._suppress_traffic = True
+        try:
+            if self._traffic_monitor:
+                self._traffic_monitor.log.traffic(
+                    "TX", f"[data block {total} bytes]".encode()
+                )
+
+            sent = 0
+            chunks_since_ack = 0
+
+            def send_one(chunk: bytes) -> None:
+                nonlocal sent, chunks_since_ack
+                self._write(chunk)
+                sent += len(chunk)
+                chunks_since_ack += 1
+                if chunks_since_ack >= ack_every and sent < total:
+                    found, err_data = self._read_until_marker(b"+", timeout=10)
+                    if not found:
+                        raise RuntimeError(
+                            f"device write timeout, received: {err_data!r}"
+                        )
+                    chunks_since_ack = 0
+
+            if tqdm:
+                with tqdm(
+                    total=total, desc=desc, unit="B",
+                    unit_scale=True, leave=False,
+                ) as pbar:
+                    for chunk in data_iter:
+                        send_one(chunk)
+                        pbar.update(len(chunk))
+            else:
+                for chunk in data_iter:
+                    send_one(chunk)
+        finally:
+            self._suppress_traffic = False
+
     # ═══════════════════════════════════════════════════════════════
     # 校验
     # ═══════════════════════════════════════════════════════════════
@@ -739,6 +806,104 @@ class MicroPython:
     # 单文件刷入
     # ═══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _remote_dirs_for_paths(remote_paths: Sequence[str]) -> List[str]:
+        seen: Set[str] = set()
+        dirs: List[str] = []
+        for remote_path in remote_paths:
+            normalized = remote_path.replace("\\", "/").rstrip("/")
+            parent = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+            if not parent or parent in (".", "/"):
+                continue
+
+            absolute = parent.startswith("/")
+            parts = [p for p in parent.split("/") if p]
+            current = "/" if absolute else ""
+            for part in parts:
+                if absolute:
+                    current = "/" + part if current == "/" else current + "/" + part
+                else:
+                    current = part if not current else current + "/" + part
+                if current not in seen:
+                    seen.add(current)
+                    dirs.append(current)
+        return dirs
+
+    def _mkdirs_on_device(self, remote_paths: Sequence[str]) -> None:
+        dirs = self._remote_dirs_for_paths(remote_paths)
+        if not dirs:
+            return
+        self._execute(
+            "import os\n"
+            f"for d in {dirs!r}:\n"
+            "    try:\n"
+            "        os.mkdir(d)\n"
+            "    except OSError:\n"
+            "        pass\n",
+            timeout=max(3, len(dirs) // 4 + 3),
+        )
+
+    def _verify_files_on_device_batch(
+        self,
+        file_meta: Sequence[Tuple[str, int]],
+        verify_mode: str = "size",
+        expected_crcs: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, bool]:
+        if verify_mode == "off":
+            return {remote_path: True for remote_path, _size in file_meta}
+
+        expected_crcs = expected_crcs or {}
+        indexed_entries = [
+            (idx, remote_path, size, expected_crcs.get(remote_path))
+            for idx, (remote_path, size) in enumerate(file_meta)
+        ]
+        script = (
+            "import os,gc\n"
+            "try:\n"
+            " import ubinascii\n"
+            "except Exception:\n"
+            " ubinascii=None\n"
+            f"entries = {indexed_entries!r}\n"
+            f"mode = {verify_mode!r}\n"
+            "for idx,path,exp_size,exp_crc in entries:\n"
+            " try:\n"
+            "  actual=os.stat(path)[6]\n"
+            "  ok=(actual==exp_size)\n"
+            "  crc=-1\n"
+            "  if ok and mode=='crc32' and exp_crc is not None:\n"
+            "   if ubinascii is None:\n"
+            "    print('OK',idx)\n"
+            "    continue\n"
+            "   crc=0\n"
+            "   with open(path,'rb') as f:\n"
+            "    while True:\n"
+            "     gc.collect()\n"
+            "     chunk=f.read(4096)\n"
+            "     if not chunk: break\n"
+            "     crc=ubinascii.crc32(chunk,crc)\n"
+            "   crc=crc&0xffffffff\n"
+            "   ok=(crc==exp_crc)\n"
+            "  print('OK '+str(idx) if ok else 'BAD '+str(idx)+' '+str(actual)+' '+str(crc))\n"
+            " except Exception as e:\n"
+            "  print('ERR '+str(idx)+' '+str(e))\n"
+        )
+        timeout = max(5, len(indexed_entries) * (8 if verify_mode == "crc32" else 1))
+        out = self._execute(script, timeout=timeout)
+        result = {remote_path: False for remote_path, _size in file_meta}
+        idx_to_path = {idx: remote_path for idx, remote_path, _size, _crc in indexed_entries}
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2 or parts[0] not in {"OK", "BAD", "ERR"}:
+                continue
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                continue
+            remote_path = idx_to_path.get(idx)
+            if remote_path is not None:
+                result[remote_path] = parts[0] == "OK"
+        return result
+
     def flash_file(
         self,
         local_path: str,
@@ -788,12 +953,14 @@ class MicroPython:
         if should_compile and actual_local.endswith(".py"):
             mpy_path, tmp_dir = _compile_to_mpy(actual_local, bytecode_ver, arch)
             if mpy_path:
-                tmp_dirs.append(tmp_dir)
+                if tmp_dir:
+                    tmp_dirs.append(tmp_dir)
                 actual_local = mpy_path
                 if not actual_remote.endswith(".mpy"):
                     actual_remote = actual_remote[:-3] + ".mpy"
 
         file_size = os.path.getsize(actual_local)
+        chunk_size = self.config.chunk_size or DEFAULT_CHUNK_SIZE
         verify_mode = self.config.verify
         max_retries = self.config.max_retries
 
@@ -805,7 +972,7 @@ class MicroPython:
 
         log.info(
             "刷入: %s → %s (%d 字节, 块=%d)",
-            local_path, actual_remote, file_size, DEFAULT_CHUNK_SIZE,
+            local_path, actual_remote, file_size, chunk_size,
         )
 
         if dry_run:
@@ -814,7 +981,7 @@ class MicroPython:
 
         script = (
             FLASH.replace("FILE", repr(actual_remote))
-            .replace("BFSIZE", str(DEFAULT_CHUNK_SIZE))
+            .replace("BFSIZE", str(chunk_size))
             .replace("FSIZE", str(file_size))
         )
 
@@ -824,14 +991,7 @@ class MicroPython:
                 self._enter_raw_repl()
 
                 # 创建远程目录
-                remote_dir = actual_remote.rsplit("/", 1)[0]
-                if remote_dir:
-                    self._execute(
-                        "import os\n"
-                        f"try:\n os.mkdir({remote_dir!r})\n"
-                        f"except OSError:\n pass\n",
-                        timeout=3,
-                    )
+                self._mkdirs_on_device([actual_remote])
 
                 for attempt in range(max_retries + 1):
                     if attempt > 0:
@@ -849,7 +1009,7 @@ class MicroPython:
                         def _file_chunks() -> Any:
                             with open(actual_local, "rb") as f:
                                 while True:
-                                    chunk = f.read(DEFAULT_CHUNK_SIZE)
+                                    chunk = f.read(chunk_size)
                                     if not chunk:
                                         break
                                     yield chunk
@@ -897,6 +1057,252 @@ class MicroPython:
     # 批量刷入
     # ═══════════════════════════════════════════════════════════════
 
+    def flash_entries(
+        self,
+        entries: Sequence[Tuple[str, str]],
+        bytecode_ver: Optional[int] = None,
+        arch: Optional[str] = None,
+        active_tags: Optional[Set[str]] = None,
+        dry_run: bool = False,
+    ) -> List[Tuple[str, str, bool]]:
+        tmp_dirs: List[str] = []
+        verify_mode = self.config.verify
+        chunk_size = self.config.chunk_size or DEFAULT_CHUNK_SIZE
+        expected_crcs: Dict[str, int] = {}
+        t0_prepare = time.time()
+
+        try:
+            prep: List[Tuple[str, str, str, bool]] = []
+            for lp, rp in entries:
+                if Path(rp).name == "manifest.py" or lp.endswith(".pyi"):
+                    continue
+                actual_local = lp
+                actual_remote = rp.replace("\\", "/")
+                if active_tags and actual_local.endswith(".py"):
+                    from .preprocessor import preprocess
+
+                    pp_dir = tempfile.mkdtemp()
+                    os.chmod(pp_dir, 0o700)
+                    tmp_dirs.append(pp_dir)
+                    pp_path = os.path.join(pp_dir, Path(actual_local).name)
+                    Path(pp_path).write_text(
+                        preprocess(
+                            Path(actual_local).read_text(encoding="utf-8"),
+                            active_tags,
+                            actual_local,
+                        ),
+                        encoding="utf-8",
+                    )
+                    actual_local = pp_path
+
+                basename = Path(actual_remote).name
+                needs_compile = (
+                    self.config.auto_compile
+                    and basename not in ("main.py", "boot.py")
+                    and actual_local.endswith(".py")
+                )
+                prep.append((lp, actual_local, actual_remote, needs_compile))
+
+            compile_jobs = [actual for _src, actual, _remote, needs in prep if needs]
+            t0_compile = time.time()
+            compiled = _compile_files_parallel(compile_jobs, bytecode_ver, arch)
+            compile_elapsed = time.time() - t0_compile
+
+            final_jobs: List[Tuple[str, str, str]] = []
+            for source_local, actual_local, actual_remote, needs_compile in prep:
+                if needs_compile and actual_local in compiled:
+                    mpy_path, mpy_tmp_dir = compiled[actual_local]
+                    if mpy_path:
+                        if mpy_tmp_dir:
+                            tmp_dirs.append(mpy_tmp_dir)
+                        actual_local = mpy_path
+                        if not actual_remote.endswith(".mpy"):
+                            actual_remote = actual_remote[:-3] + ".mpy"
+                final_jobs.append((source_local, actual_local, actual_remote))
+
+            def read_one(job: Tuple[str, str, str]) -> _PreparedFlashFile:
+                source_local, actual_local, actual_remote = job
+                content = Path(actual_local).read_bytes()
+                return _PreparedFlashFile(
+                    source_path=source_local,
+                    remote_path=actual_remote,
+                    local_path=actual_local,
+                    content=content,
+                    size=len(content),
+                )
+
+            prepared_by_index: Dict[int, _PreparedFlashFile] = {}
+            workers = min(8, max(1, len(final_jobs)))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(read_one, job): idx
+                    for idx, job in enumerate(final_jobs)
+                }
+                for future in as_completed(future_map):
+                    prepared_by_index[future_map[future]] = future.result()
+            prepared = [
+                prepared_by_index[idx]
+                for idx in range(len(final_jobs))
+                if idx in prepared_by_index
+            ]
+
+            if verify_mode == "crc32":
+                with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as executor:
+                    future_map = {
+                        executor.submit(self._compute_crc32, item.content): item.remote_path
+                        for item in prepared
+                    }
+                    for future in as_completed(future_map):
+                        expected_crcs[future_map[future]] = future.result()
+
+            if not prepared:
+                log.info("No files to flash")
+                return []
+
+            all_data = b"".join(item.content for item in prepared)
+            file_meta = [(item.size, item.remote_path) for item in prepared]
+            verify_meta = [(item.remote_path, item.size) for item in prepared]
+            prepare_elapsed = time.time() - t0_prepare
+            log.debug(
+                "flash prepare: files=%d bytes=%d prepare=%.3fs compile=%.3fs",
+                len(prepared),
+                len(all_data),
+                prepare_elapsed,
+                compile_elapsed,
+            )
+
+            if dry_run:
+                log.info("[DRY-RUN] would flash %d files", len(prepared))
+                for item in prepared:
+                    log.info(
+                        "  %s -> %s (%d bytes)",
+                        item.source_path,
+                        item.remote_path,
+                        item.size,
+                    )
+                return []
+
+            script = (
+                FLASH_PROGRAM.replace("FILES", repr(file_meta))
+                .replace("BFSIZE", str(chunk_size))
+                .replace("ACK_EVERY", str(BATCH_ACK_EVERY))
+            )
+            max_retries = self.config.max_retries
+            transfer_t0 = time.time()
+
+            for attempt in range(max_retries + 1):
+                self._enter_raw_repl()
+                if attempt > 0:
+                    log.warning("retry %d/%d", attempt, max_retries)
+
+                self._mkdirs_on_device([item.remote_path for item in prepared])
+
+                with self._traffic_log_ctx():
+                    log.info("Batch flashing %d files", len(prepared))
+                    for item in prepared:
+                        log.debug(
+                            "  %s -> %s (%d bytes)",
+                            item.source_path,
+                            item.remote_path,
+                            item.size,
+                        )
+
+                    try:
+                        self._write(script.encode() + SET_EXECUTE)
+                        found, err_data = self._read_until_marker(b"READY", timeout=30)
+                        if not found:
+                            raise RuntimeError(f"device not ready: {err_data!r}")
+
+                        total_data_size = len(all_data)
+                        self._send_data_with_sparse_ack(
+                            (
+                                all_data[i : i + chunk_size]
+                                for i in range(0, total_data_size, chunk_size)
+                            ),
+                            total_data_size,
+                        )
+
+                        found, _err_data = self._read_until_marker(b">", timeout=10)
+                        if not found:
+                            elapsed = time.time() - transfer_t0
+                            rate = total_data_size / elapsed / 1024 if elapsed > 0 else 0
+                            log.warning(
+                                "flash completed but prompt was not received; skipping verification"
+                            )
+                            log.info(
+                                "Flash complete without verification: %.1f KB, %d files, %.1fs, %.0f KB/s",
+                                total_data_size / 1024,
+                                len(prepared),
+                                elapsed,
+                                rate,
+                            )
+                            return [
+                                (item.source_path, item.remote_path, True)
+                                for item in prepared
+                            ]
+
+                        if verify_mode != "off":
+                            verify_results = self._verify_files_on_device_batch(
+                                verify_meta,
+                                verify_mode,
+                                expected_crcs,
+                            )
+                            failed = [
+                                item
+                                for item in prepared
+                                if not verify_results.get(item.remote_path, False)
+                            ]
+                            if failed:
+                                if attempt >= max_retries:
+                                    log.error(
+                                        "%d files failed verification after retries",
+                                        len(failed),
+                                    )
+                                    return [
+                                        (
+                                            item.source_path,
+                                            item.remote_path,
+                                            item not in failed,
+                                        )
+                                        for item in prepared
+                                    ]
+                                log.warning(
+                                    "%d files failed verification; retrying batch",
+                                    len(failed),
+                                )
+                                continue
+
+                        elapsed = time.time() - transfer_t0
+                        rate = total_data_size / elapsed / 1024 if elapsed > 0 else 0
+                        log.info(
+                            "Batch flash successful: %.1f KB, %d files, %.1fs, %.0f KB/s",
+                            total_data_size / 1024,
+                            len(prepared),
+                            elapsed,
+                            rate,
+                        )
+                        return [
+                            (item.source_path, item.remote_path, True)
+                            for item in prepared
+                        ]
+
+                    except (serial.SerialException, ConnectionError) as e:
+                        if attempt >= max_retries:
+                            log.error("Batch flash failed: %s", e)
+                            return [
+                                (item.source_path, item.remote_path, False)
+                                for item in prepared
+                            ]
+                        log.warning(
+                            "transfer error; retrying (%d/%d)",
+                            attempt + 1,
+                            max_retries,
+                        )
+            return []
+        finally:
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
     def flash_program(
         self,
         local_dir: str,
@@ -928,211 +1334,14 @@ class MicroPython:
                     ).replace("\\", "/")
                     entries.append((lp, rp))
 
-        # 预处理、编译、读取内容
-        tmp_dirs: List[str] = []
-        file_list: List[Tuple[str, str, int]] = []
-        file_meta: List[Tuple[int, str]] = []
-        all_data = b""
-        verify_mode = self.config.verify
-        expected_crcs: Dict[str, int] = {}
-
-        # 第一轮：预处理
-        prep: List[Tuple[str, str, bool]] = []
-        for lp, rp in entries:
-            if Path(rp).name == "manifest.py" or lp.endswith(".pyi"):
-                continue
-            actual_local = lp
-            actual_remote = rp
-            if active_tags and actual_local.endswith(".py"):
-                from .preprocessor import preprocess
-
-                pp_dir = tempfile.mkdtemp()
-                os.chmod(pp_dir, 0o700)
-                tmp_dirs.append(pp_dir)
-                pp_path = os.path.join(pp_dir, Path(actual_local).name)
-                Path(pp_path).write_text(
-                    preprocess(
-                        Path(actual_local).read_text(encoding="utf-8"),
-                        active_tags, actual_local,
-                    ),
-                    encoding="utf-8",
-                )
-                actual_local = pp_path
-            basename = Path(actual_remote).name
-            needs_compile = (
-                self.config.auto_compile
-                and basename not in ("main.py", "boot.py")
-                and actual_local.endswith(".py")
-            )
-            prep.append((actual_local, actual_remote, needs_compile))
-
-        # 第二轮：并行编译
-        compile_jobs = [al for al, _, needs in prep if needs]
-        compiled = _compile_files_parallel(compile_jobs, bytecode_ver, arch)
-
-        # 第三轮：读取并构建文件列表
-        for actual_local, actual_remote, needs_compile in prep:
-            if needs_compile and actual_local in compiled:
-                mpy_path, mpy_tmp_dir = compiled[actual_local]
-                if mpy_path:
-                    tmp_dirs.append(mpy_tmp_dir)
-                    actual_local = mpy_path
-                    if not actual_remote.endswith(".mpy"):
-                        actual_remote = actual_remote[:-3] + ".mpy"
-
-            with open(actual_local, "rb") as f:
-                content = f.read()
-            file_list.append((actual_remote, actual_local, len(content)))
-            if verify_mode == "crc32":
-                expected_crcs[actual_remote] = self._compute_crc32(content)
-            all_data += content
-            file_meta.append((len(content), actual_remote))
-
-        if not file_list:
-            log.info("没有需要刷入的文件 (%s)", local_dir)
-            return []
-
-        _t0 = time.time()
-        if dry_run:
-            log.info("[DRY-RUN] 将批量刷入 %d 个文件:", len(file_list))
-            for rp, lp, sz in file_list:
-                log.info("  %s → %s (%d 字节)", lp, rp, sz)
-            return []
-
-        script = FLASH_PROGRAM.replace("FILES", repr(file_meta)).replace(
-            "BFSIZE", str(DEFAULT_CHUNK_SIZE),
+        return self.flash_entries(
+            entries,
+            bytecode_ver=bytecode_ver,
+            arch=arch,
+            active_tags=active_tags,
+            dry_run=dry_run,
         )
-        max_retries = self.config.max_retries
 
-        try:
-            for attempt in range(max_retries + 1):
-                self._enter_raw_repl()
-
-                if attempt > 0:
-                    log.warning("重试 %d/%d", attempt, max_retries)
-
-                # 批量创建目录
-                dirs = sorted({
-                    os.path.dirname(rp)
-                    for rp, _, _ in file_list
-                    if os.path.dirname(rp)
-                })
-                if dirs:
-                    mkdir_cmds = (
-                        "import os\n"
-                        f"for d in {dirs!r}:\n"
-                        "    try:\n"
-                        "        os.mkdir(d)\n"
-                        "    except OSError:\n"
-                        "        pass\n"
-                    )
-                    self._execute(mkdir_cmds)
-
-                with self._traffic_log_ctx():
-                    log.info("批量刷入 %d 个文件:", len(file_list))
-                    for rp, lp, sz in file_list:
-                        log.debug("  %s → %s (%d 字节)", lp, rp, sz)
-
-                    try:
-                        self._write(script.encode() + SET_EXECUTE)
-                        found, err_data = self._read_until_marker(b"READY", timeout=30)
-                        if not found:
-                            raise RuntimeError(f"设备未就绪: {err_data!r}")
-
-                        total_data_size = len(all_data)
-                        self._send_data_with_ack(
-                            (
-                                all_data[i : i + DEFAULT_CHUNK_SIZE]
-                                for i in range(0, total_data_size, DEFAULT_CHUNK_SIZE)
-                            ),
-                            total_data_size,
-                        )
-
-                        # 等待刷入完成
-                        found, err_data = self._read_until_marker(b">", timeout=10)
-                        if not found:
-                            total_size = len(all_data)
-                            elapsed = time.time() - _t0
-                            rate = total_size / elapsed / 1024 if elapsed > 0 else 0
-                            log.warning("刷入完成但设备未返回确认，跳过校验")
-                            log.info(
-                                "刷入成功 (校验已跳过): %.1f KB, %d 个文件, %.1fs, %.0f KB/s",
-                                total_size / 1024, len(file_list), elapsed, rate,
-                            )
-                            return [
-                                (lp, rp, True) for (rp, lp, sz) in file_list
-                            ]
-
-                        # 校验
-                        if verify_mode != "off":
-                            failed_files: List[Tuple[str, str]] = []
-                            for rp, lp, sz in file_list:
-                                ok = self._verify_file_on_device(
-                                    rp, sz, verify_mode, expected_crcs.get(rp),
-                                )
-                                if not ok:
-                                    failed_files.append((lp, rp))
-
-                            if failed_files:
-                                if attempt >= max_retries:
-                                    log.error(
-                                        "%d 个文件校验失败，重试耗尽",
-                                        len(failed_files),
-                                    )
-                                    return [
-                                        (lp2, rp2, False)
-                                        for (rp2, lp2, sz2) in file_list
-                                    ]
-
-                                log.warning(
-                                    "%d 个文件校验失败，逐文件重试...",
-                                    len(failed_files),
-                                )
-                                retry_ok = 0
-                                for lp, rp in failed_files:
-                                    try:
-                                        self.flash_file(
-                                            lp, rp, compile=False,
-                                            bytecode_ver=bytecode_ver, arch=arch,
-                                            active_tags=active_tags,
-                                        )
-                                        retry_ok += 1
-                                    except Exception as e2:
-                                        log.error("逐文件重试失败 %s: %s", rp, e2)
-                                if retry_ok == len(failed_files):
-                                    log.info("全部逐文件重试成功")
-                                    break
-                                continue
-
-                        total_size = len(all_data)
-                        elapsed = time.time() - _t0
-                        rate = total_size / elapsed / 1024 if elapsed > 0 else 0
-                        log.info(
-                            "批量刷入成功: %.1f KB, %d 个文件, %.1fs, %.0f KB/s",
-                            total_size / 1024, len(file_list), elapsed, rate,
-                        )
-                        return [
-                            (lp, rp, True) for (rp, lp, sz) in file_list
-                        ]
-
-                    except (serial.SerialException, ConnectionError) as e:
-                        if attempt >= max_retries:
-                            log.error("批量刷入失败: %s", e)
-                            return [
-                                (lp, rp, False)
-                                for (rp, lp, sz) in file_list
-                            ]
-                        log.warning(
-                            "刷入过程异常，准备重试 (%d/%d)...",
-                            attempt + 1, max_retries,
-                        )
-        finally:
-            for d in tmp_dirs:
-                shutil.rmtree(d, ignore_errors=True)
-
-        return []
-
-    # ═══════════════════════════════════════════════════════════════
     # 设备信息查询
     # ═══════════════════════════════════════════════════════════════
 

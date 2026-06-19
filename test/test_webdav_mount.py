@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from cli.main import app
 from cli.utils import webdav_mount
+from cli.utils.config import DEFAULT_BAUDRATE
 from cli.utils.webdav_mount import (
     DeviceFileStat,
     DevicePathMapper,
@@ -46,6 +47,7 @@ class FakeAdapter:
         self.writes = []
         self.moves = []
         self.operations = []
+        self.usage = {"total": 1024, "used": 256, "free": 768}
 
     def stat(self, path: str):
         if path in self.dirs:
@@ -64,6 +66,9 @@ class FakeAdapter:
             and "/" not in file_path[len(path.rstrip("/") + "/"):]
         )
         return children
+
+    def fs_usage(self):
+        return self.usage
 
     def read_file(self, path: str) -> bytes:
         return self.files[path]
@@ -326,6 +331,21 @@ def test_propfind_depth_one_lists_directory_children():
     assert "<D:href>/</D:href>" in text
     assert "<D:href>/main.py</D:href>" in text
     assert "<D:getcontentlength>15</D:getcontentlength>" in text
+
+
+def test_propfind_root_reports_real_device_flash_quota():
+    adapter = FakeAdapter()
+    adapter.usage = {"total": 4096, "used": 1536, "free": 2560}
+    server = _serve(adapter)
+    try:
+        status, _headers, body = _request(server, "PROPFIND", "/", headers={"Depth": "0"})
+    finally:
+        server.shutdown()
+
+    text = body.decode("utf-8")
+    assert status == 207
+    assert "<D:quota-used-bytes>1536</D:quota-used-bytes>" in text
+    assert "<D:quota-available-bytes>2560</D:quota-available-bytes>" in text
 
 
 def test_propfind_injects_run_trigger_file():
@@ -942,7 +962,7 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
         ])
 
     assert result.exit_code == 0
-    factory.assert_called_once_with("COM4", 115200, 10, "ws://esp32.local:8266", "secret")
+    factory.assert_called_once_with("COM4", DEFAULT_BAUDRATE, 10, "ws://esp32.local:8266", "secret")
     mp.connect.assert_called_once()
     serve.assert_called_once()
     assert serve.call_args.args[1].startup_empty_list_grace == 12.5

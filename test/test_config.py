@@ -8,6 +8,7 @@ from cli.utils.config import (
     _load_config,
     create_default_config,
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_BAUDRATE,
     CONFIG_FILE,
 )
 
@@ -29,6 +30,7 @@ class TestLoadConfig:
         assert cfg.auto_compile is True
         assert cfg.verify == "size"
         assert cfg.max_retries == 2
+        assert cfg.baudrate == DEFAULT_BAUDRATE
         assert "ESP32" in cfg.board_tags
 
     def test_custom_chunk_size(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -81,6 +83,11 @@ class TestLoadConfig:
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {"max_retries": 0})
         assert _load_config().max_retries == 0
+
+    def test_custom_baudrate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"baudrate": 1500000})
+        assert _load_config().baudrate == 1500000
 
     def test_negative_max_retries_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
@@ -138,6 +145,7 @@ class TestCreateDefaultConfig:
         assert data["verify"] == "size"
         assert data["download_threads"] == 4
         assert data["auto_compile"] is True
+        assert data["baudrate"] == DEFAULT_BAUDRATE
 
     def test_default_config_is_loadable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)

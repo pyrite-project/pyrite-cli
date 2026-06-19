@@ -10,5 +10,5 @@ class PyriteConfig:
     verify: str = "size"
     max_retries: int = 2
     board_tags: Dict[str, List[str]] = field(default_factory=dict)
-    baudrate: int = 0  # 0 means use CLI default
+    baudrate: int = 921600
     timeout: int = 0  # 0 means use CLI default

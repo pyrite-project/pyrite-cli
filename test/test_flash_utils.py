@@ -1,11 +1,14 @@
 import os
 import binascii
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from cli.utils.flash import MicroPython, _colorize_repl_output
-from cli.project.sync import compute_file_hash
+from cli.project.sync import ProjectSyncManager, compute_file_hash
+from cli.utils.compiler import _compile_to_mpy
 
 # ── _colorize_repl_output ───────────────────────────────────────────
 
@@ -137,6 +140,136 @@ class TestFilesystemMountGuard:
         assert "b=b[0]" in code
         assert "os.VfsLfs2(b)" in code
         assert kwargs == {"timeout": 5, "raise_on_error": False}
+
+
+class TestFlashBatchHelpers:
+    def test_remote_dirs_expand_nested_parents(self):
+        dirs = MicroPython._remote_dirs_for_paths([
+            "/app/main.py",
+            "/app/lib/drivers/sensor.py",
+            "pkg/mod.py",
+        ])
+
+        assert dirs == [
+            "/app",
+            "/app/lib",
+            "/app/lib/drivers",
+            "pkg",
+        ]
+
+    def test_batch_verify_parses_single_repl_response(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        calls = []
+
+        def fake_execute(code, **kwargs):
+            calls.append((code, kwargs))
+            return "OK 0\nBAD 1 3 -1\nERR 2 OSError"
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+
+        result = mp._verify_files_on_device_batch(
+            [
+                ("/ok.py", 2),
+                ("/bad.py", 4),
+                ("/err.py", 1),
+            ],
+            "size",
+            {},
+        )
+
+        assert result == {
+            "/ok.py": True,
+            "/bad.py": False,
+            "/err.py": False,
+        }
+        assert len(calls) == 1
+        assert "entries =" in calls[0][0]
+        assert calls[0][1]["timeout"] >= 5
+
+
+class TestCompilerCache:
+    def test_compile_to_mpy_reuses_cache(self, tmp_path: Path, monkeypatch):
+        source = tmp_path / "main.py"
+        source.write_text("print('cached')\n", encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+        calls = []
+
+        class FakeRunResult:
+            returncode = 0
+
+            def __init__(self, out_path: str):
+                self.stderr = MagicMock()
+                self.stderr.read.return_value = b""
+                self._out_path = out_path
+
+            def wait(self, timeout: int):
+                Path(self._out_path).write_bytes(b"compiled")
+
+        class FakeMpyCross:
+            __version__ = "9.9"
+
+            @staticmethod
+            def set_version(**_kwargs):
+                return None
+
+            @staticmethod
+            def run(*args, **_kwargs):
+                calls.append(args)
+                out_path = args[args.index("-o") + 1]
+                return FakeRunResult(out_path)
+
+        monkeypatch.setitem(sys.modules, "mpy_cross", FakeMpyCross)
+
+        first_path, first_tmp = _compile_to_mpy(
+            str(source), bytecode_ver=6, arch="xtensa", cache_dir=str(cache_dir)
+        )
+        second_path, second_tmp = _compile_to_mpy(
+            str(source), bytecode_ver=6, arch="xtensa", cache_dir=str(cache_dir)
+        )
+
+        assert Path(first_path).read_bytes() == b"compiled"
+        assert first_path == second_path
+        assert first_tmp is None
+        assert second_tmp is None
+        assert len(calls) == 1
+
+
+class TestProjectFlashBatching:
+    def test_project_flash_batches_changed_files(self, tmp_path: Path):
+        (tmp_path / "main.py").write_text("print('new')\n", encoding="utf-8")
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "sensor.py").write_text("print('sensor')\n", encoding="utf-8")
+
+        hash_config = tmp_path / "pyrite_file_config.json"
+        hash_config.write_text(
+            '{"version": 1, "hash_algorithm": "sha256", "files": {"main.py": "old"}}',
+            encoding="utf-8",
+        )
+
+        mp = MagicMock()
+        mp.flash_entries.return_value = [
+            (str(tmp_path / "main.py"), "/app/main.py", True),
+            (str(tmp_path / "lib" / "sensor.py"), "/app/lib/sensor.py", True),
+        ]
+
+        results = ProjectSyncManager(mp).flash(
+            str(tmp_path),
+            "/app",
+            hash_config_path=str(hash_config),
+            bytecode_ver=6,
+            arch="xtensa",
+        )
+
+        assert results == mp.flash_entries.return_value
+        mp.flash_entries.assert_called_once()
+        entries = mp.flash_entries.call_args.args[0]
+        assert entries == [
+            (str(tmp_path / "main.py"), "/app/main.py"),
+            (str(tmp_path / "lib" / "sensor.py"), "/app/lib/sensor.py"),
+        ]
+        assert mp.flash_entries.call_args.kwargs["bytecode_ver"] == 6
+        assert mp.flash_entries.call_args.kwargs["arch"] == "xtensa"
+        mp.flash_file.assert_not_called()
 
 
 # ── _compute_file_hash ──────────────────────────────────────────────

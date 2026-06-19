@@ -14,6 +14,7 @@ import serial
 
 from .log import get_logger
 from .transport import Transport
+from .config import DEFAULT_BAUDRATE
 
 log = get_logger(__name__)
 
@@ -24,7 +25,7 @@ class SerialTransport(Transport):
     def __init__(
         self,
         port: Optional[str] = None,
-        baudrate: int = 115200,
+        baudrate: int = DEFAULT_BAUDRATE,
         timeout: int = 10,
     ) -> None:
         super().__init__()

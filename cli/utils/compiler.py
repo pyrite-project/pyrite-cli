@@ -7,6 +7,7 @@ mpy-cross 编译器封装 — 单文件编译与并行编译。
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,8 +25,37 @@ def _compile_to_mpy(
     local_path: str,
     bytecode_ver: Optional[int] = None,
     arch: Optional[str] = None,
+    cache_dir: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """编译 .py → .mpy，返回 ``(mpy_path, tmp_dir)``；失败返回 ``(None, None)``。"""
+    try:
+        import mpy_cross
+    except ImportError:
+        log.info("mpy-cross not found, skip compile: %s", local_path)
+        return None, None
+
+    mpy_version = str(getattr(mpy_cross, "__version__", "unknown"))
+    h = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        while True:
+            chunk = f.read(1048576)
+            if not chunk:
+                break
+            h.update(chunk)
+    h.update(
+        f"|bytecode={bytecode_ver or ''}|arch={arch or ''}|mpy={mpy_version}".encode()
+    )
+    cache_root = Path(
+        cache_dir
+        or os.environ.get("PYRITE_MPY_CACHE_DIR", "")
+        or (Path.cwd() / ".pyrite_cache" / "mpy")
+    )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cached_path = cache_root / f"{Path(local_path).stem}-{h.hexdigest()[:16]}.mpy"
+    if cached_path.exists():
+        log.trace("mpy cache hit: %s", cached_path)
+        return str(cached_path), None
+
     tmp_dir = tempfile.mkdtemp()
     os.chmod(tmp_dir, 0o700)
     out_path = os.path.join(tmp_dir, Path(local_path).stem + ".mpy")
@@ -33,15 +63,15 @@ def _compile_to_mpy(
     if arch is not None:
         args += [f"-march={arch}"]
     try:
-        import mpy_cross
-
         if bytecode_ver is not None:
             mpy_cross.set_version(micropython=None, bytecode=str(bytecode_ver))
         r = mpy_cross.run(*args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         r.wait(timeout=30)
         if r.returncode == 0:
             log.trace("编译成功: %s → %s", local_path, out_path)
-            return out_path, tmp_dir
+            shutil.copy2(out_path, cached_path)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return str(cached_path), None
         err_msg = r.stderr.read().decode(errors="replace").strip()
         log.warning("mpy-cross 编译失败，回退到 .py: %s", err_msg)
     except ImportError:

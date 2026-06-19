@@ -176,24 +176,23 @@ class ProjectSyncManager:
             log.info("[DRY-RUN] 以上 %d 个文件将被刷入（未实际执行）", len(changed))
             return []
 
-        results: List[Tuple[str, str, bool]] = []
-        ok = fail = 0
+        try:
+            results = self.mp.flash_entries(
+                [(lp, remote_path) for lp, remote_path, _reason in changed],
+                bytecode_ver=bytecode_ver,
+                arch=arch,
+                active_tags=active_tags,
+                dry_run=False,
+            )
+        except Exception as e:
+            log.error("batch flash failed: %s", e)
+            results = [
+                (lp, remote_path, False)
+                for lp, remote_path, _reason in changed
+            ]
 
-        for lp, remote_path, _reason in changed:
-            try:
-                self.mp.flash_file(
-                    lp, remote_path,
-                    compile=None,
-                    bytecode_ver=bytecode_ver,
-                    arch=arch,
-                    active_tags=active_tags,
-                )
-                results.append((lp, remote_path, True))
-                ok += 1
-            except Exception as e:
-                log.error("刷入失败 %s: %s", remote_path, e)
-                results.append((lp, remote_path, False))
-                fail += 1
+        ok = sum(1 for _lp, _rp, success in results if success)
+        fail = sum(1 for _lp, _rp, success in results if not success)
 
         if ok > 0:
             updated: Dict[str, str] = {}

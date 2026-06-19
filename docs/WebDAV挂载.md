@@ -98,6 +98,12 @@ pyrcli mount COM4 --startup-empty-list-grace 10
 
 如果设备确实是空文件系统，保护窗口结束后会正常显示空目录。
 
+### Flash 使用率
+
+`pyrcli mount` 会在 WebDAV 根目录的 `PROPFIND` 响应里返回 `quota-used-bytes` 和 `quota-available-bytes`。这两个值来自设备端 `os.statvfs('/')`，也就是 `pyrcli fs df` 使用的同一套真实文件系统空间统计；它不是 PC 端目录缓存大小，也不是通过列目录累加出来的估算值。
+
+不同系统文件管理器对 WebDAV quota 字段的展示方式不同：有的会显示容量/可用空间，有的只在属性面板或挂载信息里使用这些字段。
+
 ### 通过当前 mount 会话运行脚本
 
 `pyrcli mount` 会在 WebDAV 根目录注入一个受保护的虚拟可执行文件。文件名按当前系统选择：

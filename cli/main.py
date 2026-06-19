@@ -23,7 +23,7 @@ from . import __version__
 
 from .project.project import init_stubs, new_project_interactive
 from .project.sync import ProjectSyncManager
-from .utils.config import create_default_config
+from .utils.config import DEFAULT_BAUDRATE, create_default_config
 from .utils.errors import humanize_exception
 from .utils.firmware import (
     chip_info,
@@ -269,7 +269,7 @@ def flash(
                                autocompletion=_complete_port),
     file: str = typer.Argument(..., help="待刷入的本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -322,7 +322,7 @@ def flash(
 @app.command()
 def repl(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -345,7 +345,7 @@ def flash_program(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -406,7 +406,7 @@ def flash_program(
 @app.command()
 def reset(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -438,7 +438,7 @@ def config() -> None:
 @app.command()
 def board_info(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -599,7 +599,7 @@ def mount(
         help="挂载前先递归读取并缓存完整目录结构",
     ),
     baudrate: int = typer.Option(
-        115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
+        DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
     ),
     timeout: int = typer.Option(
         10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
@@ -792,7 +792,7 @@ def project_flash(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -839,7 +839,7 @@ def project_status(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -884,7 +884,7 @@ def project_pull(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(help="本地项目目录路径（如 . 或 ./bak）"),
     remote_path: str = typer.Argument("/", help="设备上的远程路径前缀", show_default=False),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -935,7 +935,7 @@ def project_run(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -995,7 +995,7 @@ def device_backup(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地备份目录"),
     remote_path: str = typer.Argument("/", help="设备上的备份根路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
@@ -1023,7 +1023,7 @@ def device_restore(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地待恢复目录"),
     remote_path: str = typer.Argument("/", help="设备上的恢复根路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
     no_overwrite: bool = typer.Option(False, "--no-overwrite", help="跳过设备上已存在的文件"),
@@ -1129,7 +1129,7 @@ def fs_ls(
     recursive: bool = typer.Option(False, "--recursive", "-r", help="递归列出"),
     sort: Optional[str] = typer.Option(None, "--sort", help="排序: name/size"),
     paginate: bool = typer.Option(False, "--paginate", "-p", help="分页显示"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1223,7 +1223,7 @@ def fs_rm(
     path: str = typer.Argument(..., help="设备上要删除的文件或目录路径"),
     recursive: bool = typer.Option(False, "-r", "--recursive", help="递归删除"),
     force: bool = typer.Option(False, "-f", "--force", help="忽略错误"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1250,7 +1250,7 @@ def fs_rm(
 def fs_cat(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     path: str = typer.Argument(..., help="设备上的文件路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1270,7 +1270,7 @@ def fs_put(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     local_path: str = typer.Argument(..., help="本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
@@ -1313,7 +1313,7 @@ def fs_get(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     remote_path: str = typer.Argument(..., help="设备上的文件路径"),
     local_path: str = typer.Argument(None, help="本地保存路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1334,7 +1334,7 @@ def fs_get(
 def fs_tree(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     path: str = typer.Argument("/", help="设备上的目录路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1361,7 +1361,7 @@ def fs_mv(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     src: str = typer.Argument(..., help="源路径"),
     dst: str = typer.Argument(..., help="目标路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -1385,7 +1385,7 @@ def fs_cp(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     src: str = typer.Argument(..., help="源路径"),
     dst: str = typer.Argument(..., help="目标路径"),
-    baudrate: int = typer.Option(115200, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),

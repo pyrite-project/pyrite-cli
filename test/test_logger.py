@@ -24,12 +24,14 @@ from cli.utils.log import (
     LogManager,
     LogRecord,
     Logger,
+    TextFileHandler,
     TrafficMonitor,
     configure,
     configure_from_verbosity,
     get_logger,
     get_level,
     set_level,
+    shutdown,
 )
 
 
@@ -230,6 +232,81 @@ def test_jsonl_handler_operation_fields():
         assert data["op_status"] == "end"
         assert data["duration_ms"] == 456.7
         assert data["extra"]["path"] == "/main.py"
+
+
+def test_text_handler_writes_readable_log():
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = os.path.join(tmp, "test.log")
+        h = TextFileHandler(log_path)
+
+        rec = LogRecord(
+            INFO, "test.module", "flash_file done",
+            op="flash_file", op_status="end",
+            duration_ms=12.3, extra={"path": "/main.py"},
+        )
+        h.emit(rec)
+        h.close()
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "INFO" in text
+        assert "test.module" in text
+        assert "flash_file done" in text
+        assert "duration_ms=12.3" in text
+        assert "path=/main.py" in text
+
+
+def test_file_handlers_rotate_with_save_limit():
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = os.path.join(tmp, "pyrite.jsonl")
+        for path in [
+            "pyrite.jsonl",
+            "pyrite.1.jsonl",
+            "pyrite.2.jsonl",
+            "pyrite.3.jsonl",
+        ]:
+            with open(os.path.join(tmp, path), "w", encoding="utf-8") as f:
+                f.write(path)
+
+        h = JSONLFileHandler(log_path, max_files=3)
+        h.emit(LogRecord(INFO, "test", "current"))
+        h.close()
+
+        files = sorted(os.listdir(tmp))
+        assert files == ["pyrite.1.jsonl", "pyrite.2.jsonl", "pyrite.jsonl"]
+
+
+def test_configure_uses_fixed_json_and_text_logs():
+    with tempfile.TemporaryDirectory() as tmp:
+        shutdown()
+        try:
+            handler = configure(log_dir=tmp, file_enabled=True)
+            assert handler is not None
+
+            log = get_logger("test.fixed_files")
+            log.info("hello fixed logs")
+            shutdown()
+
+            assert os.path.exists(os.path.join(tmp, "pyrite.jsonl"))
+            assert os.path.exists(os.path.join(tmp, "pyrite.log"))
+            assert not [name for name in os.listdir(tmp) if name.startswith("pyrite_")]
+        finally:
+            shutdown()
+
+
+def test_configure_disables_traffic_records():
+    with tempfile.TemporaryDirectory() as tmp:
+        shutdown()
+        try:
+            configure(log_dir=tmp, file_enabled=True, traffic_enabled=False)
+            log = get_logger("test.no_traffic")
+            log.traffic("TX", b"\x01\x02")
+            shutdown()
+
+            assert not os.path.exists(os.path.join(tmp, "pyrite.jsonl"))
+            assert not os.path.exists(os.path.join(tmp, "pyrite.log"))
+        finally:
+            shutdown()
 
 
 # ═══════════════════════════════════════════════════════════════════

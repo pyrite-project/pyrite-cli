@@ -1,12 +1,25 @@
 import os
 import binascii
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from cli.utils.flash import MicroPython, _colorize_repl_output
+from cli.utils.flash import (
+    BATCH_ACK_EVERY,
+    FLASH,
+    FLASH_PROGRAM,
+    FLASH_SUFFIX,
+    MicroPython,
+    _build_inline_batch_verify_code,
+    _build_inline_verify_code,
+    _colorize_repl_output,
+    _compute_block_crc32,
+    _decide_delta_flash,
+    _parse_remote_block_crc_output,
+)
 from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.compiler import _compile_to_mpy
 
@@ -121,6 +134,166 @@ class TestComputeCrc32:
         assert result >= 0
 
 
+class TestDeltaFlashHelpers:
+    def test_compute_block_crc32_splits_data(self):
+        blocks = _compute_block_crc32(b"abcde", 2)
+
+        assert blocks == [
+            (binascii.crc32(b"ab") & 0xFFFFFFFF, 2),
+            (binascii.crc32(b"cd") & 0xFFFFFFFF, 2),
+            (binascii.crc32(b"e") & 0xFFFFFFFF, 1),
+        ]
+
+    def test_remote_missing_falls_back_to_full(self):
+        decision = _decide_delta_flash(
+            4,
+            None,
+            _compute_block_crc32(b"abcd", 2),
+            None,
+            2,
+        )
+
+        assert decision.action == "full"
+
+    def test_equal_blocks_skip_flash(self):
+        blocks = _compute_block_crc32(b"abcd", 2)
+
+        decision = _decide_delta_flash(4, 4, blocks, blocks, 2)
+
+        assert decision.action == "skip"
+        assert decision.offset == 0
+
+    def test_middle_difference_writes_suffix_from_first_bad_block(self):
+        local = _compute_block_crc32(b"aabbcc", 2)
+        remote = _compute_block_crc32(b"aaxxcc", 2)
+
+        decision = _decide_delta_flash(6, 6, local, remote, 2)
+
+        assert decision.action == "suffix"
+        assert decision.offset == 2
+        assert decision.truncate is False
+
+    def test_matching_prefix_and_longer_local_appends(self):
+        local = _compute_block_crc32(b"aabbcc", 2)
+        remote = _compute_block_crc32(b"aabb", 2)
+
+        decision = _decide_delta_flash(6, 4, local, remote, 2)
+
+        assert decision.action == "append"
+        assert decision.offset == 4
+
+    def test_matching_prefix_and_shorter_local_truncates_without_rewrite(self):
+        local = _compute_block_crc32(b"aabb", 2)
+        remote = _compute_block_crc32(b"aabbcc", 2)
+
+        decision = _decide_delta_flash(4, 6, local, remote, 2)
+
+        assert decision.action == "truncate"
+        assert decision.offset == 4
+        assert decision.truncate is True
+
+    def test_shorter_local_with_difference_writes_suffix_then_truncates(self):
+        local = _compute_block_crc32(b"aaxx", 2)
+        remote = _compute_block_crc32(b"aabbcc", 2)
+
+        decision = _decide_delta_flash(4, 6, local, remote, 2)
+
+        assert decision.action == "suffix"
+        assert decision.offset == 2
+        assert decision.truncate is True
+
+    def test_suffix_script_rebuilds_file_when_truncate_is_unavailable(self):
+        assert "f.truncate(final_size)" in FLASH_SUFFIX
+        assert "except Exception:" in FLASH_SUFFIX
+        assert "with open(tmp,'wb') as dst:" in FLASH_SUFFIX
+        assert "os.rename(FILE,bak)" in FLASH_SUFFIX
+        assert "os.rename(tmp,FILE)" in FLASH_SUFFIX
+
+    def test_single_file_scripts_use_sparse_ack_and_batched_flush(self):
+        for script in (FLASH, FLASH_SUFFIX):
+            assert "ack_every" in script
+            assert "ack_count" in script
+            assert "ack_count" in script and "%ack_every" in script.replace(" ", "")
+            assert "if f_size:" in script or "if remaining:" in script
+            assert script.count("sys.stdout.write('+')") == 1
+
+    def test_upload_scripts_use_small_serial_read_buffer(self):
+        for script in (FLASH, FLASH_SUFFIX, FLASH_PROGRAM):
+            assert "usb.read(min(64," in script.replace(" ", "")
+
+    def test_inline_verify_code_checks_size(self):
+        code = _build_inline_verify_code("/app.py", 123, "size", None, 4096)
+
+        assert "_verify_path='/app.py'" in code
+        assert "_expected_size=123" in code
+        assert "os.stat(_verify_path)[6]" in code
+        assert "VERIFY_SIZE" in code
+        assert "ubinascii" not in code
+
+    def test_inline_verify_code_checks_crc32_after_size(self):
+        code = _build_inline_verify_code("/app.py", 123, "crc32", 0x1234, 8192)
+
+        assert "_expected_size=123" in code
+        assert "_expected_crc=4660" in code
+        assert "import gc,ubinascii" in code
+        assert "_vf.read(4096)" in code
+        assert "VERIFY_CRC" in code
+
+    def test_inline_batch_verify_code_checks_files(self):
+        code = _build_inline_batch_verify_code(
+            [("/a.py", 3), ("/b.py", 4)],
+            "crc32",
+            {"/a.py": 1, "/b.py": 2},
+            2048,
+        )
+
+        assert "_verify_entries=[('/a.py', 3, 1), ('/b.py', 4, 2)]" in code
+        assert "VERIFY_SIZE" in code
+        assert "VERIFY_CRC" in code
+        assert "_vf.read(2048)" in code
+
+    def test_last_block_size_mismatch_is_a_suffix_difference(self):
+        local = [(123, 2)]
+        remote = [(123, 1)]
+
+        decision = _decide_delta_flash(2, 1, local, remote, 2)
+
+        assert decision.action == "suffix"
+        assert decision.offset == 0
+
+    def test_parse_remote_block_crc_output(self):
+        parsed = _parse_remote_block_crc_output(
+            "SIZE 5\nBLOCK 0 123 4\nBLOCK 1 45 1\nEND\n"
+        )
+
+        assert parsed.missing is False
+        assert parsed.error is None
+        assert parsed.size == 5
+        assert parsed.blocks == [(123, 4), (45, 1)]
+
+    @pytest.mark.parametrize("output", ["MISSING\n", "ERR OSError('bad')\n"])
+    def test_parse_remote_block_crc_output_fallback_markers(self, output):
+        parsed = _parse_remote_block_crc_output(output)
+
+        assert parsed.blocks is None
+        assert parsed.size is None
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "",
+            "SIZE 5\nBLOCK 1 123 4\nEND\n",
+            "SIZE 5\nBLOCK 0 123 4\n",
+            "BLOCK 0 123 4\nEND\n",
+        ],
+    )
+    def test_parse_remote_block_crc_output_rejects_bad_format(self, output):
+        parsed = _parse_remote_block_crc_output(output)
+
+        assert parsed.error is not None
+        assert parsed.blocks is None
+
+
 class TestFilesystemMountGuard:
     def test_ensure_filesystem_mounted_supports_mpython_flashbdev_list(self, monkeypatch):
         mp = MicroPython(port="COM99")
@@ -140,6 +313,151 @@ class TestFilesystemMountGuard:
         assert "b=b[0]" in code
         assert "os.VfsLfs2(b)" in code
         assert kwargs == {"timeout": 5, "raise_on_error": False}
+
+
+class TestUploadAckWindow:
+    def test_slow_serial_uploads_wait_for_every_chunk(self):
+        assert MicroPython(port="COM99", baudrate=115200)._upload_ack_every() == 1
+        assert MicroPython(port="COM99", baudrate=230400)._upload_ack_every() == 1
+
+    def test_fast_serial_uploads_keep_sparse_ack(self):
+        assert (
+            MicroPython(port="COM99", baudrate=921600)._upload_ack_every()
+            == BATCH_ACK_EVERY
+        )
+
+    def test_flash_file_passes_adaptive_ack_to_script_and_sender(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"hello")
+        mp = MicroPython(port="COM99", baudrate=115200)
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+
+        def fake_send(script, *args, **kwargs):
+            calls.append((script, kwargs))
+
+        monkeypatch.setattr(mp, "_send_flash_payload", fake_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        assert len(calls) == 1
+        script, kwargs = calls[0]
+        assert "ack_every = 1" in script
+        assert kwargs["ack_every"] == 1
+
+    def test_flash_file_inlines_size_verify_without_second_repl_call(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"hello")
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "size"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(
+            mp,
+            "_verify_file_on_device",
+            lambda *args, **kwargs: pytest.fail("verify should be inline"),
+        )
+
+        def fake_send(script, *args, **kwargs):
+            calls.append((script, kwargs))
+
+        monkeypatch.setattr(mp, "_send_flash_payload", fake_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        script, kwargs = calls[0]
+        assert "_expected_size=5" in script
+        assert "VERIFY_SIZE" in script
+        assert "VERIFY_CODE" not in script
+        assert kwargs["confirm_timeout"] == 10
+
+    def test_flash_file_inlines_crc32_verify(self, tmp_path, monkeypatch):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"hello")
+        expected_crc = binascii.crc32(b"hello") & 0xFFFFFFFF
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "crc32"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(
+            mp,
+            "_verify_file_on_device",
+            lambda *args, **kwargs: pytest.fail("verify should be inline"),
+        )
+
+        def fake_send(script, *args, **kwargs):
+            calls.append((script, kwargs))
+
+        monkeypatch.setattr(mp, "_send_flash_payload", fake_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        script, kwargs = calls[0]
+        assert f"_expected_crc={expected_crc}" in script
+        assert "VERIFY_CRC" in script
+        assert "VERIFY_CODE" not in script
+        assert kwargs["confirm_timeout"] >= 15
+
+
+class TestRawReplBaudFallback:
+    def test_init_device_state_reconnects_with_common_baud_when_raw_repl_is_silent(
+        self, monkeypatch
+    ):
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.max_retries = 0
+        calls = []
+
+        def fake_try_raw_sequence():
+            calls.append(("try", mp.baudrate))
+            if mp.baudrate == 115200:
+                return True, b"raw REPL; CTRL-B to exit\r\n>"
+            return False, b""
+
+        monkeypatch.setattr(mp, "_try_raw_repl_sequence", fake_try_raw_sequence)
+        monkeypatch.setattr(mp, "_ensure_filesystem_mounted", lambda: calls.append(("fs", mp.baudrate)))
+        monkeypatch.setattr(
+            mp,
+            "_execute",
+            lambda *args, **kwargs: calls.append(("execute", mp.baudrate)) or "",
+        )
+
+        reconnects = []
+
+        def fake_reconnect_for_baud(baudrate):
+            reconnects.append(baudrate)
+            mp.baudrate = baudrate
+            mp.transport.baudrate = baudrate
+
+        monkeypatch.setattr(mp, "_reconnect_for_baud", fake_reconnect_for_baud)
+
+        mp._init_device_state()
+
+        assert reconnects == [115200]
+        assert mp.baudrate == 115200
+        assert ("fs", 115200) in calls
+        assert ("execute", 115200) in calls
 
 
 class TestFlashBatchHelpers:
@@ -185,6 +503,47 @@ class TestFlashBatchHelpers:
         assert len(calls) == 1
         assert "entries =" in calls[0][0]
         assert calls[0][1]["timeout"] >= 5
+
+    def test_flash_entries_inlines_verify_without_second_repl_call(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "main.py"
+        local.write_text("print('hi')\n", encoding="utf-8")
+        mp = MicroPython(port="COM99")
+        mp.config.auto_compile = False
+        mp.config.verify = "size"
+        mp.config.max_retries = 0
+        writes = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(mp, "_write", lambda data: writes.append(data))
+        monkeypatch.setattr(
+            mp,
+            "_read_until_marker",
+            lambda marker, timeout=30: (
+                (True, b"READY") if marker == b"READY" else (True, b"\x04\x04>")
+            ),
+        )
+        monkeypatch.setattr(
+            mp,
+            "_send_data_with_sparse_ack",
+            lambda data_iter, total, **kwargs: list(data_iter),
+        )
+        monkeypatch.setattr(
+            mp,
+            "_verify_files_on_device_batch",
+            lambda *args, **kwargs: pytest.fail("verify should be inline"),
+        )
+
+        result = mp.flash_entries([(str(local), "/main.py")])
+
+        assert result == [(str(local), "/main.py", True)]
+        script = writes[0].decode("utf-8", errors="ignore")
+        assert "_verify_entries=[('/main.py'," in script
+        assert "VERIFY_SIZE" in script
+        assert "VERIFY_CODE" not in script
 
 
 class TestCompilerCache:

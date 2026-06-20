@@ -58,6 +58,12 @@ def _load_config() -> PyriteConfig:
                 v = data.get("verify", "size")
                 if v in ("off", "size", "crc32"):
                     cfg.verify = v
+                delta = data.get("delta_flash", "auto")
+                if delta in ("off", "auto", "on"):
+                    cfg.delta_flash = delta
+                delta_min = data.get("delta_min_size", 10240)
+                if isinstance(delta_min, int) and delta_min >= 0:
+                    cfg.delta_min_size = delta_min
                 r = data.get("max_retries", 2)
                 if isinstance(r, int) and r >= 0:
                     cfg.max_retries = r
@@ -74,6 +80,10 @@ def _load_config() -> PyriteConfig:
                         cfg.chunk_size = prof["chunk_size"]
                     if isinstance(prof.get("verify"), str) and prof["verify"] in ("off", "size", "crc32"):
                         cfg.verify = prof["verify"]
+                    if isinstance(prof.get("delta_flash"), str) and prof["delta_flash"] in ("off", "auto", "on"):
+                        cfg.delta_flash = prof["delta_flash"]
+                    if isinstance(prof.get("delta_min_size"), int) and prof["delta_min_size"] >= 0:
+                        cfg.delta_min_size = prof["delta_min_size"]
                     if isinstance(prof.get("download_threads"), int) and prof["download_threads"] > 0:
                         cfg.download_threads = min(prof["download_threads"], 12)
                     if isinstance(prof.get("timeout"), int) and prof["timeout"] > 0:
@@ -108,6 +118,8 @@ def create_default_config() -> str:
             "download_threads": 4,
             "auto_compile": True,
             "verify": "size",
+            "delta_flash": "auto",
+            "delta_min_size": 10240,
             "max_retries": 2,
             "baudrate": DEFAULT_BAUDRATE,
         }, indent=2),

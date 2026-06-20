@@ -1,7 +1,7 @@
 """
 pyrite-cli 统一日志系统。
 
-提供命名 Logger、6 级日志、控制台彩色输出、JSONL 文件记录、
+提供命名 Logger、6 级日志、控制台彩色输出、JSONL 与可读文本文件记录、
 操作计时上下文管理器、串口/WebSocket 流量监控。
 
 用法::
@@ -19,7 +19,7 @@ pyrite-cli 统一日志系统。
     with log.operation("flash_file", path="/main.py", size=4096):
         ...  # 自动记录开始/结束/耗时/成败
 
-流量数据统一写入 JSONL 文件，``type`` 字段为 ``"traffic"``。
+流量数据写入日志文件时，JSONL 中 ``type`` 字段为 ``"traffic"``。
 """
 
 from __future__ import annotations
@@ -34,6 +34,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TextIO
+
+DEFAULT_JSON_LOG_NAME = "pyrite.jsonl"
+DEFAULT_TEXT_LOG_NAME = "pyrite.log"
+DEFAULT_LOG_FILE_LIMIT = 25
 
 # ═══════════════════════════════════════════════════════════════════
 # 日志级别
@@ -174,22 +178,80 @@ class ConsoleHandler(Handler):
             sys.stderr.write(f"{_COLORS[ERROR]}{record.exc_text}{_RESET}\n")
 
 
-class JSONLFileHandler(Handler):
+def _rotated_log_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.stem}.{index}{path.suffix}")
+
+
+def _rotation_candidates(path: Path) -> Iterator[tuple[int, Path]]:
+    prefix = f"{path.stem}."
+    suffix = path.suffix
+    for candidate in path.parent.glob(f"{path.stem}.*{suffix}"):
+        name = candidate.name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        middle = name[len(prefix):len(name) - len(suffix)]
+        if middle.isdigit():
+            yield int(middle), candidate
+
+
+def _rotate_fixed_log(path: Path, max_files: int) -> None:
+    max_files = max(1, max_files)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    for index, candidate in list(_rotation_candidates(path)):
+        if index >= max_files:
+            candidate.unlink(missing_ok=True)
+
+    if not path.exists() or path.stat().st_size == 0:
+        return
+
+    if max_files == 1:
+        path.unlink(missing_ok=True)
+        return
+
+    for index in range(max_files - 2, 0, -1):
+        src = _rotated_log_path(path, index)
+        if src.exists():
+            src.replace(_rotated_log_path(path, index + 1))
+
+    path.replace(_rotated_log_path(path, 1))
+
+
+class _RotatingFileHandler(Handler):
+    """固定文件名日志处理器基类，首次写入前轮转旧日志。"""
+
+    def __init__(self, log_path: str, level: int = TRACE, max_files: int = DEFAULT_LOG_FILE_LIMIT) -> None:
+        super().__init__(level)
+        self._path = log_path
+        self._max_files = max(1, max_files)
+        self._file: Optional[TextIO] = None
+        self._lock = threading.Lock()
+        self._prepared = False
+
+    def _ensure_open(self) -> None:
+        if self._file is None:
+            path = Path(self._path)
+            if not self._prepared:
+                _rotate_fixed_log(path, self._max_files)
+                self._prepared = True
+            self._file = open(path, "w", encoding="utf-8")
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file:
+                self._file.close()
+                self._file = None
+
+
+class JSONLFileHandler(_RotatingFileHandler):
     """将日志以 JSONL 格式写入单个文件。
 
     包含结构化日志和流量数据，全部合入同一文件。
     """
-
-    def __init__(self, log_path: str, level: int = TRACE) -> None:
-        super().__init__(level)
-        self._path = log_path
-        self._file: Optional[TextIO] = None
-        self._lock = threading.Lock()
-
-    def _ensure_open(self) -> None:
-        if self._file is None:
-            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-            self._file = open(self._path, "w", encoding="utf-8")
 
     def emit(self, record: LogRecord) -> None:
         if record.level < self.level:
@@ -225,15 +287,51 @@ class JSONLFileHandler(Handler):
             self._file.write(json.dumps(obj, ensure_ascii=False) + "\n")  # type: ignore[union-attr]
             self._file.flush()
 
-    @property
-    def path(self) -> str:
-        return self._path
 
-    def close(self) -> None:
+class TextFileHandler(_RotatingFileHandler):
+    """将日志写入阅读友好的纯文本文件。"""
+
+    def emit(self, record: LogRecord) -> None:
+        if record.level < self.level:
+            return
+
         with self._lock:
-            if self._file:
-                self._file.close()
-                self._file = None
+            self._ensure_open()
+            self._file.write(_format_text_record(record) + "\n")  # type: ignore[union-attr]
+            if record.exc_text:
+                self._file.write(record.exc_text.rstrip() + "\n")  # type: ignore[union-attr]
+            self._file.flush()
+
+
+def _format_text_record(record: LogRecord) -> str:
+    ts = datetime.fromtimestamp(record.ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"{ts} {record.level_name:<5} [{record.module}]"
+
+    fields: List[str] = []
+    if record.type == "traffic":
+        detail = f"{record.dir or ''}"
+        if record.raw_hex:
+            fields.append(f"hex={record.raw_hex}")
+        if record.text:
+            fields.append(f"text={record.text.strip()}")
+        return f"{line} {detail}{_format_fields(fields)}"
+
+    msg = record.msg
+    if record.op:
+        fields.append(f"op={record.op}")
+        if record.op_status:
+            fields.append(f"op_status={record.op_status}")
+        if record.duration_ms is not None:
+            fields.append(f"duration_ms={round(record.duration_ms, 1)}")
+    for key, value in record.extra.items():
+        fields.append(f"{key}={value}")
+    return f"{line} {msg}{_format_fields(fields)}"
+
+
+def _format_fields(fields: List[str]) -> str:
+    if not fields:
+        return ""
+    return "  " + " ".join(fields)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -247,6 +345,7 @@ class LogManager:
         self._handlers: List[Handler] = []
         self._lock = threading.Lock()
         self._configured = False
+        self.traffic_enabled = True
 
     def add_handler(self, handler: Handler) -> None:
         with self._lock:
@@ -258,6 +357,8 @@ class LogManager:
                 self._handlers.remove(handler)
 
     def emit(self, record: LogRecord) -> None:
+        if record.type == "traffic" and not self.traffic_enabled:
+            return
         with self._lock:
             for h in self._handlers:
                 try:
@@ -273,6 +374,8 @@ class LogManager:
                 except Exception:
                     pass
             self._handlers.clear()
+            self._configured = False
+            self.traffic_enabled = True
 
     @property
     def jsonl_path(self) -> Optional[str]:
@@ -280,6 +383,15 @@ class LogManager:
         with self._lock:
             for h in self._handlers:
                 if isinstance(h, JSONLFileHandler):
+                    return h.path
+        return None
+
+    @property
+    def text_path(self) -> Optional[str]:
+        """返回可读文本日志路径（如果已配置）。"""
+        with self._lock:
+            for h in self._handlers:
+                if isinstance(h, TextFileHandler):
                     return h.path
         return None
 
@@ -500,6 +612,7 @@ def configure(
     log_dir: str = "./log",
     file_enabled: bool = True,
     traffic_enabled: bool = True,
+    max_log_files: int = DEFAULT_LOG_FILE_LIMIT,
 ) -> JSONLFileHandler | None:
     """配置全局日志系统。
 
@@ -508,26 +621,34 @@ def configure(
     Args:
         console_level: 控制台最低输出级别
         log_dir: 日志文件目录
-        file_enabled: 是否启用 JSONL 文件日志
+        file_enabled: 是否启用文件日志
         traffic_enabled: 是否启用流量记录（不影响其他日志）
+        max_log_files: 每种固定日志最多保留的文件数（含当前文件）
 
     Returns:
-        JSONLFileHandler 实例（如果启用了文件日志），否则 None
+        JSONLFileHandler 实例（如果启用了文件日志），否则 None。
     """
     global _mgr
 
     if _mgr._configured:
         return None
     _mgr._configured = True
+    _mgr.traffic_enabled = traffic_enabled
 
     _mgr.add_handler(ConsoleHandler(level=console_level))
 
     if file_enabled:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(log_dir, f"pyrite_{ts}.log")
-        fh = JSONLFileHandler(log_path)
-        _mgr.add_handler(fh)
-        return fh
+        json_handler = JSONLFileHandler(
+            os.path.join(log_dir, DEFAULT_JSON_LOG_NAME),
+            max_files=max_log_files,
+        )
+        text_handler = TextFileHandler(
+            os.path.join(log_dir, DEFAULT_TEXT_LOG_NAME),
+            max_files=max_log_files,
+        )
+        _mgr.add_handler(json_handler)
+        _mgr.add_handler(text_handler)
+        return json_handler
 
     return None
 
@@ -552,8 +673,8 @@ def configure_from_verbosity(verbose: int, quiet: bool) -> None:
     else:
         level = INFO
 
-    # 始终启用文件日志
-    configure(console_level=level)
+    # 始终启用文件日志；原始流量仅在 TRACE 模式写入，避免普通命令产生大量日志。
+    configure(console_level=level, traffic_enabled=level <= TRACE)
     global _current_level
     _current_level = level
 

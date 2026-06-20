@@ -39,6 +39,7 @@ except ImportError:
 # ── 模块日志器 ──
 log = get_logger(__name__)
 BATCH_ACK_EVERY = 8
+RAW_REPL_BAUD_FALLBACKS = (115200, DEFAULT_BAUDRATE, 460800, 230400)
 
 
 @dataclass
@@ -48,6 +49,21 @@ class _PreparedFlashFile:
     local_path: str
     content: bytes
     size: int
+
+
+@dataclass(frozen=True)
+class DeltaFlashDecision:
+    action: str
+    offset: int = 0
+    truncate: bool = False
+
+
+@dataclass(frozen=True)
+class RemoteBlockCrcResult:
+    size: Optional[int] = None
+    blocks: Optional[List[Tuple[int, int]]] = None
+    missing: bool = False
+    error: Optional[str] = None
 
 # ── 原始 REPL 协议常量 ──
 ENTER_RAW_REPL = b"\x01"
@@ -65,6 +81,8 @@ try:
     usb = sys.stdin.buffer
     sys.stdout.write('READY')
     f_size = FSIZE
+    ack_every = ACK_EVERY
+    ack_count = 0
     with open(FILE, 'wb') as f:
         while f_size:
             want = min(BFSIZE, f_size)
@@ -74,13 +92,18 @@ try:
                 if c:
                     d += c
             f.write(d)
-            f.flush()
             f_size -= len(d)
-            sys.stdout.write('+')
+            ack_count += 1
+            if ack_every and ack_count % ack_every == 0:
+                f.flush()
+                if f_size:
+                    sys.stdout.write('+')
+        f.flush()
     micropython.kbd_intr(3)
     rec = b''
     while not (b'ok' in rec):
         rec = (rec + (usb.read(1) or b''))[-16:]
+VERIFY_CODE
     sys.stdout.write('ok')
 except Exception as e:
     sys.stdout.write('FLASH_ERR:' + str(e) + '\\n')
@@ -103,21 +126,295 @@ try:
         with open(file_path, 'wb') as f:
             remaining = file_size
             while remaining:
-                blk = min(remaining, BFSIZE)
-                d = usb.read(blk)
-                if d:
-                    f.write(d)
-                    f.flush()
-                    remaining -= len(d)
-                    total_left -= len(d)
-                    ack_count += 1
-                    if ack_every and ack_count % ack_every == 0 and total_left:
-                        sys.stdout.write('+')
+                want = min(remaining, BFSIZE)
+                d = b''
+                while len(d) < want:
+                    c = usb.read(min(64, want - len(d)))
+                    if c:
+                        d += c
+                f.write(d)
+                f.flush()
+                remaining -= len(d)
+                total_left -= len(d)
+                ack_count += 1
+                if ack_every and ack_count % ack_every == 0 and total_left:
+                    sys.stdout.write('+')
+VERIFY_CODE
     micropython.kbd_intr(3)
 except Exception as e:
     sys.stdout.write('FLASH_ERR:' + str(e) + '\\n')
     raise
 """
+
+DELTA_BLOCK_CRC = """\
+import os,gc,ubinascii
+path=FILE
+block_size=BLOCK_SIZE
+try:
+    size=os.stat(path)[6]
+    print('SIZE',size)
+    i=0
+    with open(path,'rb') as f:
+        while True:
+            gc.collect()
+            data=f.read(block_size)
+            if not data:
+                break
+            print('BLOCK',i,ubinascii.crc32(data)&0xffffffff,len(data))
+            i+=1
+    print('END')
+except OSError:
+    print('MISSING')
+except Exception as e:
+    print('ERR',repr(e))
+"""
+
+FLASH_SUFFIX = """\
+import os,sys,micropython
+try:
+    micropython.kbd_intr(-1)
+    usb=sys.stdin.buffer
+    sys.stdout.write('READY')
+    remaining=FSIZE
+    final_size=FINAL_SIZE
+    ack_every=ACK_EVERY
+    ack_count=0
+    tmp=FILE+'.pyrite_tmp'
+    bak=FILE+'.pyrite_bak'
+    f=open(FILE,'r+b')
+    try:
+        f.seek(OFFSET)
+        while remaining:
+            want=min(BFSIZE,remaining)
+            d=b''
+            while len(d)<want:
+                c=usb.read(min(64,want-len(d)))
+                if c:
+                    d+=c
+            f.write(d)
+            remaining-=len(d)
+            ack_count+=1
+            if ack_every and ack_count%ack_every==0:
+                f.flush()
+                if remaining:
+                    sys.stdout.write('+')
+        f.flush()
+        if final_size>=0:
+            try:
+                f.truncate(final_size)
+                f.flush()
+            except Exception:
+                f.close()
+                f=None
+                left=final_size
+                with open(FILE,'rb') as src:
+                    with open(tmp,'wb') as dst:
+                        while left:
+                            data=src.read(min(BFSIZE,left))
+                            if not data:
+                                break
+                            dst.write(data)
+                            dst.flush()
+                            left-=len(data)
+                if left:
+                    raise OSError('short copy')
+                try:
+                    os.remove(bak)
+                except OSError:
+                    pass
+                os.rename(FILE,bak)
+                try:
+                    os.rename(tmp,FILE)
+                except Exception:
+                    try:
+                        os.rename(bak,FILE)
+                    except Exception:
+                        pass
+                    raise
+                try:
+                    os.remove(bak)
+                except OSError:
+                    pass
+    finally:
+        if f:
+            f.close()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    micropython.kbd_intr(3)
+    rec=b''
+    while not (b'ok' in rec):
+        rec=(rec+(usb.read(1) or b''))[-16:]
+VERIFY_CODE
+    sys.stdout.write('ok')
+except Exception as e:
+    sys.stdout.write('FLASH_ERR:'+str(e)+'\\n')
+    raise
+"""
+
+
+def _compute_block_crc32(data: bytes, block_size: int) -> List[Tuple[int, int]]:
+    """Return ``(crc32, size)`` for each block in ``data``."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    return [
+        (binascii.crc32(data[i:i + block_size]) & 0xFFFFFFFF, len(data[i:i + block_size]))
+        for i in range(0, len(data), block_size)
+    ]
+
+
+def _build_inline_verify_code(
+    remote_path: str,
+    expected_size: int,
+    verify_mode: str,
+    expected_crc: Optional[int],
+    chunk_size: int,
+) -> str:
+    if verify_mode == "off":
+        return ""
+
+    read_size = max(64, min(chunk_size, 4096))
+    lines = [
+        "    import os",
+        f"    _verify_path={remote_path!r}",
+        f"    _expected_size={expected_size}",
+        "    _actual_size=os.stat(_verify_path)[6]",
+        "    if _actual_size!=_expected_size:",
+        "        raise OSError('VERIFY_SIZE:%d:%d'%(_expected_size,_actual_size))",
+    ]
+    if verify_mode == "crc32" and expected_crc is not None:
+        lines.extend([
+            f"    _expected_crc={expected_crc & 0xFFFFFFFF}",
+            "    try:",
+            "        import gc,ubinascii",
+            "    except Exception:",
+            "        ubinascii=None",
+            "    if ubinascii is None:",
+            "        sys.stdout.write('VERIFY_WARN:crc32 unavailable\\n')",
+            "    else:",
+            "        _crc=0",
+            "        with open(_verify_path,'rb') as _vf:",
+            "            while True:",
+            "                gc.collect()",
+            f"                _chunk=_vf.read({read_size})",
+            "                if not _chunk:",
+            "                    break",
+            "                _crc=ubinascii.crc32(_chunk,_crc)",
+            "        _crc=_crc&0xffffffff",
+            "        if _crc!=_expected_crc:",
+            "            raise OSError('VERIFY_CRC:%d:%d'%(_expected_crc,_crc))",
+        ])
+    return "\n".join(lines) + "\n"
+
+
+def _build_inline_batch_verify_code(
+    file_meta: Sequence[Tuple[str, int]],
+    verify_mode: str,
+    expected_crcs: Optional[Dict[str, int]],
+    chunk_size: int,
+) -> str:
+    if verify_mode == "off":
+        return ""
+
+    expected_crcs = expected_crcs or {}
+    entries = [
+        (remote_path, size, expected_crcs.get(remote_path))
+        for remote_path, size in file_meta
+    ]
+    read_size = max(64, min(chunk_size, 4096))
+    lines = [
+        "    import os",
+        f"    _verify_entries={entries!r}",
+        "    for _verify_path,_expected_size,_expected_crc in _verify_entries:",
+        "        _actual_size=os.stat(_verify_path)[6]",
+        "        if _actual_size!=_expected_size:",
+        "            raise OSError('VERIFY_SIZE:%s:%d:%d'%(_verify_path,_expected_size,_actual_size))",
+    ]
+    if verify_mode == "crc32":
+        lines.extend([
+            "    try:",
+            "        import gc,ubinascii",
+            "    except Exception:",
+            "        ubinascii=None",
+            "    if ubinascii is None:",
+            "        sys.stdout.write('VERIFY_WARN:crc32 unavailable\\n')",
+            "    else:",
+            "        for _verify_path,_expected_size,_expected_crc in _verify_entries:",
+            "            if _expected_crc is None:",
+            "                continue",
+            "            _crc=0",
+            "            with open(_verify_path,'rb') as _vf:",
+            "                while True:",
+            "                    gc.collect()",
+            f"                    _chunk=_vf.read({read_size})",
+            "                    if not _chunk:",
+            "                        break",
+            "                    _crc=ubinascii.crc32(_chunk,_crc)",
+            "            _crc=_crc&0xffffffff",
+            "            if _crc!=_expected_crc:",
+            "                raise OSError('VERIFY_CRC:%s:%d:%d'%(_verify_path,_expected_crc,_crc))",
+        ])
+    return "\n".join(lines) + "\n"
+
+
+def _parse_remote_block_crc_output(output: str) -> RemoteBlockCrcResult:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return RemoteBlockCrcResult(error="empty response")
+    if lines == ["MISSING"] or "MISSING" in lines:
+        return RemoteBlockCrcResult(missing=True)
+    err_line = next((line for line in lines if line.startswith("ERR")), None)
+    if err_line:
+        return RemoteBlockCrcResult(error=err_line)
+    if not lines[0].startswith("SIZE ") or lines[-1] != "END":
+        return RemoteBlockCrcResult(error="missing SIZE or END")
+
+    try:
+        remote_size = int(lines[0].split()[1])
+    except (IndexError, ValueError):
+        return RemoteBlockCrcResult(error="invalid SIZE")
+
+    blocks: List[Tuple[int, int]] = []
+    for expected_index, line in enumerate(lines[1:-1]):
+        parts = line.split()
+        if len(parts) != 4 or parts[0] != "BLOCK":
+            return RemoteBlockCrcResult(error=f"invalid block line: {line!r}")
+        try:
+            index = int(parts[1])
+            crc = int(parts[2]) & 0xFFFFFFFF
+            size = int(parts[3])
+        except ValueError:
+            return RemoteBlockCrcResult(error=f"invalid block values: {line!r}")
+        if index != expected_index or size <= 0:
+            return RemoteBlockCrcResult(error=f"invalid block order or size: {line!r}")
+        blocks.append((crc, size))
+
+    if sum(size for _crc, size in blocks) != remote_size:
+        return RemoteBlockCrcResult(error="block sizes do not match SIZE")
+    return RemoteBlockCrcResult(size=remote_size, blocks=blocks)
+
+
+def _decide_delta_flash(
+    local_size: int,
+    remote_size: Optional[int],
+    local_blocks: Sequence[Tuple[int, int]],
+    remote_blocks: Optional[Sequence[Tuple[int, int]]],
+    block_size: int,
+) -> DeltaFlashDecision:
+    if remote_size is None or remote_blocks is None:
+        return DeltaFlashDecision("full")
+
+    should_truncate = local_size < remote_size
+    for idx, (local_block, remote_block) in enumerate(zip(local_blocks, remote_blocks)):
+        if local_block != remote_block:
+            return DeltaFlashDecision("suffix", idx * block_size, should_truncate)
+
+    if local_size == remote_size:
+        return DeltaFlashDecision("skip")
+    if local_size > remote_size:
+        return DeltaFlashDecision("append", remote_size)
+    return DeltaFlashDecision("truncate", local_size, True)
 
 def _strip_repl_trailer(buf: bytes) -> bytes:
     """去除原始 REPL 响应尾部的协议标记。"""
@@ -236,6 +533,11 @@ class MicroPython:
             except Exception as e:
                 log.trace("断开连接时忽略异常: %s", e)
 
+    def _upload_ack_every(self) -> int:
+        if isinstance(self.transport, SerialTransport) and self.baudrate <= 230400:
+            return 1
+        return BATCH_ACK_EVERY
+
     @property
     def is_connected(self) -> bool:
         return self.transport.is_connected
@@ -317,6 +619,63 @@ class MicroPython:
             log.trace("硬复位启动中断失败: %s", exc)
             return False
 
+    def _try_raw_repl_sequence(self) -> Tuple[bool, bytes]:
+        """Try the normal Ctrl+C → Ctrl+A Raw REPL entry sequence once."""
+        self._interrupt_running_program()
+
+        self._write(ENTER_RAW_REPL)
+        ok, data = self._read_until_raw_repl(timeout=2)
+        if ok:
+            return True, data
+
+        log.debug("首次进入原始 REPL 失败，尝试兜底...")
+        self._write(SET_EXECUTE)
+        time.sleep(0.8)
+        self._interrupt_running_program()
+        self._write(ENTER_RAW_REPL)
+        return self._read_until_raw_repl(timeout=3)
+
+    def _reconnect_for_baud(self, baudrate: int) -> None:
+        """Reconnect the current serial transport at a different baud rate."""
+        if not isinstance(self.transport, SerialTransport):
+            return
+        log.debug("切换串口波特率并重连: %d", baudrate)
+        self.connect(baudrate=baudrate)
+
+    def _try_common_baud_raw_repl(self) -> Tuple[bool, bytes]:
+        """Try common MicroPython baud rates when the configured rate is silent."""
+        if not isinstance(self.transport, SerialTransport):
+            return False, b""
+
+        original_baudrate = self.baudrate
+        last_data = b""
+        candidates: List[int] = []
+        for baudrate in RAW_REPL_BAUD_FALLBACKS:
+            if baudrate != original_baudrate and baudrate not in candidates:
+                candidates.append(baudrate)
+
+        for baudrate in candidates:
+            try:
+                log.warning(
+                    "原始 REPL 在 %d 波特率无响应，尝试 %d...",
+                    original_baudrate,
+                    baudrate,
+                )
+                self._reconnect_for_baud(baudrate)
+                ok, data = self._try_raw_repl_sequence()
+                last_data = data
+                if ok:
+                    log.info("已自动切换到可用波特率: %d", baudrate)
+                    return True, data
+            except Exception as exc:
+                log.debug("尝试波特率 %d 失败: %s", baudrate, exc)
+
+        try:
+            self._reconnect_for_baud(original_baudrate)
+        except Exception:
+            pass
+        return False, last_data
+
     def _ensure_filesystem_mounted(self) -> None:
         """确保标准 VFS 已挂载。
 
@@ -359,18 +718,10 @@ class MicroPython:
         序列：持续 Ctrl+C → Ctrl+A → 兜底 Ctrl+D → 持续 Ctrl+C → Ctrl+A → kbd_intr(-1)
         """
         log.trace("初始化设备状态 → 原始 REPL")
-        self._interrupt_running_program()
-
-        self._write(ENTER_RAW_REPL)
-        ok, data = self._read_until_raw_repl(timeout=2)
+        ok, data = self._try_raw_repl_sequence()
 
         if not ok:
-            log.debug("首次进入原始 REPL 失败，尝试兜底...")
-            self._write(SET_EXECUTE)
-            time.sleep(0.8)
-            self._interrupt_running_program()
-            self._write(ENTER_RAW_REPL)
-            ok, data = self._read_until_raw_repl(timeout=3)
+            ok, data = self._try_common_baud_raw_repl()
 
         if not ok:
             # 尝试 DTR/RTS 硬件复位兜底
@@ -469,7 +820,7 @@ class MicroPython:
                 buf += chunk
                 self._record_rx(chunk)
                 if marker in buf:
-                    return True, b""
+                    return True, buf
                 idle_count = 0
                 sleep_time = 0.001
             else:
@@ -904,6 +1255,61 @@ class MicroPython:
                 result[remote_path] = parts[0] == "OK"
         return result
 
+    def _get_remote_block_crc(
+        self,
+        remote_path: str,
+        block_size: int,
+    ) -> RemoteBlockCrcResult:
+        script = (
+            DELTA_BLOCK_CRC.replace("FILE", repr(remote_path))
+            .replace("BLOCK_SIZE", str(block_size))
+        )
+        try:
+            out = self._execute(script, timeout=30, raise_on_error=False)
+        except Exception as exc:
+            return RemoteBlockCrcResult(error=str(exc))
+        return _parse_remote_block_crc_output(out)
+
+    def _send_flash_payload(
+        self,
+        script: str,
+        local_path: str,
+        total_size: int,
+        chunk_size: int,
+        offset: int = 0,
+        confirm_timeout: int = 10,
+        ack_every: int = BATCH_ACK_EVERY,
+    ) -> None:
+        self._drain_rx()
+        self._write(script.encode())
+        self._write(SET_EXECUTE)
+        found, err_data = self._read_until_marker(b"READY", timeout=30)
+        if not found:
+            raise RuntimeError(f"设备未就绪: {err_data!r}")
+
+        def _file_chunks() -> Any:
+            with open(local_path, "rb") as f:
+                if offset:
+                    f.seek(offset)
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        self._send_data_with_sparse_ack(
+            _file_chunks(),
+            total_size,
+            ack_every=ack_every,
+            desc="传输中",
+        )
+
+        # 等待设备端确认脚本退出。
+        self._write(b"ok")
+        found, err_data = self._read_until_marker(b"ok", timeout=confirm_timeout)
+        if not found:
+            raise RuntimeError(f"刷入完成但设备未确认: {err_data!r}")
+
     def flash_file(
         self,
         local_path: str,
@@ -963,12 +1369,18 @@ class MicroPython:
         chunk_size = self.config.chunk_size or DEFAULT_CHUNK_SIZE
         verify_mode = self.config.verify
         max_retries = self.config.max_retries
+        delta_enabled = (
+            self.config.delta_flash != "off"
+            and file_size >= self.config.delta_min_size
+        )
 
-        # 预计算 CRC32
+        local_content: Optional[bytes] = None
         expected_crc: Optional[int] = None
-        if verify_mode == "crc32":
+        if verify_mode == "crc32" or delta_enabled:
             with open(actual_local, "rb") as f:
-                expected_crc = self._compute_crc32(f.read())
+                local_content = f.read()
+            if verify_mode == "crc32":
+                expected_crc = self._compute_crc32(local_content)
 
         log.info(
             "刷入: %s → %s (%d 字节, 块=%d)",
@@ -979,11 +1391,85 @@ class MicroPython:
             log.info("[DRY-RUN] 将刷入 %s → %s (%d 字节)", local_path, actual_remote, file_size)
             return
 
-        script = (
+        upload_ack_every = self._upload_ack_every()
+        inline_verify_code = _build_inline_verify_code(
+            actual_remote,
+            file_size,
+            verify_mode,
+            expected_crc,
+            chunk_size,
+        )
+        inline_verify_timeout = 0
+        if verify_mode == "crc32":
+            inline_verify_timeout = max(15, file_size // 65536 + 15)
+        full_script = (
             FLASH.replace("FILE", repr(actual_remote))
             .replace("BFSIZE", str(chunk_size))
             .replace("FSIZE", str(file_size))
+            .replace("ACK_EVERY", str(upload_ack_every))
+            .replace("VERIFY_CODE", inline_verify_code)
         )
+
+        def _flash_once(allow_delta: bool) -> str:
+            transfer_offset = 0
+            transfer_size = file_size
+            script = full_script
+            action = "full"
+            confirm_timeout = max(10, inline_verify_timeout)
+
+            if allow_delta and local_content is not None:
+                remote = self._get_remote_block_crc(actual_remote, chunk_size)
+                local_blocks = _compute_block_crc32(local_content, chunk_size)
+                decision = _decide_delta_flash(
+                    file_size,
+                    remote.size,
+                    local_blocks,
+                    remote.blocks,
+                    chunk_size,
+                )
+                if remote.missing:
+                    log.debug("远端文件不存在，使用全量刷入: %s", actual_remote)
+                elif remote.error:
+                    log.debug("远端块校验不可用 (%s)，使用全量刷入: %s", remote.error, actual_remote)
+                elif decision.action == "skip":
+                    if verify_mode != "off":
+                        ok = self._verify_file_on_device(
+                            actual_remote, file_size, verify_mode, expected_crc,
+                        )
+                        if not ok:
+                            raise RuntimeError("校验失败")
+                    return "skip"
+                elif decision.action in ("suffix", "append", "truncate"):
+                    transfer_offset = decision.offset
+                    transfer_size = file_size - transfer_offset
+                    action = decision.action
+                    script = (
+                        FLASH_SUFFIX.replace("FILE", repr(actual_remote))
+                        .replace("BFSIZE", str(chunk_size))
+                        .replace("OFFSET", str(transfer_offset))
+                        .replace("FSIZE", str(transfer_size))
+                        .replace("FINAL_SIZE", str(file_size if decision.truncate else -1))
+                        .replace("ACK_EVERY", str(upload_ack_every))
+                        .replace("VERIFY_CODE", inline_verify_code)
+                    )
+                    if decision.truncate:
+                        confirm_timeout = max(10, file_size // max(chunk_size, 1) + 10)
+                    log.info(
+                        "块级增量刷入: %s offset=%d size=%d truncate=%s",
+                        actual_remote, transfer_offset, transfer_size, decision.truncate,
+                    )
+
+            self._send_flash_payload(
+                script,
+                actual_local,
+                transfer_size,
+                chunk_size,
+                offset=transfer_offset,
+                confirm_timeout=confirm_timeout,
+                ack_every=upload_ack_every,
+            )
+
+            return action
 
         _t0 = time.time()
         try:
@@ -993,46 +1479,42 @@ class MicroPython:
                 # 创建远程目录
                 self._mkdirs_on_device([actual_remote])
 
+                if delta_enabled:
+                    for attempt in range(max_retries + 1):
+                        if attempt > 0:
+                            self._enter_raw_repl()
+                            log.warning("增量刷入重试 %d/%d", attempt, max_retries)
+                        try:
+                            action = _flash_once(allow_delta=True)
+                            elapsed = time.time() - _t0
+                            if action == "skip":
+                                log.info("文件已一致，跳过刷入 (%s)", actual_remote)
+                            elif verify_mode == "off":
+                                log.info("刷入成功 (校验已关闭) (%s)", actual_remote)
+                            else:
+                                rate = file_size / elapsed / 1024 if elapsed > 0 else 0
+                                log.info(
+                                    "刷入成功 (%s): %.1f KB, %.1fs, %.0f KB/s",
+                                    actual_remote, file_size / 1024, elapsed, rate,
+                                )
+                            return
+                        except (serial.SerialException, ConnectionError, RuntimeError) as e:
+                            if attempt >= max_retries:
+                                log.warning("增量刷入失败，回退全量刷入: %s", e)
+                                break
+                            log.warning(
+                                "%s，准备重试增量刷入 (%d/%d)...",
+                                e, attempt + 1, max_retries,
+                            )
+
                 for attempt in range(max_retries + 1):
                     if attempt > 0:
                         self._enter_raw_repl()
                         log.warning("重试 %d/%d", attempt, max_retries)
 
                     try:
-                        self._drain_rx()
-                        self._write(script.encode())
-                        self._write(SET_EXECUTE)
-                        found, err_data = self._read_until_marker(b"READY", timeout=30)
-                        if not found:
-                            raise RuntimeError(f"设备未就绪: {err_data!r}")
-
-                        def _file_chunks() -> Any:
-                            with open(actual_local, "rb") as f:
-                                while True:
-                                    chunk = f.read(chunk_size)
-                                    if not chunk:
-                                        break
-                                    yield chunk
-
-                        self._send_data_with_ack(
-                            _file_chunks(), file_size,
-                        )
-
-                        # 等待刷入完成
-                        self._write(b"ok")
-                        found, err_data = self._read_until_marker(b"ok", timeout=10)
-                        if not found:
-                            log.warning("刷入完成但设备未返回确认，跳过校验 (%s)", actual_remote)
-                            log.info("刷入成功 (校验已跳过) (%s)", actual_remote)
-                            return
-
+                        _flash_once(allow_delta=False)
                         if verify_mode != "off":
-                            ok = self._verify_file_on_device(
-                                actual_remote, file_size,
-                                verify_mode, expected_crc,
-                            )
-                            if not ok:
-                                raise RuntimeError("校验失败")
                             elapsed = time.time() - _t0
                             rate = file_size / elapsed / 1024 if elapsed > 0 else 0
                             log.info(
@@ -1043,7 +1525,7 @@ class MicroPython:
                             log.info("刷入成功 (校验已关闭) (%s)", actual_remote)
                         return
 
-                    except (serial.SerialException, ConnectionError) as e:
+                    except (serial.SerialException, ConnectionError, RuntimeError) as e:
                         if attempt >= max_retries:
                             raise
                         log.warning(
@@ -1182,10 +1664,18 @@ class MicroPython:
                     )
                 return []
 
+            upload_ack_every = self._upload_ack_every()
+            inline_batch_verify_code = _build_inline_batch_verify_code(
+                verify_meta,
+                verify_mode,
+                expected_crcs,
+                chunk_size,
+            )
             script = (
                 FLASH_PROGRAM.replace("FILES", repr(file_meta))
                 .replace("BFSIZE", str(chunk_size))
-                .replace("ACK_EVERY", str(BATCH_ACK_EVERY))
+                .replace("ACK_EVERY", str(upload_ack_every))
+                .replace("VERIFY_CODE", inline_batch_verify_code)
             )
             max_retries = self.config.max_retries
             transfer_t0 = time.time()
@@ -1220,9 +1710,10 @@ class MicroPython:
                                 for i in range(0, total_data_size, chunk_size)
                             ),
                             total_data_size,
+                            ack_every=upload_ack_every,
                         )
 
-                        found, _err_data = self._read_until_marker(b">", timeout=10)
+                        found, prompt_data = self._read_until_marker(b">", timeout=10)
                         if not found:
                             elapsed = time.time() - transfer_t0
                             rate = total_data_size / elapsed / 1024 if elapsed > 0 else 0
@@ -1241,36 +1732,11 @@ class MicroPython:
                                 for item in prepared
                             ]
 
-                        if verify_mode != "off":
-                            verify_results = self._verify_files_on_device_batch(
-                                verify_meta,
-                                verify_mode,
-                                expected_crcs,
+                        if b"FLASH_ERR:" in prompt_data or b"Traceback" in prompt_data:
+                            raise RuntimeError(
+                                "device batch flash failed: "
+                                + prompt_data.decode("utf-8", errors="replace")
                             )
-                            failed = [
-                                item
-                                for item in prepared
-                                if not verify_results.get(item.remote_path, False)
-                            ]
-                            if failed:
-                                if attempt >= max_retries:
-                                    log.error(
-                                        "%d files failed verification after retries",
-                                        len(failed),
-                                    )
-                                    return [
-                                        (
-                                            item.source_path,
-                                            item.remote_path,
-                                            item not in failed,
-                                        )
-                                        for item in prepared
-                                    ]
-                                log.warning(
-                                    "%d files failed verification; retrying batch",
-                                    len(failed),
-                                )
-                                continue
 
                         elapsed = time.time() - transfer_t0
                         rate = total_data_size / elapsed / 1024 if elapsed > 0 else 0
@@ -1286,7 +1752,7 @@ class MicroPython:
                             for item in prepared
                         ]
 
-                    except (serial.SerialException, ConnectionError) as e:
+                    except (serial.SerialException, ConnectionError, RuntimeError) as e:
                         if attempt >= max_retries:
                             log.error("Batch flash failed: %s", e)
                             return [

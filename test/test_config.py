@@ -74,6 +74,27 @@ class TestLoadConfig:
             _write_json(tmp_path / CONFIG_FILE, {"verify": mode})
             assert _load_config().verify == mode
 
+    def test_delta_flash_modes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        for mode in ("off", "auto", "on"):
+            _write_json(tmp_path / CONFIG_FILE, {"delta_flash": mode})
+            assert _load_config().delta_flash == mode
+
+    def test_invalid_delta_flash_mode_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"delta_flash": "always"})
+        assert _load_config().delta_flash == "auto"
+
+    def test_custom_delta_min_size(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"delta_min_size": 2048})
+        assert _load_config().delta_min_size == 2048
+
+    def test_invalid_delta_min_size_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"delta_min_size": -1})
+        assert _load_config().delta_min_size == 10240
+
     def test_invalid_verify_mode_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {"verify": "sha256"})
@@ -146,6 +167,8 @@ class TestCreateDefaultConfig:
         assert data["download_threads"] == 4
         assert data["auto_compile"] is True
         assert data["baudrate"] == DEFAULT_BAUDRATE
+        assert data["delta_flash"] == "auto"
+        assert data["delta_min_size"] == 10240
 
     def test_default_config_is_loadable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)

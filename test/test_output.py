@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from cli.main import app, _norm_path
-from cli.project.sync import ProjectSyncManager
+from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.errors import humanize_exception
 
 runner = CliRunner()
@@ -176,6 +176,17 @@ class TestProjectStatusFormat:
         mgr.status.assert_called_once()
         assert mgr.status.call_args.kwargs.get("fmt") == "json"
 
+    def test_diff_flag_passed_to_status(self, tmp_path):
+        mp = MagicMock()
+        mp.detect_tags.return_value = {"ESP32"}
+        mgr = self._setup_sync(False)
+        with patch("cli.main._mp_factory", return_value=mp), \
+             patch("cli.main.ProjectSyncManager", return_value=mgr):
+            runner.invoke(app, ["project", "status", "/dev/ttyUSB0",
+                                str(tmp_path), "/pyrite", "--diff"])
+        mgr.status.assert_called_once()
+        assert mgr.status.call_args.kwargs.get("diff") is True
+
     def test_empty_project_status_outputs_json(self, tmp_path, capsys):
         mgr = ProjectSyncManager(MagicMock())
 
@@ -191,6 +202,28 @@ class TestProjectStatusFormat:
         }
         assert captured.err == ""
 
+    def test_status_default_does_not_download_device_file(self, tmp_path, capsys):
+        local = tmp_path / "main.py"
+        local.write_text("print('new')\n", encoding="utf-8")
+        (tmp_path / "pyrite_file_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "hash_algorithm": "sha256",
+                "files": {"main.py": compute_file_hash(str(local))},
+            }),
+            encoding="utf-8",
+        )
+        mp = MagicMock()
+        mp.run.return_value = str(local.stat().st_size)
+        mgr = ProjectSyncManager(mp)
+
+        has_diff = mgr.status(str(tmp_path), "/app")
+
+        captured = capsys.readouterr()
+        assert has_diff is False
+        assert "[MOD]" not in captured.err
+        mp._read_device_file.assert_not_called()
+
     def test_status_reads_device_file_and_prints_unified_diff(self, tmp_path, capsys):
         local = tmp_path / "main.py"
         local.write_text("print('new')\n", encoding="utf-8")
@@ -199,7 +232,7 @@ class TestProjectStatusFormat:
         mp._read_device_file.return_value = b"print('old')\n"
         mgr = ProjectSyncManager(mp)
 
-        has_diff = mgr.status(str(tmp_path), "/app")
+        has_diff = mgr.status(str(tmp_path), "/app", diff=True)
 
         captured = capsys.readouterr()
         assert has_diff is True

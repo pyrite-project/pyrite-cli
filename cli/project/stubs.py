@@ -148,14 +148,6 @@ def get_hardware_types(dirs: list[str]) -> set[str]:
     return hw_types
 
 
-def list_all_hardware(dirs: list[str]) -> None:
-    """列出所有可用的 MicroPython 硬件类型。"""
-    hw_types = sorted(get_hardware_types(dirs))
-    log.info("可用的 MicroPython 硬件类型（共 %d 个）:", len(hw_types))
-    for hw in hw_types:
-        log.info("  %s", hw)
-
-
 def download_stubs(
     stub_dir: str,
     output_dir: str,

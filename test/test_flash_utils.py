@@ -10,15 +10,14 @@ import pytest
 from cli.utils.flash import (
     BATCH_ACK_EVERY,
     FLASH,
+    FLASH_DELTA,
     FLASH_PROGRAM,
-    FLASH_SUFFIX,
     MicroPython,
     _build_inline_batch_verify_code,
     _build_inline_verify_code,
     _colorize_repl_output,
     _compute_block_crc32,
-    _decide_delta_flash,
-    _parse_remote_block_crc_output,
+    _load_mp_script,
 )
 from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.compiler import _compile_to_mpy
@@ -135,6 +134,11 @@ class TestComputeCrc32:
 
 
 class TestDeltaFlashHelpers:
+    def test_mp_scripts_are_loaded_from_external_files(self):
+        assert FLASH == _load_mp_script("flash.py")
+        assert FLASH_PROGRAM == _load_mp_script("flash_program.py")
+        assert FLASH_DELTA == _load_mp_script("flash_delta.py")
+
     def test_compute_block_crc32_splits_data(self):
         blocks = _compute_block_crc32(b"abcde", 2)
 
@@ -144,73 +148,8 @@ class TestDeltaFlashHelpers:
             (binascii.crc32(b"e") & 0xFFFFFFFF, 1),
         ]
 
-    def test_remote_missing_falls_back_to_full(self):
-        decision = _decide_delta_flash(
-            4,
-            None,
-            _compute_block_crc32(b"abcd", 2),
-            None,
-            2,
-        )
-
-        assert decision.action == "full"
-
-    def test_equal_blocks_skip_flash(self):
-        blocks = _compute_block_crc32(b"abcd", 2)
-
-        decision = _decide_delta_flash(4, 4, blocks, blocks, 2)
-
-        assert decision.action == "skip"
-        assert decision.offset == 0
-
-    def test_middle_difference_writes_suffix_from_first_bad_block(self):
-        local = _compute_block_crc32(b"aabbcc", 2)
-        remote = _compute_block_crc32(b"aaxxcc", 2)
-
-        decision = _decide_delta_flash(6, 6, local, remote, 2)
-
-        assert decision.action == "suffix"
-        assert decision.offset == 2
-        assert decision.truncate is False
-
-    def test_matching_prefix_and_longer_local_appends(self):
-        local = _compute_block_crc32(b"aabbcc", 2)
-        remote = _compute_block_crc32(b"aabb", 2)
-
-        decision = _decide_delta_flash(6, 4, local, remote, 2)
-
-        assert decision.action == "append"
-        assert decision.offset == 4
-
-    def test_matching_prefix_and_shorter_local_truncates_without_rewrite(self):
-        local = _compute_block_crc32(b"aabb", 2)
-        remote = _compute_block_crc32(b"aabbcc", 2)
-
-        decision = _decide_delta_flash(4, 6, local, remote, 2)
-
-        assert decision.action == "truncate"
-        assert decision.offset == 4
-        assert decision.truncate is True
-
-    def test_shorter_local_with_difference_writes_suffix_then_truncates(self):
-        local = _compute_block_crc32(b"aaxx", 2)
-        remote = _compute_block_crc32(b"aabbcc", 2)
-
-        decision = _decide_delta_flash(4, 6, local, remote, 2)
-
-        assert decision.action == "suffix"
-        assert decision.offset == 2
-        assert decision.truncate is True
-
-    def test_suffix_script_rebuilds_file_when_truncate_is_unavailable(self):
-        assert "f.truncate(final_size)" in FLASH_SUFFIX
-        assert "except Exception:" in FLASH_SUFFIX
-        assert "with open(tmp,'wb') as dst:" in FLASH_SUFFIX
-        assert "os.rename(FILE,bak)" in FLASH_SUFFIX
-        assert "os.rename(tmp,FILE)" in FLASH_SUFFIX
-
     def test_single_file_scripts_use_sparse_ack_and_batched_flush(self):
-        for script in (FLASH, FLASH_SUFFIX):
+        for script in (FLASH, FLASH_DELTA):
             assert "ack_every" in script
             assert "ack_count" in script
             assert "ack_count" in script and "%ack_every" in script.replace(" ", "")
@@ -218,8 +157,28 @@ class TestDeltaFlashHelpers:
             assert script.count("sys.stdout.write('+')") == 1
 
     def test_upload_scripts_use_small_serial_read_buffer(self):
-        for script in (FLASH, FLASH_SUFFIX, FLASH_PROGRAM):
+        for script in (FLASH, FLASH_DELTA, FLASH_PROGRAM):
             assert "usb.read(min(64," in script.replace(" ", "")
+
+    def test_batch_script_flushes_on_ack_window(self):
+        assert "f.write(d)\n                f.flush()\n                remaining" not in FLASH_PROGRAM
+        assert "if ack_every and ack_count % ack_every == 0:" in FLASH_PROGRAM
+        assert "f.flush()\n                    if total_left:" in FLASH_PROGRAM
+
+    def test_delta_header_parser(self):
+        action, offset, truncate, transfer_size = MicroPython._parse_delta_header(
+            b"OKDELTA:suffix:4096:1:128\nREADY"
+        )
+
+        assert action == "suffix"
+        assert offset == 4096
+        assert truncate is True
+        assert transfer_size == 128
+
+    def test_flash_delta_script_embeds_host_block_crc_table(self):
+        assert "local_blocks=LOCAL_BLOCKS" in FLASH_DELTA
+        assert "sys.stdout.write('DELTA:%s:%d:%d:%d\\n'" in FLASH_DELTA
+        assert "print('BLOCK'" not in FLASH_DELTA
 
     def test_inline_verify_code_checks_size(self):
         code = _build_inline_verify_code("/app.py", 123, "size", None, 4096)
@@ -251,48 +210,6 @@ class TestDeltaFlashHelpers:
         assert "VERIFY_SIZE" in code
         assert "VERIFY_CRC" in code
         assert "_vf.read(2048)" in code
-
-    def test_last_block_size_mismatch_is_a_suffix_difference(self):
-        local = [(123, 2)]
-        remote = [(123, 1)]
-
-        decision = _decide_delta_flash(2, 1, local, remote, 2)
-
-        assert decision.action == "suffix"
-        assert decision.offset == 0
-
-    def test_parse_remote_block_crc_output(self):
-        parsed = _parse_remote_block_crc_output(
-            "SIZE 5\nBLOCK 0 123 4\nBLOCK 1 45 1\nEND\n"
-        )
-
-        assert parsed.missing is False
-        assert parsed.error is None
-        assert parsed.size == 5
-        assert parsed.blocks == [(123, 4), (45, 1)]
-
-    @pytest.mark.parametrize("output", ["MISSING\n", "ERR OSError('bad')\n"])
-    def test_parse_remote_block_crc_output_fallback_markers(self, output):
-        parsed = _parse_remote_block_crc_output(output)
-
-        assert parsed.blocks is None
-        assert parsed.size is None
-
-    @pytest.mark.parametrize(
-        "output",
-        [
-            "",
-            "SIZE 5\nBLOCK 1 123 4\nEND\n",
-            "SIZE 5\nBLOCK 0 123 4\n",
-            "BLOCK 0 123 4\nEND\n",
-        ],
-    )
-    def test_parse_remote_block_crc_output_rejects_bad_format(self, output):
-        parsed = _parse_remote_block_crc_output(output)
-
-        assert parsed.error is not None
-        assert parsed.blocks is None
-
 
 class TestFilesystemMountGuard:
     def test_ensure_filesystem_mounted_supports_mpython_flashbdev_list(self, monkeypatch):
@@ -419,6 +336,38 @@ class TestUploadAckWindow:
         assert "VERIFY_CRC" in script
         assert "VERIFY_CODE" not in script
         assert kwargs["confirm_timeout"] >= 15
+
+    def test_flash_file_delta_embeds_local_blocks_without_remote_crc_roundtrip(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"abcdefgh")
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "on"
+        mp.config.delta_min_size = 1
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+
+        def fake_delta_send(script, *args, **kwargs):
+            calls.append((script, args, kwargs))
+            return "suffix"
+
+        monkeypatch.setattr(mp, "_send_delta_flash_payload", fake_delta_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        assert len(calls) == 1
+        script, args, kwargs = calls[0]
+        assert "local_blocks=[" in script
+        assert "DELTA:%s:%d:%d:%d" in script
+        assert args[0] == str(local)
+        assert kwargs["ack_every"] == BATCH_ACK_EVERY
 
 
 class TestRawReplBaudFallback:

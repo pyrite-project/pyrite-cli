@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## 性能优化取舍提醒
+
+- 不要默认建议把设备端 `usb.read(min(64, ...))` 放大；64B 读取窗口是为兼容不同 MicroPython 板卡和 REPL stdin 行为保留的稳定性设计。
+- 不要默认建议移除批量刷入中的 host 侧 `all_data = b"".join(...)` 合并；当前一次性连续数据流是为简化设备端协议和进度统计保留的设计。
+- 不要默认建议缩短串口连接/DTR/RTS 固定等待；这些等待用于提高 ESP32/ESP8266 等板卡复位和 Raw REPL 初始化稳定性。
+
 pyrite-cli 是一个 MicroPython 设备串口工具，通过 UART 原始 REPL 协议与设备通信，提供文件刷入、交互式 REPL、自动编译、条件编译、增量刷入、项目脚手架等功能。CLI 入口为 `pyrcli`（定义在 `pyproject.toml` 中 `cli.main:main`）。
 
 ## 环境

@@ -24,7 +24,6 @@ from cli.utils.webdav_mount import (
     mount_run_executable_for_system,
     open_linux_file_manager,
     open_macos_file_manager,
-    warm_up_directory_listing,
     webdav_file_manager_url,
 )
 
@@ -48,6 +47,7 @@ class FakeAdapter:
         self.moves = []
         self.operations = []
         self.usage = {"total": 1024, "used": 256, "free": 768}
+        self.usage_calls = 0
 
     def stat(self, path: str):
         if path in self.dirs:
@@ -68,6 +68,7 @@ class FakeAdapter:
         return children
 
     def fs_usage(self):
+        self.usage_calls += 1
         return self.usage
 
     def read_file(self, path: str) -> bytes:
@@ -346,6 +347,45 @@ def test_propfind_root_reports_real_device_flash_quota():
     assert status == 207
     assert "<D:quota-used-bytes>1536</D:quota-used-bytes>" in text
     assert "<D:quota-available-bytes>2560</D:quota-available-bytes>" in text
+
+
+def test_directory_cache_reuses_root_filesystem_usage_for_propfind():
+    adapter = FakeAdapter()
+    mapper = DevicePathMapper("/flash")
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        mapper.root,
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+    handler = make_webdav_handler(cache, mapper, WebDavConfig(empty_list_retry_delay=0))
+    server = WebDavThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        first_status, _headers, _body = _request(server, "PROPFIND", "/", headers={"Depth": "0"})
+        second_status, _headers, _body = _request(server, "PROPFIND", "/", headers={"Depth": "0"})
+    finally:
+        server.shutdown()
+
+    assert first_status == 207
+    assert second_status == 207
+    assert adapter.usage_calls == 1
+
+
+def test_directory_cache_refreshes_filesystem_usage_after_write():
+    adapter = FakeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    assert cache.fs_usage() is not None
+    assert cache.fs_usage() is not None
+    cache.write_file("/flash/main.py", b"print('updated')\n")
+    assert cache.fs_usage() is not None
+
+    assert adapter.usage_calls == 2
 
 
 def test_propfind_injects_run_trigger_file():
@@ -632,18 +672,6 @@ def test_propfind_returns_retry_when_startup_root_listing_is_not_ready():
     assert b"root directory listing is not ready" in body
 
 
-def test_warm_up_retries_transient_empty_root_listing():
-    adapter = TransientEmptyListAdapter()
-
-    warm_up_directory_listing(
-        adapter,
-        "/flash",
-        WebDavConfig(empty_list_retries=1, empty_list_retry_delay=0),
-    )
-
-    assert adapter.list_calls == 2
-
-
 def test_directory_cache_returns_root_before_background_scan_finishes():
     adapter = BlockingTreeAdapter()
     cache = DirectoryCachingWebDavAdapter(
@@ -667,7 +695,7 @@ def test_directory_cache_returns_root_before_background_scan_finishes():
     assert adapter.list_calls["/flash/lib"] == before
 
 
-def test_directory_cache_invalidates_after_write():
+def test_directory_cache_updates_file_write_without_root_rescan():
     adapter = BlockingTreeAdapter()
     adapter.dirs = {"/flash"}
     cache = DirectoryCachingWebDavAdapter(
@@ -680,9 +708,11 @@ def test_directory_cache_invalidates_after_write():
     assert adapter.list_calls["/flash"] == 1
 
     cache.write_file("/flash/new.py", b"print(1)\n")
-    cache.list_dir("/flash")
+    children = cache.list_dir("/flash")
 
-    assert adapter.list_calls["/flash"] == 2
+    assert adapter.list_calls["/flash"] == 1
+    assert [child.path for child in children] == ["/flash/main.py", "/flash/new.py"]
+    assert cache.stat("/flash/new.py") == DeviceFileStat(path="/flash/new.py", is_dir=False, size=9)
 
 
 def test_directory_cache_primes_from_recursive_listing_without_incremental_ls():
@@ -699,6 +729,23 @@ def test_directory_cache_primes_from_recursive_listing_without_incremental_ls():
     assert [child.path for child in cache.list_dir("/flash")] == ["/flash/lib", "/flash/main.py"]
     assert [child.path for child in cache.list_dir("/flash/lib")] == ["/flash/lib/pkg.py"]
     assert cache.stat("/flash/lib/pkg.py") == DeviceFileStat(path="/flash/lib/pkg.py", is_dir=False, size=7)
+    assert adapter.list_calls == 0
+
+
+def test_directory_cache_preserves_recursive_preload_after_file_write():
+    adapter = RecursiveListingAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    assert cache.prime_from_recursive_listing()
+    cache.write_file("/flash/main.py", b"print('updated')\n")
+
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/lib", "/flash/main.py"]
+    assert cache.stat("/flash/main.py") == DeviceFileStat(path="/flash/main.py", is_dir=False, size=17)
+    assert adapter.recursive_calls == ["/flash"]
     assert adapter.list_calls == 0
 
 

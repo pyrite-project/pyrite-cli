@@ -32,6 +32,7 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 
 [tool.setuptools.package-data]
 "cli.project" = ["feature_stub.pyi"]
+"cli.utils" = ["mp_scripts/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = [

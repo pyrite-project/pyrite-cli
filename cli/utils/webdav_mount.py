@@ -489,10 +489,12 @@ class DirectoryCachingWebDavAdapter:
         self._lock = threading.RLock()
         self._dirs: dict[str, list[DeviceFileStat]] = {}
         self._stats: dict[str, DeviceFileStat] = {}
+        self._usage: Optional[DeviceFilesystemUsage] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._generation = 0
         self._root_empty_since: Optional[float] = None
         self._root_listing_ready = False
+        self._tree_scan_complete = False
 
     def stat(self, path: str) -> Optional[DeviceFileStat]:
         normalized = self._normalize(path)
@@ -576,6 +578,7 @@ class DirectoryCachingWebDavAdapter:
             self._stats = stats
             self._root_listing_ready = True
             self._root_empty_since = None
+            self._tree_scan_complete = True
             generation = self._generation
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -592,7 +595,22 @@ class DirectoryCachingWebDavAdapter:
     def fs_usage(self) -> Optional[DeviceFilesystemUsage]:
         if not hasattr(self._adapter, "fs_usage"):
             return None
-        return self._adapter.fs_usage()
+        with self._lock:
+            if self._usage is not None:
+                log.debug("WebDAV CACHE usage-hit root=%s", self._root)
+                return self._usage
+
+        usage = self._adapter.fs_usage()
+        if usage is None:
+            return None
+        if not isinstance(usage, DeviceFilesystemUsage):
+            usage = DeviceFilesystemUsage(
+                used=max(0, int(usage.get("used", 0))),
+                free=max(0, int(usage.get("free", 0))),
+            )
+        with self._lock:
+            self._usage = usage
+        return usage
 
     def read_file(self, path: str) -> bytes:
         return self._adapter.read_file(path)
@@ -600,8 +618,10 @@ class DirectoryCachingWebDavAdapter:
     def write_file(self, path: str, data: bytes) -> None:
         try:
             self._adapter.write_file(path, data)
-        finally:
+        except Exception:
             self._invalidate()
+            raise
+        self._cache_file_write(path, len(data))
 
     def make_dir(self, path: str) -> None:
         try:
@@ -697,6 +717,32 @@ class DirectoryCachingWebDavAdapter:
                 self._stats[self._normalize(child.path)] = child
         return list(children)
 
+    def _cache_file_write(self, path: str, size: int) -> None:
+        normalized = self._normalize(path)
+        stat = DeviceFileStat(path=normalized, is_dir=False, size=size)
+        parent = self._parent_dir(normalized)
+        with self._lock:
+            self._usage = None
+            self._stats[normalized] = stat
+            self._dirs.pop(normalized, None)
+            children = self._dirs.get(parent)
+            if children is None:
+                self._tree_scan_complete = False
+                return
+
+            replaced = False
+            updated: list[DeviceFileStat] = []
+            for child in children:
+                if self._normalize(child.path) == normalized:
+                    updated.append(stat)
+                    replaced = True
+                else:
+                    updated.append(child)
+            if not replaced:
+                updated.append(stat)
+            updated.sort(key=lambda item: (not item.is_dir, item.path.lower()))
+            self._dirs[parent] = updated
+
     def _startup_retries_for(self, path: str) -> Optional[int]:
         if path == self._root and not self._root_listing_ready:
             return max(self._config.empty_list_retries, self._config.startup_empty_list_retries)
@@ -711,6 +757,8 @@ class DirectoryCachingWebDavAdapter:
 
     def _ensure_background_scan(self) -> None:
         with self._lock:
+            if self._tree_scan_complete:
+                return
             if self._scan_thread and self._scan_thread.is_alive():
                 return
             generation = self._generation
@@ -745,6 +793,9 @@ class DirectoryCachingWebDavAdapter:
                 children = self._fetch_and_cache_dir(path, generation)
                 scanned_dirs += 1
                 stack.extend(child.path for child in children if child.is_dir)
+            with self._lock:
+                if generation == self._generation:
+                    self._tree_scan_complete = True
             log.info("WebDAV 目录缓存后台扫描完成 root=%s dirs=%d", self._root, scanned_dirs)
         except Exception as exc:
             log.debug("WebDAV 目录缓存后台扫描失败 root=%s reason=%s", self._root, exc)
@@ -754,6 +805,8 @@ class DirectoryCachingWebDavAdapter:
             self._generation += 1
             self._dirs.clear()
             self._stats.clear()
+            self._usage = None
+            self._tree_scan_complete = False
             log.debug("WebDAV CACHE invalidated generation=%d", self._generation)
 
 
@@ -1309,21 +1362,6 @@ def connect_file_manager(url: str, drive: Optional[str] = None) -> tuple[str, Op
     if system == "Darwin":
         return open_macos_file_manager(url)
     raise RuntimeError(f"暂不支持自动打开 {system} 的文件管理器，请手动访问 {url}")
-
-
-def warm_up_directory_listing(adapter: object, root: str, config: WebDavConfig) -> None:
-    try:
-        stat = adapter.stat(root)
-        if stat and stat.is_dir:
-            children = list_dir_with_empty_retry(
-                adapter,
-                root,
-                config.empty_list_retries,
-                config.empty_list_retry_delay,
-            )
-            log.debug("WebDAV warm-up path=%s entries=%d", root, len(children))
-    except Exception as exc:
-        log.debug("WebDAV warm-up skipped path=%s reason=%s", root, exc)
 
 
 def serve_webdav(mp: MicroPython, config: WebDavConfig) -> None:

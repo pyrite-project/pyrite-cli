@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import http.client
+from importlib import import_module
 from typing import List, Optional
 from urllib.parse import urlencode
 
@@ -21,23 +22,42 @@ import typer
 
 from . import __version__
 
-from .project.project import init_stubs, new_project_interactive
-from .project.sync import ProjectSyncManager
 from .utils.config import DEFAULT_BAUDRATE, create_default_config
 from .utils.errors import humanize_exception
-from .utils.firmware import (
-    chip_info,
-    erase_flash,
-    flash_firmware,
-    read_flash,
-    verify_firmware,
-)
-from .utils.flash import MicroPython
 from .utils.log import configure_from_verbosity, get_logger
 from .utils.output import is_tty, log as output_log, print_json
-from .utils.webrepl_micropython import WebREPLMicroPython
 
 log = get_logger(__name__)
+
+
+class _LazyObject:
+    def __init__(self, module_name: str, attr_name: str) -> None:
+        self._module_name = module_name
+        self._attr_name = attr_name
+        self._target = None
+
+    def _load(self):
+        if self._target is None:
+            self._target = getattr(import_module(self._module_name), self._attr_name)
+        return self._target
+
+    def __call__(self, *args, **kwargs):
+        return self._load()(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+
+MicroPython = _LazyObject("cli.utils.flash", "MicroPython")
+WebREPLMicroPython = _LazyObject("cli.utils.webrepl_micropython", "WebREPLMicroPython")
+ProjectSyncManager = _LazyObject("cli.project.sync", "ProjectSyncManager")
+init_stubs = _LazyObject("cli.project.project", "init_stubs")
+new_project_interactive = _LazyObject("cli.project.project", "new_project_interactive")
+flash_firmware = _LazyObject("cli.utils.firmware", "flash_firmware")
+erase_flash = _LazyObject("cli.utils.firmware", "erase_flash")
+chip_info = _LazyObject("cli.utils.firmware", "chip_info")
+verify_firmware = _LazyObject("cli.utils.firmware", "verify_firmware")
+read_flash = _LazyObject("cli.utils.firmware", "read_flash")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -848,6 +868,7 @@ def project_status(
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    diff: bool = typer.Option(False, "--diff", help="download device files and print unified diff"),
     fmt: str = _FORMAT_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
@@ -871,7 +892,7 @@ def project_status(
         has_diff = ProjectSyncManager(mp).status(
             directory, remote_path, hash_config_path=hash_config,
             active_tags=active_tags or None,
-            manifest_path=manifest, fmt=fmt,
+            manifest_path=manifest, fmt=fmt, diff=diff,
         )
     finally:
         mp.disconnect()

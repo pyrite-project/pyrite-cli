@@ -162,10 +162,6 @@ Extracts all available hardware types from the list of stub directory names.
 - Parse rule: for directory names starting with `micropython-v`, the third `-`-delimited segment is the hardware type
 - e.g. `micropython-v1_20_0-esp32` → `esp32`, `micropython-v1_20_0-rp2` → `rp2`
 
-#### `list_all_hardware(dirs: list[str]) -> None`
-
-Prints all available MicroPython hardware types.
-
 #### `list_available(dirs: list[str], hardware: str) -> None`
 
 Prints all available stubs for a given hardware type.

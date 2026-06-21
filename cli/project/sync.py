@@ -309,6 +309,7 @@ class ProjectSyncManager:
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
         fmt: str = "text",
+        diff: bool = False,
     ) -> bool:
         """比对本地哈希和设备端文件，显示差异清单（不刷入）。"""
         if hash_config_path is None:
@@ -353,8 +354,16 @@ class ProjectSyncManager:
             cur_hash = current_hashes.get(rp)
             old_hash = stored.get(rel)
             dev_size = dev_sizes.get(rp, -1)
+            local_size = os.path.getsize(local_path)
             if dev_size < 0:
                 added.append((rel, rp))
+                continue
+
+            if not diff:
+                if dev_size != local_size or old_hash is None or cur_hash != old_hash:
+                    changed.append((rel, rp, ""))
+                else:
+                    ok_count += 1
                 continue
 
             with open(local_path, "rb") as f:

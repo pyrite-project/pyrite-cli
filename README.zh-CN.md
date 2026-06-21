@@ -1,31 +1,35 @@
-# Pyrite CLI
+<h1 align="center">Pyrite CLI</h1>
 
-[English](README.md) | [中文](README.zh-CN.md)
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
+</p>
 
-Pyrite CLI 是一个 MicroPython 设备工具箱，用来刷入代码、浏览文件、打开 REPL、同步项目，并把设备文件系统挂载到文件系统。它可以通过 UART raw REPL 与设备通信，也可以通过 WebREPL WebSocket 走 Wi-Fi 通道；同一套命令同时覆盖 USB 串口和远程 WebREPL。
+Pyrite CLI 是一个面向 MicroPython 开发板的精简命令行工具箱。它通过统一的 `pyrcli` 命令界面，帮助你发现设备、刷入文件、同步项目、查看设备文件系统、打开 REPL、通过 WebDAV 挂载文件，以及执行固件相关任务。
 
-它面向 MicroPython 日常开发循环：发现设备、推送代码、查看文件、运行一段命令，然后快速重复。
+它默认通过 UART raw REPL 与设备通信；添加 `--ws` 后，可以改用 WebREPL over WebSocket。
 
-## 功能/亮点
+## 一览
 
-| 需求 | 命令 | Pyrite CLI 做什么 |
-|------|------|-------------------|
-| 发现设备 | `pyrcli scan` | 扫描串口设备，可探测板级信息，可输出 JSON |
-| 刷入单文件 | `pyrcli flash COM3 main.py /main.py` | 预处理、可选编译 `.mpy`、传输并校验 |
-| 同步项目 | `pyrcli project flash COM3 . /app` | 基于哈希只上传新增或变更文件 |
-| 浏览文件 | `pyrcli fs ls COM3 /` | 列表、上传、下载、删除、移动、复制设备文件 |
-| 桌面挂载 | `pyrcli mount COM3` | 通过本地 WebDAV 将MicroPython设备的文件系统桥接到系统文件管理器 |
-| 交互调试 | `pyrcli repl COM3` | 打开交互式 MicroPython REPL |
-| Wi-Fi 连接 | `--ws ws://esp32.local:8266` | 将设备命令切换到 WebREPL |
-| 固件烧录 | `pyrcli firmware flash COM3 firmware.bin` | 封装 `esptool` 固件操作 |
+| 任务 | 命令 | 说明 |
+|------|------|------|
+| 发现设备 | `pyrcli scan` | 扫描串口设备，可选板级探测和 JSON 输出 |
+| 刷入单文件 | `pyrcli flash COM3 main.py /main.py` | 预处理、可选编译为 `.mpy`、传输、校验 |
+| 同步项目 | `pyrcli project flash COM3 . /app` | 只上传新增或变更文件 |
+| 浏览文件 | `pyrcli fs ls COM3 /` | 列出、上传、下载、删除、移动和复制文件 |
+| 挂载文件 | `pyrcli mount COM3` | 通过本地 WebDAV 暴露设备文件系统 |
+| 实时调试 | `pyrcli repl COM3` | 打开交互式 MicroPython REPL |
+| 使用 WebREPL | `--ws ws://XXX:XXXX` | 通过 WebREPL 路由设备命令 |
+| 烧录固件 | `pyrcli firmware flash COM3 firmware.bin` | 封装 `esptool` 固件操作 |
 
 ## 安装
+
+Pyrite CLI 需要 Python 3.10 或更高版本。
 
 ```bash
 pip install pyrite-cli
 ```
 
-固件烧录是可选能力，需要额外安装 `esptool`：
+固件烧录是可选能力，需要 `esptool`：
 
 ```bash
 pip install esptool
@@ -37,37 +41,38 @@ pip install esptool
 pip install -e .
 ```
 
-核心运行依赖包括 `typer`、`pyserial`、`requests`、`tqdm`、`mpy-cross`、`libcst` 和 `websocket-client`。
-
 ## 快速上手
 
+把示例里的 `COM3` 替换成你的串口。
+
 ```bash
-# 发现设备
+# 发现已连接的开发板
 pyrcli scan
 pyrcli scan -i
 
 # 查看板级信息
 pyrcli board-info COM3
 
-# 刷入文件
+# 刷入并运行
 pyrcli flash COM3 main.py /main.py
-
-# 执行一段命令
 pyrcli run COM3 "import machine; print(machine.freq())"
 
-# 打开交互式 REPL
-pyrcli repl COM3
-
-# 列出和传输文件
+# 操作文件
 pyrcli fs ls COM3 /
 pyrcli fs put COM3 local.py /remote.py
 pyrcli fs get COM3 /remote.py local_copy.py
 
-# 在桌面文件管理器中挂载设备文件系统
+# 打开交互式 REPL
+pyrcli repl COM3
+```
+
+在桌面文件管理器中挂载设备文件系统：
+
+```bash
 pyrcli mount COM3
 ```
 
-给设备命令添加 `--ws` 即可改用 WebREPL。位置参数 `PORT` 会保留，用来保持 CLI 形状一致；真正的连接目标是 WebSocket URL。
+给设备命令添加 `--ws` 即可改用 WebREPL。位置参数 `PORT` 会保留，用来保持 CLI 形状一致；真正的传输目标是 WebSocket URL。
 
 ```bash
 pyrcli board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
@@ -77,51 +82,49 @@ pyrcli mount COM3 --ws ws://esp32.local:8266 --password mypass
 
 省略 `--password` 时，WebREPL 密码解析顺序为：命令行参数、`PYRITE_WEBREPL_PASSWORD` 环境变量、交互输入。
 
-## 主要功能
+## 核心能力
 
-**快速刷入链路**
+### 快速刷入
 
 Pyrite CLI 会进入 raw REPL、分块传输代码、校验结果，并恢复设备会话。Python 文件可在上传前自动编译为 `.mpy`。
 
-**项目级增量同步**
+### 增量项目同步
 
-`pyrcli project hash` 记录本地 SHA256 哈希。`pyrcli project flash` 对比状态，只上传新增或变更文件。
+`pyrcli project hash` 记录本地 SHA256 哈希。`pyrcli project flash` 对比该状态，只上传新增或变更文件。
 
-**条件编译**
+### 条件构建
 
-使用 `@feature("wifi")`、`@target("esp32")`、`with feature(...)` 和 `with target(...)`，可以用同一套源码管理多块开发板或多个固件变体。Pyrite CLI 使用 `libcst` 做语法树级重写，不用正则替换。
+使用 `@feature("wifi")`、`@target("esp32")`、`with feature(...)` 和 `with target(...)`，可以用同一套源码管理多块开发板或多个固件变体。Pyrite CLI 使用 `libcst` 重写语法，而不是正则替换。
 
-**Manifest 刷入清单**
+### Manifest 刷入
 
-`manifest.py` 可以选择模块和包、重映射远端路径，并按 feature 标签过滤文件。解析器基于 `ast`，不会执行任意代码。
+`manifest.py` 可以选择模块和包、重映射远端路径，并按 feature 标签过滤文件。它通过 `ast` 解析，不会执行任意代码。
 
-**桌面文件系统桥接**
+### 桌面文件系统桥接
 
-`pyrcli mount` 启动本地 WebDAV 服务，把文件管理器操作映射为 MicroPython 文件操作。Windows 可映射盘符；Linux 和 macOS 会在默认文件管理器中打开 WebDAV 位置。
+`pyrcli mount` 会启动本地 WebDAV 服务，把文件管理器操作映射为 MicroPython 文件操作。Windows 可映射盘符；Linux 和 macOS 会在默认文件管理器中打开 WebDAV 位置。
 
-**传输层抽象**
+### 共享传输层
 
 串口和 WebREPL 共用同一组高层 MicroPython 操作。大多数设备命令都支持 `--ws` 和 `--password`。
 
 ## 常见工作流
 
-### 创建项目
+创建项目并准备编辑器支持：
 
 ```bash
 pyrcli project new my-project
 pyrcli project new my-project --platform COM3
 ```
 
-项目助手可以检测开发板、下载匹配的 MicroPython 类型存根，并准备编辑器配置。
-
-### 刷入目录
+刷入目录：
 
 ```bash
 pyrcli flash-program COM3 src/ /app
 pyrcli flash-program COM3 src/ /app --manifest manifest.py
 ```
 
-### 增量同步项目
+增量同步项目：
 
 ```bash
 pyrcli project hash .
@@ -130,7 +133,7 @@ pyrcli project flash COM3 . /app
 pyrcli project pull COM3 . /app
 ```
 
-### 浏览和挂载文件
+浏览和挂载文件：
 
 ```bash
 pyrcli fs ls COM3 / -r
@@ -140,7 +143,7 @@ pyrcli mount COM3 --readonly
 pyrcli mount COM3 --drive P
 ```
 
-### 固件烧录
+烧录固件：
 
 ```bash
 pyrcli firmware flash COM3 firmware.bin
@@ -180,33 +183,30 @@ ESP32_S3 = ["ESP32", "wifi"]
 C3 = ["ESP32", "wifi"]
 ```
 
-## 文档导航
-
-想按路径阅读，可以从这里进入：
+## 文档
 
 | 主题 | 文档 |
 |------|------|
 | 入门、命令、配置 | [快速上手](docs/快速上手.md) |
 | 刷入协议与项目同步 | [设备刷入与项目同步](docs/设备刷入与项目同步.md) |
-| 条件编译实战 | [条件编译实战](docs/条件编译实战.md) |
-| 条件编译英文指南 | [Conditional Compilation: Practical Guide](docs/conditional-compilation-guide.md) |
+| 条件编译指南 | [Conditional Compilation: Practical Guide](docs/conditional-compilation-guide.md) |
+| 条件编译中文实战 | [条件编译实战](docs/条件编译实战.md) |
 | WebDAV 桌面挂载 | [WebDAV 挂载](docs/WebDAV挂载.md) |
 | 架构说明 | [Architecture](docs/architecture.md) |
-| `flash.py` 内部说明 | [`flash.py` internals](docs/关于flash.py_EN.md) |
 
-## 命令地图
+## 命令参考
 
 ### 顶层命令
 
 | 命令 | 作用 |
 |------|------|
 | `scan` | 扫描串口设备，支持过滤和 JSON 输出 |
-| `flash` | 刷入单个本地文件 |
+| `flash` | 刷入单个本地文件到设备 |
 | `flash-program` | 递归刷入本地目录 |
 | `run` | 在设备上执行 Python 代码 |
 | `repl` | 打开交互式 REPL |
-| `reset` | 通过 raw REPL 软重启 |
-| `board-info` | 输出固件、CPU、内存、Flash、文件系统信息 |
+| `reset` | 通过 raw REPL 软重启设备 |
+| `board-info` | 输出固件、CPU、内存、Flash 和文件系统信息 |
 | `mount` | 通过本地 WebDAV 挂载设备文件系统 |
 | `config` | 创建默认 `.pyrite_config.json` |
 
@@ -226,7 +226,7 @@ C3 = ["ESP32", "wifi"]
 
 | 命令 | 作用 |
 |------|------|
-| `fs ls` | 列文件，支持递归、排序、分页 |
+| `fs ls` | 列出文件，支持递归、排序和分页 |
 | `fs cat` | 打印设备端文本文件 |
 | `fs put` | 上传本地文件 |
 | `fs get` | 下载设备文件 |
@@ -244,36 +244,3 @@ C3 = ["ESP32", "wifi"]
 | `firmware info` | 读取芯片和 Flash 信息 |
 | `firmware verify` | 验证固件内容 |
 | `firmware read` | 读取 Flash 内容到文件 |
-
-## 内部工作方式
-
-Pyrite CLI 以 MicroPython raw REPL 作为统一执行层。
-
-- 通过 `Ctrl+A` (`0x01`) 进入 raw REPL，然后在设备上执行小段 Python。
-- 单文件刷入会注入设备端接收脚本，从 `sys.stdin.buffer` 读取二进制块。
-- 批量刷入先发送文件大小和路径清单，再发送连续数据流。
-- 下载采用两阶段 bytes 协议：先查询大小，再按已知大小接收字节。
-- 协议助手会剥离 `\x04\x04>` 等 REPL 尾部标记。
-- 刷入前设置 `kbd_intr(-1)`，避免数据流中的 `0x03` 被误当成键盘中断。
-- `fs ls` 会故意执行两次 `os.stat(p)`，因为部分 MicroPython 板子首次调用可能返回过期数据。
-- 统一日志系统会写入 JSONL 操作记录，并可记录串口或 WebSocket 流量。
-
-## 开发
-
-运行无需设备的纯逻辑测试：
-
-```bash
-pytest test/test_protocol_helpers.py test/test_flash_utils.py test/test_config.py test/test_manifest_loader.py test/test_logger.py test/test_output.py test/test_webdav_mount.py -v
-```
-
-实机验证需要连接 MicroPython 开发板：
-
-```bash
-pyrcli board-info COM3
-pyrcli flash COM3 main.py /main.py
-pyrcli run COM3 "print('hello')"
-```
-
-## License
-
-见 [LICENSE](LICENSE)。

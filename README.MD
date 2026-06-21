@@ -1,25 +1,29 @@
-# Pyrite CLI
+<h1 align="center">Pyrite CLI</h1>
 
-Welcome👋! [English](README.md) | [中文](README.zh-CN.md)
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
+</p>
 
-Pyrite CLI is a MicroPython device toolkit for flashing code or , browsing files, opening a REPL, syncing projects, and mounting the device filesystem in your system. It talks to boards through UART raw REPL or WebREPL over WebSocket, so the same command surface works over USB serial and Wi-Fi.
+Pyrite CLI is a focused command-line toolkit for MicroPython boards. It helps you find devices, flash files, sync projects, inspect the device filesystem, open a REPL, mount files through WebDAV, and run firmware tasks from one `pyrcli` command surface.
 
-It is built for the everyday loop of MicroPython development: find the board, push code, inspect files, run a quick command, and repeat without juggling several small tools.
+It talks to boards through UART raw REPL by default, and can use WebREPL over WebSocket when you add `--ws`.
 
-## Features/Highlights
+## At a Glance
 
-| Need | Command | What Pyrite CLI does |
-|------|---------|----------------------|
-| Find boards | `pyrcli scan` | Lists serial devices, with optional board probing and JSON output |
-| Flash one file | `pyrcli flash COM3 main.py /main.py` | Preprocesses, optionally compiles to `.mpy`, transfers, and verifies |
-| Sync a project | `pyrcli project flash COM3 . /app` | Uses hashes to upload only changed files |
-| Browse files | `pyrcli fs ls COM3 /` | Lists, uploads, downloads, removes, moves, and copies device files |
-| Mount files | `pyrcli mount COM3` | Exposes the device filesystem through a local WebDAV bridge |
-| Debug live | `pyrcli repl COM3` | Opens an interactive MicroPython REPL |
-| Use Wi-Fi | `--ws ws://esp32.local:8266` | Routes device commands through WebREPL |
-| Flash firmware | `pyrcli firmware flash COM3 firmware.bin` | Wraps `esptool` for firmware operations |
+| Task | Command | Notes |
+|------|---------|-------|
+| Find boards | `pyrcli scan` | Serial scan, optional board probing, JSON output |
+| Flash one file | `pyrcli flash COM3 main.py /main.py` | Preprocess, optionally compile to `.mpy`, transfer, verify |
+| Sync a project | `pyrcli project flash COM3 . /app` | Upload only added or changed files |
+| Browse files | `pyrcli fs ls COM3 /` | List, upload, download, remove, move, and copy files |
+| Mount files | `pyrcli mount COM3` | Expose the device filesystem through local WebDAV |
+| Debug live | `pyrcli repl COM3` | Open an interactive MicroPython REPL |
+| Use WebREPL | `--ws ws://XXX:XXXX` | Route device commands through WebREPL |
+| Flash firmware | `pyrcli firmware flash COM3 firmware.bin` | Wrap `esptool` for firmware operations |
 
 ## Install
+
+Pyrite CLI requires Python 3.10 or newer.
 
 ```bash
 pip install pyrite-cli
@@ -37,9 +41,9 @@ For local development from this repository:
 pip install -e .
 ```
 
-Core runtime dependencies include `typer`, `pyserial`, `requests`, `tqdm`, `mpy-cross`, `libcst`, and `websocket-client`.
-
 ## Quick Start
+
+Use the examples with your own serial port in place of `COM3`.
 
 ```bash
 # Find connected boards
@@ -49,25 +53,26 @@ pyrcli scan -i
 # Inspect a board
 pyrcli board-info COM3
 
-# Flash a file
+# Flash and run
 pyrcli flash COM3 main.py /main.py
-
-# Run a quick command
 pyrcli run COM3 "import machine; print(machine.freq())"
 
-# Open an interactive REPL
-pyrcli repl COM3
-
-# List and transfer files
+# Work with files
 pyrcli fs ls COM3 /
 pyrcli fs put COM3 local.py /remote.py
 pyrcli fs get COM3 /remote.py local_copy.py
 
-# Mount the filesystem in your desktop file manager
+# Open an interactive REPL
+pyrcli repl COM3
+```
+
+Mount the device filesystem in your desktop file manager:
+
+```bash
 pyrcli mount COM3
 ```
 
-Use WebREPL instead of serial by adding `--ws`. The positional `PORT` is kept for a consistent CLI shape; the WebSocket URL is the real transport target.
+Use WebREPL instead of serial by adding `--ws`. The positional `PORT` stays in place for a consistent CLI shape; the WebSocket URL is the actual transport target.
 
 ```bash
 pyrcli board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
@@ -77,51 +82,49 @@ pyrcli mount COM3 --ws ws://esp32.local:8266 --password mypass
 
 If `--password` is omitted, WebREPL password resolution is: CLI option, `PYRITE_WEBREPL_PASSWORD`, then interactive prompt.
 
-## Main Features
+## Core Capabilities
 
-**Fast flashing loop**
+### Fast Flashing
 
 Pyrite CLI enters raw REPL, transfers code in chunks, verifies the result, and restores the device session. Python files can be compiled to `.mpy` automatically before upload.
 
-**Project-level incremental sync**
+### Incremental Project Sync
 
 `pyrcli project hash` records local SHA256 hashes. `pyrcli project flash` compares that state and uploads only added or changed files.
 
-**Conditional builds**
+### Conditional Builds
 
 Use `@feature("wifi")`, `@target("esp32")`, `with feature(...)`, and `with target(...)` to keep one source tree for several boards or firmware variants. Pyrite CLI rewrites the syntax with `libcst`, not regular expressions.
 
-**Manifest-based flashing**
+### Manifest-Based Flashing
 
 `manifest.py` can select modules and packages, remap remote paths, and filter files by feature tags. It is parsed with `ast` and does not execute arbitrary code.
 
-**Desktop filesystem bridge**
+### Desktop Filesystem Bridge
 
 `pyrcli mount` starts a local WebDAV server and maps desktop file-manager actions to MicroPython file operations. Windows can map a drive letter; Linux and macOS open the WebDAV location in the default file manager.
 
-**Transport abstraction**
+### Shared Transport Layer
 
 Serial and WebREPL share the same high-level MicroPython operations. Most device commands accept `--ws` and `--password`.
 
 ## Common Workflows
 
-### Create a project
+Create a project and prepare editor support:
 
 ```bash
 pyrcli project new my-project
 pyrcli project new my-project --platform COM3
 ```
 
-The project helper can detect the board, download matching MicroPython type stubs, and prepare editor configuration.
-
-### Flash a directory
+Flash a directory:
 
 ```bash
 pyrcli flash-program COM3 src/ /app
 pyrcli flash-program COM3 src/ /app --manifest manifest.py
 ```
 
-### Incremental project sync
+Sync a project incrementally:
 
 ```bash
 pyrcli project hash .
@@ -130,7 +133,7 @@ pyrcli project flash COM3 . /app
 pyrcli project pull COM3 . /app
 ```
 
-### Browse and mount files
+Browse and mount files:
 
 ```bash
 pyrcli fs ls COM3 / -r
@@ -140,7 +143,7 @@ pyrcli mount COM3 --readonly
 pyrcli mount COM3 --drive P
 ```
 
-### Flash firmware
+Flash firmware:
 
 ```bash
 pyrcli firmware flash COM3 firmware.bin
@@ -182,8 +185,6 @@ C3 = ["ESP32", "wifi"]
 
 ## Documentation
 
-Start here if you want a guided path:
-
 | Topic | Document |
 |-------|----------|
 | First steps, commands, config | [快速上手](docs/快速上手.md) |
@@ -192,11 +193,10 @@ Start here if you want a guided path:
 | Conditional compilation, Chinese | [条件编译实战](docs/条件编译实战.md) |
 | WebDAV desktop mount | [WebDAV 挂载](docs/WebDAV挂载.md) |
 | Architecture notes | [Architecture](docs/architecture.md) |
-| `flash.py` internals | [`flash.py` internals](docs/关于flash.py_EN.md) |
 
-## Command Map
+## Command Reference
 
-### Top-level commands
+### Top-Level Commands
 
 | Command | Purpose |
 |---------|---------|
@@ -244,36 +244,3 @@ Start here if you want a guided path:
 | `firmware info` | Read chip and flash information |
 | `firmware verify` | Verify firmware contents |
 | `firmware read` | Read flash contents to a file |
-
-## How it work
-
-Pyrite CLI uses MicroPython raw REPL as the common execution layer.
-
-- Raw REPL is entered with `Ctrl+A` (`0x01`), then small Python snippets are executed on the device.
-- Single-file flashing injects a device-side receiver that reads binary chunks from `sys.stdin.buffer`.
-- Batch flashing sends one manifest of file sizes and paths, followed by one continuous data stream.
-- Downloads use a two-stage bytes protocol: query size first, then read a known number of bytes.
-- REPL trailers such as `\x04\x04>` are stripped by protocol helpers.
-- `kbd_intr(-1)` is set before flashing so data bytes containing `0x03` do not trigger a keyboard interrupt.
-- `fs ls` intentionally calls `os.stat(p)` twice because some MicroPython boards can return stale data on the first call.
-- Logs are written through the unified logger, including JSONL operation records and serial/WebSocket traffic traces.
-
-## Development
-
-Run the pure logic tests without a device:
-
-```bash
-pytest test/test_protocol_helpers.py test/test_flash_utils.py test/test_config.py test/test_manifest_loader.py test/test_logger.py test/test_output.py test/test_webdav_mount.py -v
-```
-
-Device validation requires an attached MicroPython board:
-
-```bash
-pyrcli board-info COM3
-pyrcli flash COM3 main.py /main.py
-pyrcli run COM3 "print('hello')"
-```
-
-## License
-
-See [LICENSE](LICENSE).

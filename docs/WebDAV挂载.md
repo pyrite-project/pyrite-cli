@@ -4,6 +4,8 @@
 
 这个方案不依赖设备固件的 USB MTP 支持，也不需要在设备端运行常驻服务。只要设备能通过现有串口或 WebREPL 进入 Raw REPL，就可以使用。
 
+如果需要相反方向，即让设备端访问上位机目录，请使用 `pyrcli remount`。`remount` 委托 `mpremote mount`，会把本地目录挂到设备 VFS 的 `/remote`，不走本页描述的 WebDAV 服务。
+
 ---
 
 ## 1. 工作方式
@@ -67,6 +69,28 @@ Ctrl+C
 ```
 
 停止时会断开串口连接，并尽量清理自动创建的系统挂载。
+
+---
+
+## 2.1 反向挂载：remount
+
+```powershell
+pyrcli remount COM4 .
+```
+
+`remount` 的方向是设备访问 PC：设备端会看到 `/remote`，当前工作目录也由 `mpremote` 切到 `/remote`。它等价于：
+
+```powershell
+mpremote connect COM4 mount .
+```
+
+如果目录中有符号链接，并且确实需要让设备端跟随链接访问挂载根目录之外的文件，可以显式开启：
+
+```powershell
+pyrcli remount COM4 . --unsafe-links
+```
+
+`remount` 仅支持串口路径，因为它使用的是 `mpremote` 的串口连接能力；WebREPL 仍使用 `pyrcli mount --ws ...` 访问设备文件系统。
 
 ---
 
@@ -309,7 +333,7 @@ INFO [cli.utils.webdav_mount] WebDAV PUT /main.py -> /main.py 204 0B 518.7ms cli
 `pyrcli mount` 已做目录缓存和空列表重试：
 
 1. 默认会在 WebDAV 服务启动前预热根目录缓存，避免文件管理器首次访问时看到偶发空目录。
-2. 使用 `--load-all` 时，WebDAV 服务挂载前会先调用 `flash.py` 内的 `fs_ls_recursive()` 读取并缓存整棵目录结构。
+2. 使用 `--load-all` 时，WebDAV 服务挂载前会先调用 `cli.utils.flash` 暴露的 `fs_ls_recursive()` 读取并缓存整棵目录结构。
 3. 增量目录读取仍会在 `PROPFIND Depth: 1` 遇到空列表时短重试一次，避免把偶发空结果写入缓存。
 
 默认重试间隔约 `80ms`。后续浏览已扫描过的目录时，会优先使用 PC 侧缓存，减少串口往返和刚打开文件管理器时偶发显示空目录的情况。

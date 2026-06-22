@@ -18,18 +18,17 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import serial
 import serial.tools.list_ports
 
-from .ansi import _RESET
-from .compiler import _compile_files_parallel, _compile_to_mpy
-from .config import DEFAULT_BAUDRATE, DEFAULT_CHUNK_SIZE, _load_config
-from .log import TrafficMonitor, get_logger
-from .serial_transport import SerialTransport
-from .transport import Transport
-from .types import PyriteConfig
+from ..ansi import _RESET
+from ..compiler import _compile_files_parallel, _compile_to_mpy
+from ..config import DEFAULT_BAUDRATE, DEFAULT_CHUNK_SIZE, _load_config
+from ..log import TrafficMonitor, get_logger
+from ..transport import SerialTransport, Transport
+from ..types import PyriteConfig
 
 try:
     from tqdm import tqdm
@@ -49,6 +48,12 @@ class _PreparedFlashFile:
     local_path: str
     content: bytes
     size: int
+
+
+@dataclass
+class _WindowsReplInput:
+    data: bytes
+    echo_as: Optional[str] = None
 
 
 # ── 原始 REPL 协议常量 ──
@@ -203,6 +208,176 @@ def _colorize_repl_output(text: str, in_error: bool) -> Tuple[str, bool]:
             return "\033[31m" + text[:m.end()] + "\033[0m" + text[m.end():], False
         return "\033[31m" + text + "\033[0m", True
     return text, False
+
+
+_WINDOWS_EXT_KEYS = {
+    "H": b"\x1b[A",
+    "P": b"\x1b[B",
+    "M": b"\x1b[C",
+    "K": b"\x1b[D",
+    "G": b"\x1b[H",
+    "O": b"\x1b[F",
+    "S": b"\x1b[3~",
+    "R": b"\x1b[2~",
+    "I": b"\x1b[5~",
+    "Q": b"\x1b[6~",
+}
+
+
+class _WindowsReplEchoFilter:
+    def __init__(self) -> None:
+        self._pending: List[Tuple[bytes, bytes]] = []
+        self._current: Optional[Tuple[bytes, bytes]] = None
+        self._index = 0
+        self._buffer = bytearray()
+
+    def add(self, expected: bytes, replacement: str | bytes) -> None:
+        if not expected:
+            return
+        if isinstance(replacement, str):
+            replacement = replacement.encode("utf-8")
+        self._pending.append((expected, replacement))
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        for byte in data:
+            while True:
+                if self._current is None and self._pending:
+                    self._current = self._pending[0]
+                    self._index = 0
+                    self._buffer = bytearray()
+
+                if self._current is None:
+                    out.append(byte)
+                    break
+
+                expected, replacement = self._current
+                if byte == expected[self._index]:
+                    self._buffer.append(byte)
+                    self._index += 1
+                    if self._index == len(expected):
+                        out.extend(replacement)
+                        self._pending.pop(0)
+                        self._current = None
+                        self._index = 0
+                        self._buffer = bytearray()
+                    break
+
+                if self._index:
+                    out.extend(self._buffer)
+                    self._pending.pop(0)
+                    self._current = None
+                    self._index = 0
+                    self._buffer = bytearray()
+                    continue
+
+                out.append(byte)
+                break
+        return bytes(out)
+
+
+def _windows_repl_key_to_input(
+    ch: str,
+    read_next: Callable[[], str],
+) -> Optional[_WindowsReplInput]:
+    if ch in ("\x00", "\xe0"):
+        data = _WINDOWS_EXT_KEYS.get(read_next())
+        return _WindowsReplInput(data) if data else None
+    if not ch.isascii():
+        return _WindowsReplInput(ch.encode("unicode_escape"), echo_as=ch)
+    try:
+        return _WindowsReplInput(ch.encode("utf-8"))
+    except UnicodeEncodeError:
+        return _WindowsReplInput(ch.encode("utf-8", errors="replace"))
+
+
+def _windows_repl_key_to_bytes(
+    ch: str,
+    read_next: Callable[[], str],
+) -> Optional[bytes]:
+    item = _windows_repl_key_to_input(ch, read_next)
+    return item.data if item else None
+
+
+def _windows_repl_input_reader(
+    msvcrt_module: Any,
+    out_queue: Any,
+    stop_event: Any,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            ch = msvcrt_module.getwch()
+            item = _windows_repl_key_to_input(ch, msvcrt_module.getwch)
+        except (EOFError, OSError):
+            break
+        except KeyboardInterrupt:
+            item = _WindowsReplInput(b"\x03")
+        if item:
+            out_queue.put(item)
+
+
+def _repl_display_width(text: str) -> int:
+    import unicodedata
+
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return max(width, 1 if text else 0)
+
+
+class _WindowsReplLineEditor:
+    def __init__(self, stdout: Any) -> None:
+        self._stdout = stdout
+        self._chars: List[str] = []
+
+    def handle(self, item: _WindowsReplInput) -> Tuple[Optional[bytes], bool]:
+        data = item.data
+        if data == b"\x03":
+            return None, True
+        if data in (b"\r", b"\n"):
+            line = self._encoded_line() + b"\r"
+            self._chars.clear()
+            return line, False
+        if data in (b"\x08", b"\x7f"):
+            self._backspace()
+            return None, False
+        if data.startswith(b"\x1b["):
+            return (data, False) if not self._chars else (None, False)
+
+        text = item.echo_as
+        if text is None:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return data, False
+        if not text:
+            return None, False
+        if any(ord(ch) < 32 and ch not in "\t" for ch in text):
+            return data, False
+
+        self._chars.extend(text)
+        self._stdout.write(text)
+        self._stdout.flush()
+        return None, False
+
+    def _backspace(self) -> None:
+        if not self._chars:
+            return
+        ch = self._chars.pop()
+        self._stdout.write("\b \b" * _repl_display_width(ch))
+        self._stdout.flush()
+
+    def _encoded_line(self) -> bytes:
+        parts = []
+        for ch in self._chars:
+            if ch.isascii():
+                parts.append(ch)
+            else:
+                parts.append(ch.encode("unicode_escape").decode("ascii"))
+        return "".join(parts).encode("ascii", errors="replace")
+
 
 class MicroPython:
     """通过串口原始 REPL 与 MicroPython 设备交互。
@@ -607,7 +782,7 @@ class MicroPython:
         had_previous = self._traffic_monitor is not None
         if not had_previous:
             self._traffic_monitor = TrafficMonitor(log, port=self.port)
-            from .log import _mgr
+            from ..log import _mgr
             log_path = _mgr.jsonl_path
             if log_path:
                 log.info("流量日志: %s", log_path)
@@ -624,8 +799,12 @@ class MicroPython:
 
     def repl_(self) -> None:
         """交互式 MicroPython REPL（串口透传模式）。"""
+        import codecs
+
         try:
             import msvcrt
+            import queue
+            import threading
             win = True
         except ImportError:
             import select
@@ -658,6 +837,22 @@ class MicroPython:
             termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
 
         in_error = False
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        echo_filter = _WindowsReplEchoFilter() if win else None
+        line_editor = _WindowsReplLineEditor(sys.stdout) if win else None
+        keyboard_queue = None
+        keyboard_stop = None
+        queue_empty = None
+        if win:
+            keyboard_queue = queue.Queue()
+            keyboard_stop = threading.Event()
+            queue_empty = queue.Empty
+            keyboard_thread = threading.Thread(
+                target=_windows_repl_input_reader,
+                args=(msvcrt, keyboard_queue, keyboard_stop),
+                daemon=True,
+            )
+            keyboard_thread.start()
 
         try:
             while self.is_connected:
@@ -666,7 +861,11 @@ class MicroPython:
                     chunk = self.transport.read(self.transport.in_waiting)
                     if not chunk:
                         continue
-                    text = chunk.decode("utf-8", errors="replace")
+                    if echo_filter is not None:
+                        chunk = echo_filter.feed(chunk)
+                        if not chunk:
+                            continue
+                    text = utf8_decoder.decode(chunk, final=False)
                     if not text:
                         continue
                     output, in_error = _colorize_repl_output(text, in_error)
@@ -675,29 +874,18 @@ class MicroPython:
 
                 # 键盘 → 串口
                 if win:
-                    _EXT_KEYS = {
-                        b"H": b"\x1b[A",
-                        b"P": b"\x1b[B",
-                        b"M": b"\x1b[C",
-                        b"K": b"\x1b[D",
-                        b"G": b"\x1b[H",
-                        b"O": b"\x1b[F",
-                        b"S": b"\x1b[3~",
-                        b"R": b"\x1b[2~",
-                        b"I": b"\x1b[5~",
-                        b"Q": b"\x1b[6~",
-                    }
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch()
-                        if ch == b"\xe0":
-                            ch2 = msvcrt.getch()
-                            seq = _EXT_KEYS.get(ch2)
-                            if seq:
-                                self._write(seq)
-                        elif ch == b"\x00":
-                            msvcrt.getch()
-                        else:
-                            self._write(ch)
+                    while keyboard_queue is not None:
+                        try:
+                            item = keyboard_queue.get_nowait()
+                        except queue_empty:
+                            break
+                        data, should_exit = line_editor.handle(item)  # type: ignore[union-attr]
+                        if should_exit:
+                            raise KeyboardInterrupt
+                        if data:
+                            if data != b"\r" and data.endswith(b"\r") and echo_filter is not None:
+                                echo_filter.add(data[:-1], b"")
+                            self._write(data)
                 else:
                     if select.select([sys.stdin], [], [], 0)[0]:
                         buf = os.read(sys.stdin.fileno(), 1)
@@ -724,6 +912,13 @@ class MicroPython:
         except KeyboardInterrupt:
             pass
         finally:
+            if keyboard_stop is not None:
+                keyboard_stop.set()
+            pending_text = utf8_decoder.decode(b"", final=True)
+            if pending_text:
+                output, _ = _colorize_repl_output(pending_text, in_error)
+                sys.stdout.write(output)
+                sys.stdout.flush()
             sys.stdout.buffer.write(b"\r\n")
             sys.stdout.buffer.flush()
             if old_tty is not None:
@@ -1138,7 +1333,7 @@ class MicroPython:
 
         # 条件编译预处理
         if active_tags and local_path.endswith(".py"):
-            from .preprocessor import preprocess
+            from ..preprocessor import preprocess
 
             pp_dir = tempfile.mkdtemp()
             os.chmod(pp_dir, 0o700)
@@ -1176,9 +1371,10 @@ class MicroPython:
         chunk_size = self.config.chunk_size or DEFAULT_CHUNK_SIZE
         verify_mode = self.config.verify
         max_retries = self.config.max_retries
+        delta_mode = self.config.delta_flash
         delta_enabled = (
-            self.config.delta_flash != "off"
-            and file_size >= self.config.delta_min_size
+            delta_mode == "on"
+            or (delta_mode == "auto" and file_size > chunk_size)
         )
 
         local_content: Optional[bytes] = None
@@ -1342,7 +1538,7 @@ class MicroPython:
                 actual_local = lp
                 actual_remote = rp.replace("\\", "/")
                 if active_tags and actual_local.endswith(".py"):
-                    from .preprocessor import preprocess
+                    from ..preprocessor import preprocess
 
                     pp_dir = tempfile.mkdtemp()
                     os.chmod(pp_dir, 0o700)
@@ -1566,7 +1762,7 @@ class MicroPython:
 
         # 收集文件清单
         if manifest_path:
-            from .manifest_loader import load_manifest
+            from ..manifest_loader import load_manifest
 
             entries = load_manifest(manifest_path, active_tags or set(), base_dir=local_dir)
         else:

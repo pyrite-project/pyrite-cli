@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import os
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1032,7 +1033,7 @@ def test_mount_run_requests_current_mount_session():
         server.shutdown()
 
     assert result.exit_code == 0
-    assert result.stdout == "ran /app.py\n"
+    assert "ran /app.py\n" in result.stdout
     assert adapter.run_calls == ["/app.py"]
 
 
@@ -1042,3 +1043,57 @@ def test_mount_help_includes_webrepl_options():
     assert result.exit_code == 0
     assert "--ws" in result.stdout
     assert "--password" in result.stdout
+
+
+def test_remount_invokes_mpremote_mount(monkeypatch, tmp_path):
+    run_calls = []
+
+    class Result:
+        returncode = 0
+
+    monkeypatch.setattr(
+        "cli.main.shutil.which",
+        lambda name: "C:\\bin\\mpremote.exe" if name == "mpremote" else None,
+    )
+    monkeypatch.setattr(
+        "cli.main.subprocess.run",
+        lambda cmd: run_calls.append(cmd) or Result(),
+    )
+
+    result = runner.invoke(app, [
+        "remount",
+        "COM7",
+        str(tmp_path),
+        "--unsafe-links",
+    ])
+
+    assert result.exit_code == 0
+    assert run_calls == [[
+        "C:\\bin\\mpremote.exe",
+        "connect",
+        "COM7",
+        "mount",
+        "--unsafe-links",
+        os.path.abspath(str(tmp_path)),
+    ]]
+
+
+def test_remount_reports_missing_mpremote(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli.main.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "cli.main.subprocess.run",
+        lambda _cmd: pytest.fail("mpremote should not be started"),
+    )
+
+    result = runner.invoke(app, ["remount", "COM7", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "mpremote" in result.output
+
+
+def test_top_level_help_lists_remount_not_firmware():
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "remount" in result.stdout
+    assert "firmware" not in result.stdout

@@ -36,17 +36,19 @@ pyrcli project status COM3 src/ /app
 pyrcli project pull COM3 src/ /app
 pyrcli project scan src/
 
-# 固件烧录（需安装 esptool: pip install esptool）
-pyrcli firmware flash COM3 firmware.bin
-pyrcli firmware erase COM3
-pyrcli firmware info COM3
-pyrcli firmware verify COM3 firmware.bin
-pyrcli firmware read COM3 0x100000 -o backup.bin
-
 # fs ls 增强功能
 pyrcli fs ls COM3 / -r              # 递归列出
 pyrcli fs ls COM3 / --sort size      # 按文件大小排序
 pyrcli fs ls COM3 / -p              # 分页显示
+
+# 反向挂载（设备端通过 /remote 访问上位机目录，委托 mpremote）
+pyrcli remount COM3 .
+pyrcli remount COM3 src/ --unsafe-links
+
+# 包安装与 GPIO 监控
+pyrcli pkg install COM3 aioble --target /lib --dry-run
+pyrcli pkg install COM3 aioble --target /lib
+pyrcli monitor COM3 --pins 0,2,4,5 --count 20
 
 # 构建
 pip install build
@@ -59,20 +61,25 @@ python -m build
 cli/
   main.py                  # Typer CLI 入口 — scan, flash, flash-program, repl,
                            # run, reset, board-info, new, init, config
-                           # 子命令组: project, fs, firmware
+                           # 子命令组: project, fs, pkg
+                           # 顶层命令: mount, remount, monitor
                            # 含 MSYS2 路径修复 _norm_path()、串口自动补全
   utils/
-    flash.py               # MicroPython 串口类 — 串口连接、原始 REPL 读写、
-                           # 文件刷入/校验、批量刷入、设备文件浏览器、
+    flash/                 # MicroPython 串口类与刷入核心包
+      core.py              # 原始 REPL、文件刷入/校验、批量刷入、设备文件浏览器、
                            # bytes 协议下载、递归 fs_ls_recursive
-                           # （不含 project 逻辑）
-    firmware.py            # 固件刷写 — esptool 子进程封装，烧录/擦除/验证/
-                           # 读取固件 .bin（可选依赖 esptool）
-    transport.py           # 传输层抽象基类 Transport（ABC）
-    serial_transport.py    # pyserial 串口传输实现 SerialTransport
-    webrepl_transport.py   # WebSocket WebREPL 传输实现 WebREPLTransport
+      flash.py             # 命令可触达的公开 facade
+      mp_scripts/          # 设备端刷入脚本
+    transport/             # 传输层包
+      base.py              # Transport 抽象基类（ABC）
+      serial.py            # pyserial 串口传输实现 SerialTransport
+      webrepl.py           # WebSocket WebREPL 传输实现 WebREPLTransport
+    serial_transport.py    # 旧导入兼容层
+    webrepl_transport.py   # 旧导入兼容层
     webrepl_micropython.py # WebREPLMicroPython — 通过 WebREPL 连接设备的
                            # MicroPython 子类（继承所有高级操作）
+    pkg.py                 # mpremote mip install/cache/install-offline 计划与执行
+    monitor.py             # GPIO 监控参数解析、采样脚本和 host 侧轮询
     config.py              # 配置加载 _load_config()、create_default_config()
                            # 常量: CONFIG_FILE, DEFAULT_CHUNK_SIZE 等
     types.py               # PyriteConfig 数据类定义
@@ -168,7 +175,7 @@ C3 = ["ESP32", "wifi"]
 2. **命令冒烟测试**（无需设备，修复语法/导入错误后必做）：
    - `python -c "from cli.main import app; from cli.utils.flash import MicroPython; from cli.utils.config import _load_config; from cli.utils.preprocessor import preprocess; from cli.utils.log import get_logger; from cli.utils.output import print_json"` — 验证所有模块可正常导入
    - `pyrcli --help` — CLI 入口正常
-   - `pyrcli flash --help` / `pyrcli fs --help` / `pyrcli project --help` / `pyrcli firmware --help` — 各子命令组正常
+  - `pyrcli flash --help` / `pyrcli fs --help` / `pyrcli project --help` / `pyrcli pkg --help` / `pyrcli monitor --help` / `pyrcli remount --help` — 各命令/子命令组正常
    - `pyrcli scan`（不需要设备，无设备时正常退出即可）
    - `pyrcli scan --version`
 

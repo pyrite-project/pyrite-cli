@@ -119,7 +119,6 @@ def create_default_config() -> str:
             "auto_compile": True,
             "verify": "size",
             "delta_flash": "auto",
-            "delta_min_size": 10240,
             "max_retries": 2,
             "baudrate": DEFAULT_BAUDRATE,
         }, indent=2),

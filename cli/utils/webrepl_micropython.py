@@ -11,8 +11,7 @@ from typing import Optional
 
 from .flash import MicroPython
 from .log import get_logger
-from .transport import Transport
-from .webrepl_transport import WebREPLTransport
+from .transport import Transport, WebREPLTransport
 
 log = get_logger(__name__)
 

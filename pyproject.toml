@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
 name = "pyrite-cli"
-version = "0.0.1"
+version = "0.0.3"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0",
@@ -13,6 +13,7 @@ dependencies = [
     "requests>=2.28.0",
     "tqdm>=4.64.0",
     "mpy-cross",
+    "mpremote>=1.28.0",
     "libcst>=1.1.0",
     "tomli>=2.0.0; python_version < '3.11'",
     "websocket-client>=1.6.0",
@@ -32,7 +33,7 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 
 [tool.setuptools.package-data]
 "cli.project" = ["feature_stub.pyi"]
-"cli.utils" = ["mp_scripts/*.py"]
+"cli.utils.flash" = ["mp_scripts/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = [
@@ -45,6 +46,8 @@ testpaths = [
     "test/test_serial_transport.py",
     "test/test_output.py",
     "test/test_webdav_mount.py",
+    "test/test_pkg.py",
+    "test/test_monitor.py",
 ]
 
 [tool.mypy]

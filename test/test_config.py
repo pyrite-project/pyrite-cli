@@ -168,7 +168,6 @@ class TestCreateDefaultConfig:
         assert data["auto_compile"] is True
         assert data["baudrate"] == DEFAULT_BAUDRATE
         assert data["delta_flash"] == "auto"
-        assert data["delta_min_size"] == 10240
 
     def test_default_config_is_loadable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)

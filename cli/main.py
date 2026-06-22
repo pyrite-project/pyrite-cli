@@ -2,13 +2,14 @@
 pyrite-cli CLI 入口 — MicroPython 设备串口工具。
 
 通过 Typer 提供 scan、flash、repl、run、reset、board-info、
-project、fs、firmware 等子命令。
+monitor、pkg、project、fs、mount、remount 等子命令。
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -53,11 +54,6 @@ WebREPLMicroPython = _LazyObject("cli.utils.webrepl_micropython", "WebREPLMicroP
 ProjectSyncManager = _LazyObject("cli.project.sync", "ProjectSyncManager")
 init_stubs = _LazyObject("cli.project.project", "init_stubs")
 new_project_interactive = _LazyObject("cli.project.project", "new_project_interactive")
-flash_firmware = _LazyObject("cli.utils.firmware", "flash_firmware")
-erase_flash = _LazyObject("cli.utils.firmware", "erase_flash")
-chip_info = _LazyObject("cli.utils.firmware", "chip_info")
-verify_firmware = _LazyObject("cli.utils.firmware", "verify_firmware")
-read_flash = _LazyObject("cli.utils.firmware", "read_flash")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -584,6 +580,74 @@ except:pass
 
 
 # ═══════════════════════════════════════════════════════════════════
+# monitor — GPIO 只读监控
+# ═══════════════════════════════════════════════════════════════════
+
+@app.command("monitor")
+def monitor(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    pins: Optional[str] = typer.Option(
+        None, "--pins",
+        help="逗号分隔的 GPIO 引脚列表，例如 0,2,4,5；不指定时保守探测",
+    ),
+    interval: float = typer.Option(0.5, "--interval", "-i", help="采样间隔秒数"),
+    duration: Optional[float] = typer.Option(None, "--duration", help="监控持续秒数"),
+    count: Optional[int] = typer.Option(None, "--count", help="采样次数"),
+    edge: Optional[str] = typer.Option(None, "--edge", help="仅支持 changed，状态变化时输出"),
+    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    fmt: str = _FORMAT_OPTION,
+    json_output: bool = _JSON_OPTION,
+) -> None:
+    """只读监控 MicroPython GPIO 输入状态。"""
+    from .utils.monitor import MonitorError, format_monitor_header, run_monitor_session
+
+    fmt = _resolve_format(fmt, json_output)
+    text_refresh = fmt == "text" and is_tty()
+
+    def emit_header(options) -> None:
+        header = format_monitor_header(options, port=port)
+        if header:
+            print(header, flush=True)
+
+    def emit(line: str) -> None:
+        if text_refresh:
+            print("\r\033[K" + line, end="", flush=True)
+        else:
+            print(line, flush=True)
+
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    printed_inline = False
+    try:
+        mp.connect()
+        emitted = run_monitor_session(
+            mp,
+            pins=pins,
+            fmt=fmt,
+            interval=interval,
+            duration=duration,
+            count=count,
+            edge=edge,
+            on_start=emit_header if fmt == "text" else None,
+            sample_style="modern" if fmt == "text" else "compact",
+            write=emit,
+        )
+        printed_inline = text_refresh and emitted > 0
+    except KeyboardInterrupt:
+        printed_inline = text_refresh
+        log.info("用户中断")
+    except MonitorError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+    finally:
+        if printed_inline:
+            print()
+        mp.disconnect()
+
+
+# ═══════════════════════════════════════════════════════════════════
 # mount — PC 侧 WebDAV 挂载
 # ═══════════════════════════════════════════════════════════════════
 
@@ -729,6 +793,196 @@ def mount_run(
     if resp.status >= 400:
         log.error("mount-run 失败: HTTP %d %s", resp.status, text.strip())
         raise typer.Exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# remount — 设备侧反向挂载主机目录
+# ═══════════════════════════════════════════════════════════════════
+
+def _resolve_mpremote_command(mpremote: str) -> str:
+    resolved = shutil.which(mpremote)
+    if resolved:
+        return resolved
+    raise FileNotFoundError("未找到 mpremote。请安装：pip install mpremote")
+
+
+def _build_remount_command(
+    port: str,
+    local_dir: str,
+    mpremote: str = "mpremote",
+    unsafe_links: bool = False,
+) -> List[str]:
+    cmd = [
+        _resolve_mpremote_command(mpremote),
+        "connect",
+        port,
+        "mount",
+    ]
+    if unsafe_links:
+        cmd.append("--unsafe-links")
+    cmd.append(local_dir)
+    return cmd
+
+
+@app.command("remount")
+def remount(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    local_dir: str = typer.Argument(".", help="暴露给设备端 /remote 的上位机目录"),
+    unsafe_links: bool = typer.Option(
+        False,
+        "--unsafe-links",
+        "-l",
+        help="允许设备端通过符号链接访问挂载目录外的路径",
+    ),
+    mpremote_cmd: str = typer.Option(
+        "mpremote",
+        "--mpremote",
+        help="mpremote 可执行文件名或路径",
+    ),
+) -> None:
+    """用 mpremote 把上位机目录反向挂载到设备端 /remote。"""
+    local_dir = os.path.abspath(local_dir)
+    if not os.path.isdir(local_dir):
+        log.error("本地目录不存在: %s", local_dir)
+        raise typer.Exit(1)
+
+    try:
+        cmd = _build_remount_command(
+            port,
+            local_dir,
+            mpremote=mpremote_cmd,
+            unsafe_links=unsafe_links,
+        )
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+
+    log.info("反向挂载 %s 到设备 /remote，按 Ctrl+] 或 Ctrl+x 退出 mpremote REPL", local_dir)
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise typer.Exit(result.returncode)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# pkg — MicroPython 包安装计划与 mpremote mip 封装
+# ═══════════════════════════════════════════════════════════════════
+
+pkg_app = typer.Typer(help="MicroPython 包安装与缓存计划", add_completion=False)
+app.add_typer(pkg_app, name="pkg")
+
+
+def _print_pkg_plan(plan, fmt: str) -> None:
+    if fmt == "json":
+        print_json(plan.to_dict())
+        return
+
+    data = plan.to_dict()
+    print(f"  action: {data['action']}")
+    if data.get("package"):
+        print(f"  package: {data['package']}")
+    if data.get("port"):
+        print(f"  port: {data['port']}")
+    if data.get("target"):
+        print(f"  target: {data['target']}")
+    if data.get("cache_dir"):
+        print(f"  cache: {data['cache_dir']}")
+    command = data.get("command") or []
+    if command:
+        print("  command: " + " ".join(str(part) for part in command))
+    for note in data.get("notes", []):
+        print(f"  note: {note}")
+
+
+def _run_pkg_plan_or_exit(plan) -> None:
+    from .utils.pkg import PkgError, run_pkg_plan
+
+    try:
+        result = run_pkg_plan(plan)
+    except (FileNotFoundError, OSError, PkgError) as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+
+    if isinstance(result, subprocess.CompletedProcess) and result.returncode != 0:
+        raise typer.Exit(result.returncode)
+
+
+@pkg_app.command("install")
+def pkg_install(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    package: str = typer.Argument(..., help="包名、URL 或 github:/gitlab:/codeberg: spec"),
+    target: Optional[str] = typer.Option(None, "--target", help="设备端安装目录，例如 /lib"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只输出安装计划，不连接设备"),
+    mpremote_cmd: str = typer.Option("mpremote", "--mpremote", help="mpremote 可执行文件名或路径"),
+    fmt: str = _FORMAT_OPTION,
+    json_output: bool = _JSON_OPTION,
+) -> None:
+    """通过 mpremote mip install 安装包。"""
+    from .utils.pkg import PkgError, build_install_plan
+
+    fmt = _resolve_format(fmt, json_output)
+    try:
+        plan = build_install_plan(
+            port, package, target=target, dry_run=dry_run, mpremote=mpremote_cmd,
+        )
+    except (FileNotFoundError, OSError, PkgError) as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+
+    if dry_run:
+        _print_pkg_plan(plan, fmt)
+        return
+    _run_pkg_plan_or_exit(plan)
+
+
+@pkg_app.command("cache")
+def pkg_cache(
+    package: str = typer.Argument(..., help="包名、URL 或本地 package.json/目录"),
+    version: str = typer.Option("latest", "--version", help="缓存版本目录名"),
+    cache_root: str = typer.Option(".pyrite/pkg-cache", "--cache-root", help="上位机缓存根目录"),
+    dry_run: bool = typer.Option(True, "--dry-run", help="只输出缓存计划"),
+    fmt: str = _FORMAT_OPTION,
+    json_output: bool = _JSON_OPTION,
+) -> None:
+    """规划上位机包缓存目录；当前不执行网络下载。"""
+    from .utils.pkg import PkgError, build_cache_plan
+
+    fmt = _resolve_format(fmt, json_output)
+    try:
+        plan = build_cache_plan(
+            package, version=version, cache_root=cache_root, dry_run=dry_run,
+        )
+    except (FileNotFoundError, OSError, PkgError) as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+    _print_pkg_plan(plan, fmt)
+
+
+@pkg_app.command("install-offline")
+def pkg_install_offline(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    package_source: str = typer.Argument(..., help="本地 package.json 或包含 package.json 的目录"),
+    target: Optional[str] = typer.Option(None, "--target", help="设备端安装目录，例如 /lib"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只输出安装计划，不连接设备"),
+    mpremote_cmd: str = typer.Option("mpremote", "--mpremote", help="mpremote 可执行文件名或路径"),
+    fmt: str = _FORMAT_OPTION,
+    json_output: bool = _JSON_OPTION,
+) -> None:
+    """通过 mpremote mip install 安装本地包。"""
+    from .utils.pkg import PkgError, build_install_offline_plan
+
+    fmt = _resolve_format(fmt, json_output)
+    try:
+        plan = build_install_offline_plan(
+            port, package_source, target=target, dry_run=dry_run, mpremote=mpremote_cmd,
+        )
+    except (FileNotFoundError, OSError, PkgError) as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+
+    if dry_run:
+        _print_pkg_plan(plan, fmt)
+        return
+    _run_pkg_plan_or_exit(plan)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1425,128 +1679,6 @@ def fs_cp(
         mp.disconnect()
 
 
-# ═══════════════════════════════════════════════════════════════════
-# firmware — 固件刷写
-# ═══════════════════════════════════════════════════════════════════
-
-firmware_app = typer.Typer(help="固件刷写工具（需安装 esptool）", add_completion=False)
-app.add_typer(firmware_app, name="firmware")
-
-
-@firmware_app.command("flash")
-def firmware_flash(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    firmware: str = typer.Argument(..., help="固件 .bin 文件路径"),
-    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率"),
-    address: str = typer.Option("0x0", "--address", "-a", help="烧录起始地址"),
-    flash_mode: str = typer.Option("keep", "--flash-mode", "-m", help="Flash 模式"),
-    flash_size: str = typer.Option("keep", "--flash-size", "-s", help="Flash 容量"),
-    erase_first: bool = typer.Option(False, "--erase-first", "-e", help="烧录前先全片擦除"),
-) -> None:
-    """通过 esptool 烧录固件 .bin 到设备。"""
-    try:
-        flash_firmware(
-            port=port, firmware=firmware, baudrate=baudrate,
-            address=address, flash_mode=flash_mode, flash_size=flash_size,
-            erase_first=erase_first,
-        )
-        log.info("✓ 烧录完成")
-    except FileNotFoundError:
-        log.error("未找到 esptool，请安装：pip install esptool")
-        raise typer.Exit(1)
-    except subprocess.CalledProcessError:
-        log.error("✗ 烧录失败，请检查连接和参数")
-        raise typer.Exit(1)
-
-
-@firmware_app.command("erase")
-def firmware_erase(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率"),
-) -> None:
-    """通过 esptool 擦除设备整个 Flash。"""
-    try:
-        erase_flash(port=port, baudrate=baudrate)
-        log.info("✓ Flash 已擦除")
-    except FileNotFoundError:
-        log.error("未找到 esptool，请安装：pip install esptool")
-        raise typer.Exit(1)
-    except subprocess.CalledProcessError:
-        log.error("✗ 擦除失败，请检查连接")
-        raise typer.Exit(1)
-
-
-@firmware_app.command("info")
-def firmware_info(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率"),
-    fmt: str = _FORMAT_OPTION,
-    json_output: bool = _JSON_OPTION,
-) -> None:
-    """通过 esptool 读取设备芯片和 Flash 信息。"""
-    fmt = _resolve_format(fmt, json_output)
-    try:
-        output = chip_info(port=port, baudrate=baudrate)
-        lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
-        if fmt == "json":
-            print_json({"raw": lines})
-            return
-        for line in lines:
-            if any(kw in line for kw in (
-                "Detected", "Manufacturer", "Device",
-                "flash size", "MAC:", "Chip is", "Features:", "Crystal",
-            )):
-                typer.secho(f"  {line}", fg=typer.colors.CYAN)
-            else:
-                print(f"  {line}")
-    except FileNotFoundError:
-        log.error("未找到 esptool，请安装：pip install esptool")
-        raise typer.Exit(1)
-    except RuntimeError as e:
-        log.error("✗ %s", e)
-        raise typer.Exit(1)
-
-
-@firmware_app.command("verify")
-def firmware_verify(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    firmware: str = typer.Argument(..., help="固件 .bin 文件路径"),
-    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率"),
-    address: str = typer.Option("0x0", "--address", "-a", help="起始地址"),
-) -> None:
-    """通过 esptool 验证固件烧录结果。"""
-    try:
-        verify_firmware(port=port, firmware=firmware, baudrate=baudrate, address=address)
-        log.info("✓ 验证通过，固件与 Flash 内容一致")
-    except FileNotFoundError:
-        log.error("未找到 esptool，请安装：pip install esptool")
-        raise typer.Exit(1)
-    except subprocess.CalledProcessError:
-        log.error("✗ 验证失败，固件与 Flash 内容不匹配")
-        raise typer.Exit(1)
-
-
-@firmware_app.command("read")
-def firmware_read(
-    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    size: str = typer.Argument(..., help="读取字节数（如 0x100000）"),
-    address: str = typer.Option("0x0", "--address", "-a", help="起始地址"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="输出文件路径"),
-    baudrate: int = typer.Option(460800, "--baud", "-b", help="波特率"),
-) -> None:
-    """通过 esptool 从设备 Flash 读取内容到文件。"""
-    try:
-        dst = read_flash(
-            port=port, size=size, address=address,
-            output=output, baudrate=baudrate,
-        )
-        log.info("✓ 已读取到: %s", dst)
-    except FileNotFoundError:
-        log.error("未找到 esptool，请安装：pip install esptool")
-        raise typer.Exit(1)
-    except subprocess.CalledProcessError:
-        log.error("✗ 读取失败")
-        raise typer.Exit(1)
 # ═══════════════════════════════════════════════════════════════════
 # main
 # ═══════════════════════════════════════════════════════════════════

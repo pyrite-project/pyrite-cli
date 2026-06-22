@@ -8,17 +8,22 @@ pyrite-cli/
 │   ├── main.py              # CLI entry (Typer command definitions)
 │   ├── py.typed             # PEP 561 type marker
 │   └── utils/
-│       ├── flash.py         # MicroPython serial device communication
-│       │                       file flash/verify, fs browser, bytes download,
-│       │                       recursive fs_ls_recursive
-│       ├── firmware.py      # Firmware flashing via esptool subprocess:
-│       │                       flash/erase/info/verify/read .bin firmware
-│       │                       (optional dependency: esptool)
-│       ├── transport.py     # Transport layer ABC
-│       ├── serial_transport.py  # Serial transport implementation
-│       ├── webrepl_transport.py # WebREPL (WebSocket) transport
+│       ├── flash/
+│       │   ├── core.py      # MicroPython serial device communication,
+│       │   │                   file flash/verify, fs browser, bytes download,
+│       │   │                   recursive fs_ls_recursive
+│       │   ├── flash.py     # Public facade for command-facing flash helpers
+│       │   └── mp_scripts/  # Device-side transfer scripts
+│       ├── transport/
+│       │   ├── base.py      # Transport layer ABC
+│       │   ├── serial.py    # Serial transport implementation
+│       │   └── webrepl.py   # WebREPL (WebSocket) transport
+│       ├── serial_transport.py  # Compatibility wrapper
+│       ├── webrepl_transport.py # Compatibility wrapper
 │       ├── webrepl_micropython.py # WebREPLMicroPython — WebSocket subclass
 │       │                          inheriting all MicroPython high-level ops
+│       ├── pkg.py           # mpremote mip install/cache planning helpers
+│       ├── monitor.py       # GPIO monitor parsing/script/session helpers
 │       ├── types.py         # Type definitions (PyriteConfig dataclass)
 │       ├── config.py        # Config loading & default config generation
 │       ├── compiler.py      # mpy-cross compilation wrapper (parallel support)
@@ -47,13 +52,13 @@ pyrite-cli/
 
 ---
 
-## Transport Layer (`utils/transport.py`, `serial_transport.py`, `webrepl_transport.py`)
+## Transport Layer (`utils/transport/`)
 
 ### Design Goal
 
 Decouple the underlying communication method from **hardcoded pyserial** to a **Transport ABC**, so `flash.py`'s core logic does not care whether data flows over serial or WebSocket.
 
-### Transport ABC (`transport.py`)
+### Transport ABC (`transport/base.py`)
 
 Abstract base class defining the interface and providing shared receive buffering:
 
@@ -74,7 +79,7 @@ Abstract base class defining the interface and providing shared receive bufferin
 
 **Buffer mechanism**: The base class maintains an internal `_rx_buf`. Both `read()` and `in_waiting` trigger `_fill_buf()` to pull more data before returning. This eliminates repeated `if in_waiting: read()` boilerplate.
 
-### SerialTransport (`serial_transport.py`)
+### SerialTransport (`transport/serial.py`)
 
 pyserial wrapper:
 
@@ -93,7 +98,7 @@ SerialTransport
 - `connect()` auto-calls `reset_input_buffer()` to clear startup residual data.
 - `disconnect()` also clears parent `_rx_buf`.
 
-### WebREPLTransport (`webrepl_transport.py`)
+### WebREPLTransport (`transport/webrepl.py`)
 
 WebREPL protocol via `websocket-client`, enabling WiFi connections to MicroPython devices:
 
@@ -209,9 +214,55 @@ def _mp_factory(port, baudrate, timeout, ws, password) -> MicroPython:
 WebREPLMicroPython is a subclass of MicroPython that internally creates a `WebREPLTransport` — `flash.py` has no WebREPL awareness at all.
 Omitting `--ws` falls back to serial, preserving all existing behavior.
 
+### remount
+
+`pyrcli remount` is a thin wrapper around `mpremote mount`.
+
+```bash
+pyrcli remount COM3 .
+```
+
+The command validates the local directory, resolves the `mpremote` executable, and starts:
+
+```bash
+mpremote connect COM3 mount <local-dir>
+```
+
+`mpremote` mounts the host directory in the device VFS as `/remote` and implicitly keeps a REPL open when no follow-up action is supplied. Pyrite CLI does not reimplement this protocol and does not route `remount` through `flash.py`.
+
+### pkg
+
+`pyrcli pkg` is a thin planning and execution layer around `mpremote mip install`.
+
+```bash
+pyrcli pkg install COM3 aioble --target /lib --dry-run
+pyrcli pkg install-offline COM3 ./package.json
+```
+
+`cli/utils/pkg.py` builds auditable plans for `install`, `cache`, and `install-offline`. Dry-runs do not call subprocesses or connect to the device. Non-dry-run install commands delegate package resolution and transfer to `mpremote`, keeping MicroPython package ecosystem behavior in one upstream tool instead of reimplementing MIP.
+
+`pkg cache` currently plans cache paths and audits local `package.json` files; it does not perform network downloads.
+
+### monitor
+
+`pyrcli monitor` uses `cli/utils/monitor.py` to parse GPIO lists, build probe/sample scripts, and run a host-side polling loop.
+
+The monitor path only initializes pins as `machine.Pin(pin, machine.Pin.IN)`. It does not set pull resistors or output mode. Each sample is collected through a short `MicroPython.run()` script so it does not reuse or alter the file flashing protocol.
+
 ---
 
-## flash.py Core Refactor
+## flash Package Refactor
+
+The former monolithic `cli/utils/flash.py` is now a package:
+
+| Path | Responsibility |
+|------|----------------|
+| `cli/utils/flash/core.py` | Raw REPL protocol, file transfer, verification, filesystem helpers |
+| `cli/utils/flash/flash.py` | Public command-facing facade |
+| `cli/utils/flash/__init__.py` | Backward-compatible re-export surface |
+| `cli/utils/flash/mp_scripts/` | Device-side upload scripts packaged with `cli.utils.flash` |
+
+`from cli.utils.flash import MicroPython` and helper imports such as `_strip_repl_trailer` remain supported.
 
 ### State Machine Simplification
 
@@ -292,34 +343,6 @@ class WebREPLMicroPython(MicroPython):
 - Inherits all high-level operations (`flash_file`, `fs_ls`, `run`, `reset`, etc.)
 - Overrides `connect()` to WebSocket handshake (ignores serial-specific port/baudrate)
 - `flash.py` has zero WebREPL awareness — the separation is enforced by the transport layer
-
----
-
-## Firmware Module (`utils/firmware.py`)
-
-Firmware flashing via subprocess calls to `esptool` (optional dependency):
-
-| Function | Description |
-|----------|-------------|
-| `flash_firmware()` | Flash .bin firmware to device |
-| `erase_flash()` | Erase entire flash |
-| `chip_info()` | Read chip and flash information |
-| `verify_firmware()` | Verify firmware against flash contents |
-| `read_flash()` | Dump flash contents to a local file |
-
-**esptool resolution chain**:
-1. `python -m esptool` (installed as Python package)
-2. `esptool.py` on PATH (standalone binary)
-
-The CLI surface provides the `firmware` command group with 5 subcommands:
-
-```bash
-pyrcli firmware flash COM3 firmware.bin -b 921600 --erase-first
-pyrcli firmware erase COM3
-pyrcli firmware info COM3
-pyrcli firmware verify COM3 firmware.bin
-pyrcli firmware read COM3 0x100000 -o backup.bin
-```
 
 ---
 

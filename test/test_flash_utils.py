@@ -1,6 +1,9 @@
 import os
 import binascii
+import io
+import queue
 import sys
+import threading
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -18,6 +21,10 @@ from cli.utils.flash import (
     _colorize_repl_output,
     _compute_block_crc32,
     _load_mp_script,
+    _WindowsReplEchoFilter,
+    _WindowsReplLineEditor,
+    _windows_repl_input_reader,
+    _windows_repl_key_to_bytes,
 )
 from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.compiler import _compile_to_mpy
@@ -95,6 +102,225 @@ class TestColorizeReplOutput:
 
 
 # ── _compute_crc32 ──────────────────────────────────────────────────
+
+
+class _ReplStdout:
+    def __init__(self):
+        self.buffer = io.BytesIO()
+
+    def write(self, text):
+        self.buffer.write(text.encode("utf-8"))
+
+    def flush(self):
+        pass
+
+    def getvalue(self):
+        return self.buffer.getvalue().decode("utf-8", errors="replace")
+
+
+class _FakeMsvcrt:
+    def __init__(self, keys=None):
+        self.keys = list(keys or [])
+
+    def kbhit(self):
+        return bool(self.keys)
+
+    def getch(self):
+        if not self.keys:
+            raise OSError("closed")
+        self.keys.pop(0)
+        return b"\xd6"
+
+    def getwch(self):
+        if not self.keys:
+            raise OSError("closed")
+        return self.keys.pop(0)
+
+
+class _FakeInput:
+    def __init__(self, data, echo_as=None):
+        self.data = data
+        self.echo_as = echo_as
+
+
+class _BlockingMsvcrt:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def getwch(self):
+        self.started.set()
+        self.release.wait(5)
+        raise OSError("closed")
+
+
+class _KeyboardReplTransport:
+    def __init__(self):
+        self.connected = True
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+        if data not in (b"\x03", b"\x02"):
+            self.connected = False
+
+    def read(self, _size):
+        return b""
+
+    @property
+    def in_waiting(self):
+        return 0
+
+    def reset_input_buffer(self):
+        pass
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+
+class _OutputReplTransport:
+    def __init__(self, chunks):
+        self.connected = True
+        self.chunks = list(chunks)
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def read(self, _size):
+        return self.chunks.pop(0)
+
+    @property
+    def in_waiting(self):
+        if self.chunks:
+            return len(self.chunks[0])
+        self.connected = False
+        return 0
+
+    def reset_input_buffer(self):
+        pass
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+
+class TestInteractiveReplUnicode:
+    def test_windows_repl_key_encoder_escapes_chinese_for_friendly_repl(self):
+        assert _windows_repl_key_to_bytes("中", lambda: "") == b"\\u4e2d"
+
+    def test_windows_repl_key_encoder_maps_arrow_key(self):
+        assert _windows_repl_key_to_bytes("\xe0", lambda: "H") == b"\x1b[A"
+
+    def test_windows_repl_reader_queues_ascii_escape_for_chinese(self):
+        q = queue.Queue()
+        stop = threading.Event()
+
+        _windows_repl_input_reader(_FakeMsvcrt(["中"]), q, stop)
+
+        item = q.get_nowait()
+        assert item.data == b"\\u4e2d"
+        assert item.echo_as == "中"
+
+    def test_windows_repl_echo_filter_restores_split_chinese_echo(self):
+        echo_filter = _WindowsReplEchoFilter()
+        echo_filter.add(b"\\u4e2d", "中")
+
+        assert echo_filter.feed(b"\\u") == b""
+        assert echo_filter.feed(b"4e2d") == "中".encode("utf-8")
+
+    def test_windows_line_editor_buffers_chinese_until_enter(self):
+        stdout = _ReplStdout()
+        editor = _WindowsReplLineEditor(stdout)
+
+        data, should_exit = editor.handle(_FakeInput(b"\\u4e2d", "中"))
+
+        assert data is None
+        assert should_exit is False
+        assert stdout.getvalue() == "中"
+
+        data, should_exit = editor.handle(_FakeInput(b"\r"))
+
+        assert data == b"\\u4e2d\r"
+        assert should_exit is False
+
+    def test_windows_line_editor_backspace_is_local(self):
+        stdout = _ReplStdout()
+        editor = _WindowsReplLineEditor(stdout)
+
+        editor.handle(_FakeInput(b"\\u4e2d", "中"))
+        data, should_exit = editor.handle(_FakeInput(b"\x08"))
+
+        assert data is None
+        assert should_exit is False
+        assert stdout.buffer.getvalue().endswith(("\b \b" * 2).encode("utf-8"))
+
+    def test_windows_line_editor_ctrl_c_requests_exit(self):
+        editor = _WindowsReplLineEditor(_ReplStdout())
+
+        data, should_exit = editor.handle(_FakeInput(b"\x03"))
+
+        assert data is None
+        assert should_exit is True
+
+    def test_windows_repl_input_sends_ascii_escape_only_on_enter(self, monkeypatch):
+        transport = _KeyboardReplTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt(["中", "\r"]))
+        monkeypatch.setattr(sys, "stdout", _ReplStdout())
+
+        mp.repl_()
+
+        assert b"\\u4e2d\r" in transport.writes
+        assert b"\xd6" not in transport.writes
+
+    def test_windows_repl_backspace_after_chinese_does_not_send_escape(self, monkeypatch):
+        transport = _KeyboardReplTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt(["中", "\b", "\r"]))
+        monkeypatch.setattr(sys, "stdout", _ReplStdout())
+
+        mp.repl_()
+
+        assert b"\\u4e2d\r" not in transport.writes
+
+    def test_windows_repl_ctrl_c_after_chinese_exits_without_commit(self, monkeypatch):
+        transport = _KeyboardReplTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt(["中", "\x03"]))
+        monkeypatch.setattr(sys, "stdout", _ReplStdout())
+
+        mp.repl_()
+
+        assert b"\\u4e2d\r" not in transport.writes
+
+    def test_windows_repl_blocked_ime_reader_does_not_block_output(self, monkeypatch):
+        transport = _OutputReplTransport([b"ok"])
+        mp = MicroPython(port="COM99", transport=transport)
+        stdout = _ReplStdout()
+        fake_msvcrt = _BlockingMsvcrt()
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        try:
+            mp.repl_()
+        finally:
+            fake_msvcrt.release.set()
+
+        assert "ok" in stdout.getvalue()
+
+    def test_repl_output_decodes_split_utf8_chinese(self, monkeypatch):
+        transport = _OutputReplTransport([b"\xe4", b"\xb8", b"\xad"])
+        mp = MicroPython(port="COM99", transport=transport)
+        stdout = _ReplStdout()
+        monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt())
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        mp.repl_()
+
+        assert "中" in stdout.getvalue()
+        assert "\ufffd" not in stdout.getvalue()
 
 
 class TestComputeCrc32:
@@ -367,6 +593,75 @@ class TestUploadAckWindow:
         assert "local_blocks=[" in script
         assert "DELTA:%s:%d:%d:%d" in script
         assert args[0] == str(local)
+        assert kwargs["ack_every"] == BATCH_ACK_EVERY
+
+    def test_flash_file_auto_delta_starts_above_chunk_size(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"abcde")
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.auto_compile = False
+        mp.config.chunk_size = 4
+        mp.config.delta_flash = "auto"
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(
+            mp,
+            "_send_flash_payload",
+            lambda *args, **kwargs: pytest.fail("expected delta transfer"),
+        )
+
+        def fake_delta_send(script, *args, **kwargs):
+            calls.append((script, args, kwargs))
+            return "suffix"
+
+        monkeypatch.setattr(mp, "_send_delta_flash_payload", fake_delta_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        assert len(calls) == 1
+        script, _args, kwargs = calls[0]
+        assert "block_size=4" in script
+        assert kwargs["ack_every"] == BATCH_ACK_EVERY
+
+    def test_flash_file_auto_delta_skips_at_chunk_size(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"abcd")
+        mp = MicroPython(port="COM99", baudrate=921600)
+        mp.config.auto_compile = False
+        mp.config.chunk_size = 4
+        mp.config.delta_flash = "auto"
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(
+            mp,
+            "_send_delta_flash_payload",
+            lambda *args, **kwargs: pytest.fail("expected full transfer"),
+        )
+
+        def fake_send(script, *args, **kwargs):
+            calls.append((script, args, kwargs))
+
+        monkeypatch.setattr(mp, "_send_flash_payload", fake_send)
+
+        mp.flash_file(str(local), "/payload.bin", compile=False)
+
+        assert len(calls) == 1
+        script, _args, kwargs = calls[0]
+        assert "want = min(4, f_size)" in script
         assert kwargs["ack_every"] == BATCH_ACK_EVERY
 
 

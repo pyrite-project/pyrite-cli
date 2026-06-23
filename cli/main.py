@@ -190,6 +190,12 @@ def _mp_factory(
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 
 
+def _serial_transport_factory(port: str, baudrate: int, timeout: int):
+    from .utils.transport.serial import SerialTransport
+
+    return SerialTransport(port=port, baudrate=baudrate, timeout=timeout)
+
+
 def _sort_fs_items(items: List[dict], sort: Optional[str]) -> None:
     """排序文件系统条目：目录优先，再按名称或体积排序。"""
     reverse = False
@@ -586,11 +592,17 @@ except:pass
 @app.command("monitor")
 def monitor(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    uart: bool = typer.Option(False, "--uart", help="Read raw UART bytes instead of GPIO state"),
     pins: Optional[str] = typer.Option(
         None, "--pins",
         help="逗号分隔的 GPIO 引脚列表，例如 0,2,4,5；不指定时保守探测",
     ),
-    interval: float = typer.Option(0.5, "--interval", "-i", help="采样间隔秒数"),
+    interval: Optional[float] = typer.Option(
+        None,
+        "--interval",
+        "-i",
+        help="采样间隔秒数；GPIO 默认 0.5，UART 默认 0.05",
+    ),
     duration: Optional[float] = typer.Option(None, "--duration", help="监控持续秒数"),
     count: Optional[int] = typer.Option(None, "--count", help="采样次数"),
     edge: Optional[str] = typer.Option(None, "--edge", help="仅支持 changed，状态变化时输出"),
@@ -602,10 +614,91 @@ def monitor(
     json_output: bool = _JSON_OPTION,
 ) -> None:
     """只读监控 MicroPython GPIO 输入状态。"""
-    from .utils.monitor import MonitorError, format_monitor_header, run_monitor_session
+    from .utils.monitor import (
+        MonitorError,
+        format_monitor_header,
+        format_uart_monitor_header,
+        format_uart_monitor_rows,
+        parse_uart_ports,
+        run_monitor_session,
+        run_uart_monitor_session,
+    )
 
     fmt = _resolve_format(fmt, json_output)
     text_refresh = fmt == "text" and is_tty()
+    monitor_interval = interval if interval is not None else 0.5
+
+    if uart:
+        uart_interval = interval if interval is not None else 0.05
+        transports = []
+        printed_inline = False
+        printed_uart_block = False
+        uart_ports: list[str] = []
+
+        def emit_uart_header(options) -> None:
+            nonlocal printed_uart_block
+            header = format_uart_monitor_header(options)
+            if header:
+                print(header, flush=True)
+            if text_refresh:
+                initial_rows = format_uart_monitor_rows(
+                    [(uart_port, None) for uart_port in options.ports],
+                    fmt=options.fmt,
+                    encoding=options.encoding,
+                )
+                if initial_rows:
+                    print(initial_rows, flush=True)
+                    printed_uart_block = True
+
+        def emit_uart(block: str) -> None:
+            nonlocal printed_uart_block
+            if text_refresh:
+                if printed_uart_block:
+                    print(f"\033[{len(uart_ports)}F", end="")
+                for line in block.splitlines():
+                    print("\033[K" + line)
+                printed_uart_block = True
+                sys.stdout.flush()
+            else:
+                print(block, flush=True)
+
+        try:
+            if pins is not None:
+                raise MonitorError("--pins cannot be used with --uart")
+            if edge is not None:
+                raise MonitorError("--edge cannot be used with --uart")
+            if ws or password:
+                raise MonitorError("--uart does not support WebREPL options")
+
+            uart_ports = parse_uart_ports(port)
+            for uart_port in uart_ports:
+                transport = _serial_transport_factory(uart_port, baudrate, timeout)
+                transport.connect()
+                transports.append((uart_port, transport))
+
+            emitted = run_uart_monitor_session(
+                transports,
+                fmt=fmt,
+                interval=uart_interval,
+                duration=duration,
+                count=count,
+                on_start=emit_uart_header if fmt == "text" else None,
+                refresh=text_refresh,
+                write=emit_uart,
+            )
+            printed_inline = text_refresh and (emitted > 0 or printed_uart_block)
+        except KeyboardInterrupt:
+            printed_inline = text_refresh
+            log.info("用户中断")
+        except MonitorError as exc:
+            log.error("%s", exc)
+            raise typer.Exit(1) from exc
+        finally:
+            if printed_inline:
+                print()
+            for _uart_port, transport in reversed(transports):
+                transport.disconnect()
+        return
 
     def emit_header(options) -> None:
         header = format_monitor_header(options, port=port)
@@ -626,13 +719,19 @@ def monitor(
             mp,
             pins=pins,
             fmt=fmt,
-            interval=interval,
+            interval=monitor_interval,
             duration=duration,
             count=count,
             edge=edge,
+            on_sample_error=lambda exc, output: log.debug(
+                "monitor sample skipped: %s; output=%r",
+                exc,
+                output,
+            ),
             on_start=emit_header if fmt == "text" else None,
             sample_style="modern" if fmt == "text" else "compact",
             write=emit,
+            stream=True,
         )
         printed_inline = text_refresh and emitted > 0
     except KeyboardInterrupt:

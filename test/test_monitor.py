@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,17 +12,88 @@ from cli.utils.monitor import (
     build_pin_probe_script,
     build_sampling_script,
     build_single_sample_script,
+    build_streaming_sample_script,
+    format_uart_monitor_header,
+    format_uart_monitor_sample,
     format_monitor_header,
     format_monitor_sample,
     parse_pin_list,
     parse_sample_output,
+    parse_uart_ports,
     resolve_monitor_pins,
     run_monitor,
     run_monitor_session,
+    run_uart_monitor_session,
 )
 
 
 runner = CliRunner()
+
+
+class FakeSerialTransport:
+    def __init__(self, chunks, *, read_delay=0.0):
+        self._chunks = list(chunks)
+        self._read_delay = read_delay
+        self.connected = False
+
+    def connect(self):
+        self.connected = True
+
+    def disconnect(self):
+        self.connected = False
+
+    @property
+    def in_waiting(self):
+        if not self._chunks:
+            return 0
+        return len(self._chunks[0])
+
+    def read(self, size=-1):
+        if not self._chunks:
+            return b""
+        if self._read_delay:
+            time.sleep(self._read_delay)
+        chunk = self._chunks.pop(0)
+        if size < 0 or size >= len(chunk):
+            return chunk
+        self._chunks.insert(0, chunk[size:])
+        return chunk[:size]
+
+
+class FakeRawTransport:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    @property
+    def in_waiting(self):
+        if not self._chunks:
+            return 0
+        return len(self._chunks[0])
+
+    def read(self, size=-1):
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        if size < 0 or size >= len(chunk):
+            return chunk
+        self._chunks.insert(0, chunk[size:])
+        return chunk[:size]
+
+
+class FakeRawMicroPython:
+    def __init__(self, chunks):
+        self.transport = FakeRawTransport(chunks)
+        self.writes = []
+        self.entered_raw_repl = False
+
+    def _enter_raw_repl(self):
+        self.entered_raw_repl = True
+
+    def _write(self, data):
+        self.writes.append(data)
+
+    def _record_rx(self, _data):
+        pass
 
 
 class TestParsePinList:
@@ -76,6 +148,27 @@ class TestMonitorFormatting:
         line = format_monitor_sample([0, 2], [1, 0], fmt="json", seq=3)
 
         assert json.loads(line) == {"seq": 3, "pins": {"0": 1, "2": 0}}
+
+
+class TestUartMonitorFormatting:
+    def test_uart_ports_accept_comma_separated_values(self):
+        assert parse_uart_ports("COM3, COM4") == ["COM3", "COM4"]
+
+    def test_uart_header_uses_tab_separated_columns(self):
+        header = format_uart_monitor_header(["COM3", "COM4"])
+
+        assert "PYRITE UART MONITOR" in header
+        assert "Port\tRaw\tHex\tString" in header
+
+    def test_uart_sample_shows_raw_hex_and_string_columns(self):
+        line = format_uart_monitor_sample("COM3", b"hello")
+
+        assert line == "COM3\tb'hello'\t68 65 6c 6c 6f\thello"
+
+    def test_uart_sample_marks_decode_failures(self):
+        line = format_uart_monitor_sample("COM3", b"\xff")
+
+        assert line == "COM3\tb'\\xff'\tff\t<decode failed>"
 
 
 class TestProbeScript:
@@ -135,6 +228,15 @@ class TestSamplingScript:
     def test_invalid_edge_is_rejected(self):
         with pytest.raises(MonitorError, match="edge"):
             build_sampling_script([0], edge="rising")
+
+    def test_streaming_script_emits_marked_samples(self):
+        script = build_streaming_sample_script([0, 2], interval=0.2, count=3)
+
+        compile(script, "<monitor-stream>", "exec")
+        assert "_pins=[0, 2]" in script
+        assert "PYRITE_MONITOR_SAMPLE:" in script
+        assert "_interval=0.2" in script
+        assert "_count=3" in script
 
 
 class TestSingleSampleScript:
@@ -243,6 +345,95 @@ class TestRunMonitor:
         assert starts[0].pins == (0, 2)
         assert lines == ["#0000 | GPIO0: HIGH | GPIO2: LOW"]
 
+    def test_session_skips_transient_missing_marker_sample(self):
+        mp = MagicMock()
+        mp.run.side_effect = [
+            "PYRITE_MONITOR_SAMPLE:1\n",
+            "noise without marker\n",
+            "PYRITE_MONITOR_SAMPLE:0\n",
+        ]
+        lines = []
+        errors = []
+
+        emitted = run_monitor_session(
+            mp,
+            pins=[0],
+            count=3,
+            interval=0.001,
+            write=lines.append,
+            sleep=lambda _seconds: None,
+            on_sample_error=lambda exc, output: errors.append((str(exc), output)),
+        )
+
+        assert emitted == 2
+        assert lines == ["0=1", "0=0"]
+        assert errors == [
+            ("GPIO sample output missing monitor marker", "noise without marker\n")
+        ]
+
+    def test_session_streams_samples_without_per_sample_run_calls(self):
+        mp = FakeRawMicroPython([
+            b"OKPYRITE_MONITOR_SAMPLE:1\n",
+            b"PYRITE_MONITOR_SAMPLE:0\n\x04",
+        ])
+        lines = []
+
+        emitted = run_monitor_session(
+            mp,
+            pins=[0],
+            count=2,
+            interval=0.001,
+            write=lines.append,
+            stream=True,
+        )
+
+        assert emitted == 2
+        assert lines == ["0=1", "0=0"]
+        assert mp.entered_raw_repl is True
+        assert len(mp.writes) == 2
+
+
+class TestRunUartMonitor:
+    def test_session_reads_each_uart_and_writes_tab_rows(self):
+        transports = [
+            ("COM3", FakeSerialTransport([b"hello"])),
+            ("COM4", FakeSerialTransport([b"\xff"])),
+        ]
+        lines = []
+
+        emitted = run_uart_monitor_session(
+            transports,
+            count=1,
+            write=lines.append,
+            sleep=lambda _seconds: None,
+        )
+
+        assert emitted == 2
+        assert lines == [
+            "COM3\tb'hello'\t68 65 6c 6c 6f\thello",
+            "COM4\tb'\\xff'\tff\t<decode failed>",
+        ]
+
+    def test_slow_uart_read_does_not_block_other_ports(self):
+        transports = [
+            ("COM3", FakeSerialTransport([b"slow"], read_delay=0.2)),
+            ("COM4", FakeSerialTransport([b"fast"])),
+        ]
+        lines = []
+
+        started = time.monotonic()
+        emitted = run_uart_monitor_session(
+            transports,
+            duration=0.05,
+            interval=0.01,
+            write=lines.append,
+        )
+        elapsed = time.monotonic() - started
+
+        assert emitted >= 1
+        assert "COM4\tb'fast'\t66 61 73 74\tfast" in lines
+        assert elapsed < 0.15
+
 
 class TestMonitorCli:
     def test_monitor_command_prints_modern_text_panel(self, monkeypatch):
@@ -286,3 +477,29 @@ class TestMonitorCli:
         assert result.stdout.strip() == '{"seq":0,"pins":{"0":1,"2":0}}'
         mp.connect.assert_called_once()
         mp.disconnect.assert_called_once()
+
+    def test_monitor_command_uart_reads_serial_transport_rows(self, monkeypatch):
+        transports = {
+            "COM3": FakeSerialTransport([b"hello"]),
+            "COM4": FakeSerialTransport([b"\xff"]),
+        }
+        monkeypatch.setattr(
+            "cli.main._serial_transport_factory",
+            lambda port, *_args: transports[port],
+        )
+
+        result = runner.invoke(app, [
+            "monitor",
+            "COM3,COM4",
+            "--uart",
+            "--count",
+            "1",
+        ])
+
+        assert result.exit_code == 0
+        assert "PYRITE UART MONITOR" in result.stdout
+        assert "Port\tRaw\tHex\tString" in result.stdout
+        assert "COM3\tb'hello'\t68 65 6c 6c 6f\thello" in result.stdout
+        assert "COM4\tb'\\xff'\tff\t<decode failed>" in result.stdout
+        assert transports["COM3"].connected is False
+        assert transports["COM4"].connected is False

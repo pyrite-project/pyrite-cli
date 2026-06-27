@@ -12,7 +12,11 @@ pull_test/
 
 test_proj/
 build/
+!cli/utils/build/
+!cli/utils/build/*.py
 log/
+!cli/utils/log/
+!cli/utils/log/*.py
 
 # 未来功能设计方案（不纳入版本控制）
 docs/插件系统方案.md

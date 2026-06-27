@@ -10,6 +10,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import ntpath
 import os
 import time
 from pathlib import Path
@@ -18,8 +19,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from ..utils.config import HASH_CONFIG_FILE, _HASH_VERSION
 from ..utils.flash import SET_EXECUTE, _strip_repl_trailer
 from ..utils.log import get_logger
-from ..utils.manifest_loader import load_manifest
-from ..utils.output import log as output_log, print_json
+from ..utils.build import load_manifest
+from ..utils.ui import log as output_log, print_json, safe_text
 
 if TYPE_CHECKING:
     from ..utils.flash import MicroPython
@@ -44,6 +45,125 @@ class ProjectSyncManager:
 
     def __init__(self, mp: "MicroPython") -> None:
         self.mp = mp
+
+    @staticmethod
+    def _normalise_remote_prefix(remote_prefix: str) -> str:
+        prefix = (remote_prefix or "/").replace("\\", "/")
+        if not prefix.startswith("/"):
+            prefix = "/" + prefix
+        stripped = prefix.strip("/")
+        return f"/{stripped}" if stripped else "/"
+
+    @classmethod
+    def _remote_prefix_candidates(cls, remote_prefix: str) -> List[str]:
+        prefix = cls._normalise_remote_prefix(remote_prefix)
+        if prefix == "/":
+            return ["/"]
+        relative = prefix.lstrip("/")
+        return [prefix, relative]
+
+    @staticmethod
+    def _windows_path_reason(path: str) -> Optional[str]:
+        drive, _tail = ntpath.splitdrive(path)
+        if not drive:
+            return None
+        if drive.startswith(("\\\\", "//")):
+            return "windows_unc"
+        return "windows_drive"
+
+    @classmethod
+    def _safe_local_target_for_device_path(
+        cls,
+        local_dir: str,
+        remote_prefix: str,
+        remote_path: str,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (local_path, relative_path, reason) for a discovered device path."""
+        raw_remote = str(remote_path)
+        if not raw_remote:
+            return None, None, "empty_path"
+
+        reason = cls._windows_path_reason(raw_remote)
+        if reason is not None:
+            return None, None, reason
+        if raw_remote.startswith("\\"):
+            return None, None, "host_absolute"
+
+        remote = raw_remote.replace("\\", "/")
+        reason = cls._windows_path_reason(remote)
+        if reason is not None:
+            return None, None, reason
+        if remote.startswith("//"):
+            return None, None, "windows_unc"
+
+        prefixes = cls._remote_prefix_candidates(remote_prefix)
+        if prefixes == ["/"]:
+            rel = remote.lstrip("/")
+        else:
+            rel = None
+            for prefix in prefixes:
+                prefix_base = prefix.rstrip("/")
+                if remote == prefix_base:
+                    rel = ""
+                    break
+                if remote.startswith(prefix_base + "/"):
+                    rel = remote[len(prefix_base) + 1:]
+                    break
+            if rel is None:
+                rel = remote.lstrip("/")
+
+        if not rel or rel.startswith(("/", "\\")):
+            return None, None, "host_absolute"
+
+        parts: List[str] = []
+        for part in rel.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                return None, None, "parent_reference"
+            reason = cls._windows_path_reason(part)
+            if reason is not None:
+                return None, None, reason
+            parts.append(part)
+
+        if not parts:
+            return None, None, "empty_path"
+
+        base = Path(local_dir).resolve()
+        target = base.joinpath(*parts).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            return None, None, "outside_local_dir"
+
+        rel_path = "/".join(parts)
+        return str(target).replace("\\", "/"), rel_path, None
+
+    @classmethod
+    def _device_download_targets(
+        cls,
+        local_dir: str,
+        remote_prefix: str,
+        remote_files: List[str],
+    ) -> Tuple[List[str], List[str], List[Dict[str, str]]]:
+        safe_remote_files: List[str] = []
+        local_paths: List[str] = []
+        skipped: List[Dict[str, str]] = []
+        for remote_path in remote_files:
+            local_path, _rel_path, reason = cls._safe_local_target_for_device_path(
+                local_dir,
+                remote_prefix,
+                remote_path,
+            )
+            if local_path is None:
+                skipped.append({
+                    "remote": remote_path,
+                    "reason": reason or "unsafe_device_path",
+                })
+                continue
+            safe_remote_files.append(remote_path)
+            local_paths.append(local_path)
+        return safe_remote_files, local_paths, skipped
 
     # ── 文件收集 ──────────────────────────────────────────────
 
@@ -117,12 +237,14 @@ class ProjectSyncManager:
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
         dry_run: bool = False,
+        changed_paths: Optional[Set[str]] = None,
     ) -> List[Tuple[str, str, bool]]:
         """根据哈希配置，仅刷入新增或已更改的文件。"""
         if hash_config_path is None:
             hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
 
-        if os.path.exists(hash_config_path):
+        has_hash_config = os.path.exists(hash_config_path)
+        if has_hash_config:
             with open(hash_config_path, "r", encoding="utf-8") as f:
                 stored_config = json.load(f)
             stored_hashes = stored_config.get("files", {})
@@ -135,11 +257,21 @@ class ProjectSyncManager:
             log.info("没有需要刷入的文件")
             return []
 
+        changed_abs: Optional[Set[str]] = None
+        if changed_paths and has_hash_config:
+            changed_abs = {
+                os.path.abspath(path)
+                for path in changed_paths
+                if path
+            }
+
         changed: List[Tuple[str, str, str]] = []
         unchanged_count = 0
         current_hashes: Dict[str, str] = {}
 
         for lp, rp_part in entries:
+            if changed_abs is not None and os.path.abspath(lp) not in changed_abs:
+                continue
             rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
             cur_hash = compute_file_hash(lp)
             current_hashes[rel_path] = cur_hash
@@ -153,13 +285,18 @@ class ProjectSyncManager:
             else:
                 unchanged_count += 1
 
-        removed = [k for k in stored_hashes if k not in current_hashes]
+        removed = [] if changed_abs is not None else [
+            k for k in stored_hashes if k not in current_hashes
+        ]
         if removed:
             log.info("%d 个文件已从项目中移除（将从配置中清除）", len(removed))
             for rf in sorted(removed):
                 log.debug("  - %s", rf)
 
         if not changed:
+            if changed_abs is not None:
+                log.info("监听到的文件未产生可刷入变更，无需刷入")
+                return []
             log.info("所有文件均未更改 (%d 个文件)，无需刷入", unchanged_count)
             return [
                 (lp, os.path.join(remote_prefix, rp_part).replace("\\", "/"), True)
@@ -195,8 +332,12 @@ class ProjectSyncManager:
         fail = sum(1 for _lp, _rp, success in results if not success)
 
         if ok > 0:
-            updated: Dict[str, str] = {}
-            for lp, rp_part in entries:
+            updated: Dict[str, str] = (
+                dict(stored_hashes) if changed_abs is not None else {}
+            )
+            for lp, _rp_part in entries:
+                if changed_abs is not None and os.path.abspath(lp) not in changed_abs:
+                    continue
                 rel_path = os.path.relpath(lp, local_dir).replace("\\", "/")
                 was_flashed_ok = any(
                     lp == flp and success
@@ -289,13 +430,19 @@ class ProjectSyncManager:
         local_data: bytes,
     ) -> str:
         """Build a line-level unified diff between device and local content."""
-        remote_text = remote_data.decode("utf-8", errors="replace").splitlines(keepends=True)
-        local_text = local_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        remote_text = [
+            safe_text(line, preserve_newlines=True)
+            for line in remote_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        ]
+        local_text = [
+            safe_text(line, preserve_newlines=True)
+            for line in local_data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        ]
         return "".join(difflib.unified_diff(
             remote_text,
             local_text,
-            fromfile=remote_path,
-            tofile=rel_path,
+            fromfile=safe_text(remote_path, preserve_newlines=False),
+            tofile=safe_text(rel_path, preserve_newlines=False),
             lineterm="",
         ))
 
@@ -410,11 +557,16 @@ class ProjectSyncManager:
         output_log(f"  {sep}")
 
         for rel, rp in added:
-            output_log(f"  \033[33m[ADD]\033[0m  {rel:<40}  {rp:<40}")
+            rel_out = safe_text(rel, preserve_newlines=False)
+            rp_out = safe_text(rp, preserve_newlines=False)
+            output_log(f"  \033[33m[ADD]\033[0m  {rel_out:<40}  {rp_out:<40}")
         for rel, rp, _diff in changed:
-            output_log(f"  \033[33m[MOD]\033[0m  {rel:<40}  {rp:<40}")
+            rel_out = safe_text(rel, preserve_newlines=False)
+            rp_out = safe_text(rp, preserve_newlines=False)
+            output_log(f"  \033[33m[MOD]\033[0m  {rel_out:<40}  {rp_out:<40}")
         for rel in removed_list:
-            output_log(f"  \033[31m[DEL]\033[0m  {rel:<40}  {'(不在项目中)':40}")
+            rel_out = safe_text(rel, preserve_newlines=False)
+            output_log(f"  \033[31m[DEL]\033[0m  {rel_out:<40}  {'(不在项目中)':40}")
 
         for _rel, _rp, diff in changed:
             if diff:
@@ -445,6 +597,7 @@ class ProjectSyncManager:
     ) -> bool:
         """从设备下载文件到本地（批量传输）。"""
         entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        pre_skipped: List[Dict[str, str]] = []
         if not entries:
             if fmt != "json":
                 log.info("本地目录为空，从设备发现文件...")
@@ -458,25 +611,34 @@ class ProjectSyncManager:
                 else:
                     log.info("设备上未发现文件")
                 return True
-            from_device = True
             entries = []
-            for rp, sz in dev_files:
-                rel = (
-                    rp[len(remote_prefix):].lstrip("/")
-                    if rp.startswith(remote_prefix)
-                    else rp.lstrip("/")
+            for rp, _sz in dev_files:
+                lp, _rel, reason = self._safe_local_target_for_device_path(
+                    local_dir, remote_prefix, rp,
                 )
-                lp = os.path.join(local_dir, rel).replace("\\", "/")
-                entries.append((lp, rel))
+                if reason is not None:
+                    pre_skipped.append({"remote": rp, "reason": reason})
+                    continue
+                entries.append((lp, rp))
 
         remote_files: List[str] = []
         local_paths: List[str] = []
         for lp, rp_part in entries:
+            if str(rp_part).startswith("/"):
+                remote_files.append(str(rp_part).replace("\\", "/"))
+                local_paths.append(lp)
+                continue
             remote = os.path.join(remote_prefix, rp_part).replace("\\", "/")
             remote_files.append(remote)
             local_paths.append(lp)
 
-        return self._download_device_files(remote_files, local_paths, dry_run=dry_run, fmt=fmt)
+        return self._download_device_files(
+            remote_files,
+            local_paths,
+            dry_run=dry_run,
+            fmt=fmt,
+            pre_skipped=pre_skipped,
+        )
 
     # ── device backup / restore ─────────────────────
 
@@ -499,20 +661,24 @@ class ProjectSyncManager:
                 log.info("设备上未发现文件")
             return True
 
-        remote_files = [rp for rp, _sz in dev_files]
-        local_paths = [
-            os.path.join(
-                local_dir,
-                (
-                    rp[len(remote_prefix):].lstrip("/")
-                    if rp.startswith(remote_prefix)
-                    else rp.lstrip("/")
-                ),
-            ).replace("\\", "/")
-            for rp in remote_files
-        ]
+        remote_files: List[str] = []
+        local_paths: List[str] = []
+        pre_skipped: List[Dict[str, str]] = []
+        for rp, _sz in dev_files:
+            lp, _rel, reason = self._safe_local_target_for_device_path(
+                local_dir, remote_prefix, rp,
+            )
+            if reason is not None:
+                pre_skipped.append({"remote": rp, "reason": reason})
+                continue
+            remote_files.append(rp)
+            local_paths.append(lp)
         return bool(self._download_device_files(
-            remote_files, local_paths, dry_run=dry_run, fmt=fmt,
+            remote_files,
+            local_paths,
+            dry_run=dry_run,
+            fmt=fmt,
+            pre_skipped=pre_skipped,
         ))
 
     def restore(
@@ -598,20 +764,53 @@ class ProjectSyncManager:
         local_paths: List[str],
         dry_run: bool = False,
         fmt: str = "text",
+        pre_skipped: Optional[List[Dict[str, str]]] = None,
     ) -> bool:
         """Download a known device file list using one raw byte stream."""
+        skipped = list(pre_skipped or [])
         if dry_run:
             if fmt == "json":
-                print_json({
+                payload = {
                     "preview": [
                         {"remote": rp, "local": lp}
                         for rp, lp in zip(remote_files, local_paths)
                     ],
-                })
+                }
+                if skipped:
+                    payload["skipped"] = skipped
+                    payload["failed"] = []
+                print_json(payload)
             else:
+                for item in skipped:
+                    log.warning(
+                        "[SKIP] %s (%s)",
+                        safe_text(item["remote"], preserve_newlines=False),
+                        safe_text(item["reason"], preserve_newlines=False),
+                    )
                 log.info("[PREVIEW] 将下载 %d 个文件:", len(remote_files))
                 for rp, lp in zip(remote_files, local_paths):
-                    log.info("  %s → %s", rp, lp)
+                    log.info(
+                        "  %s → %s",
+                        safe_text(rp, preserve_newlines=False),
+                        safe_text(lp, preserve_newlines=False),
+                    )
+            return True
+
+        if fmt != "json":
+            for item in skipped:
+                log.warning(
+                    "[SKIP] %s (%s)",
+                    safe_text(item["remote"], preserve_newlines=False),
+                    safe_text(item["reason"], preserve_newlines=False),
+                )
+
+        if not remote_files:
+            if fmt == "json":
+                print_json({
+                    "downloaded": [], "skipped": skipped, "failed": [],
+                })
+            else:
+                log.info("download complete: 0 ok")
             return True
 
         self.mp._enter_raw_repl()
@@ -694,15 +893,18 @@ class ProjectSyncManager:
 
         raw = raw[:expected_total]
 
-        ok = fail = 0
+        ok = 0
+        fail = 0
         offset = 0
         downloaded = []
-        skipped = []
         failed = []
         for i, (lp, size) in enumerate(zip(local_paths, sizes)):
             if size < 0:
-                log.warning("[SKIP] %s (设备上不存在)", remote_files[i])
-                skipped.append(remote_files[i])
+                log.warning(
+                    "[SKIP] %s (设备上不存在)",
+                    safe_text(remote_files[i], preserve_newlines=False),
+                )
+                skipped.append({"remote": remote_files[i], "reason": "missing"})
                 fail += 1
                 continue
             file_data = raw[offset : offset + size]
@@ -711,13 +913,23 @@ class ProjectSyncManager:
                 os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
                 with open(lp, "wb") as f:
                     f.write(file_data)
-                log.info("✓ %s → %s (%d 字节)", remote_files[i], lp, size)
+                log.info(
+                    "✓ %s → %s (%d 字节)",
+                    safe_text(remote_files[i], preserve_newlines=False),
+                    safe_text(lp, preserve_newlines=False),
+                    size,
+                )
                 downloaded.append({
                     "remote": remote_files[i], "local": lp, "size": size,
                 })
                 ok += 1
             except Exception as e:
-                log.error("✗ %s → %s: %s", remote_files[i], lp, e)
+                log.error(
+                    "✗ %s → %s: %s",
+                    safe_text(remote_files[i], preserve_newlines=False),
+                    safe_text(lp, preserve_newlines=False),
+                    safe_text(e, preserve_newlines=False),
+                )
                 failed.append({"remote": remote_files[i], "error": str(e)})
                 fail += 1
 

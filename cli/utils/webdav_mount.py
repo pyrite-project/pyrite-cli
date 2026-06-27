@@ -28,8 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 
-from .flash import MicroPython
-from .log import get_logger
+from ..flash import MicroPython
+from ..log import get_logger
 
 log = get_logger(__name__)
 ET.register_namespace("D", "DAV:")
@@ -93,6 +93,7 @@ class WebDavConfig:
     run_timeout: int = 300
     run_queue_max_operations: int = 64
     run_queue_max_bytes: int = 64 * 1024 * 1024
+    max_upload_bytes: int = 64 * 1024 * 1024
 
 
 def mount_run_executable_for_system(
@@ -216,6 +217,16 @@ class MountRunState:
         if item.error is not None:
             raise item.error
         return item.result
+
+    def can_accept_write(self, size_bytes: int = 0) -> bool:
+        size_bytes = max(0, size_bytes)
+        with self._condition:
+            if self._state != self.RUNNING:
+                return True
+            return (
+                len(self._queue) < self._max_operations
+                and self._queued_bytes + size_bytes <= self._max_bytes
+            )
 
     def _drain_queue(self) -> None:
         with self._condition:
@@ -996,8 +1007,40 @@ def make_webdav_handler(
                 raise ValueError("missing Destination header")
             return mapper.to_remote(urlsplit(dst).path)
 
-        def _read_body_to_temp(self) -> tuple[str, int]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
+        def _send_unread_upload_rejection(self, status: int, body: bytes) -> None:
+            self.close_connection = True
+            self._send_bytes(
+                status,
+                body,
+                "text/plain; charset=utf-8",
+                {"Connection": "close"},
+            )
+
+        def _upload_content_length(self) -> Optional[int]:
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                self._send_unread_upload_rejection(HTTPStatus.BAD_REQUEST, b"missing Content-Length")
+                return None
+            try:
+                length = int(raw_length)
+            except ValueError:
+                self._send_unread_upload_rejection(HTTPStatus.BAD_REQUEST, b"invalid Content-Length")
+                return None
+            if length < 0:
+                self._send_unread_upload_rejection(HTTPStatus.BAD_REQUEST, b"invalid Content-Length")
+                return None
+            if length > config.max_upload_bytes:
+                self._send_unread_upload_rejection(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, b"upload too large")
+                return None
+            return length
+
+        def _read_body_to_temp(self) -> Optional[tuple[str, int]]:
+            length = self._upload_content_length()
+            if length is None:
+                return None
+            if run_state is not None and not run_state.can_accept_write(length):
+                self._send_unread_queue_full()
+                return None
             fd, path = tempfile.mkstemp(prefix="pyrite_webdav_queue_", suffix=".bin")
             remaining = length
             written = 0
@@ -1046,6 +1089,15 @@ def make_webdav_handler(
 
         def _send_queue_full(self) -> None:
             self._send_bytes(HTTPStatus.SERVICE_UNAVAILABLE, b"mount run queue is full")
+
+        def _send_unread_queue_full(self) -> None:
+            self.close_connection = True
+            self._send_bytes(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                b"mount run queue is full",
+                "text/plain; charset=utf-8",
+                {"Connection": "close"},
+            )
 
         def _send_listing_not_ready(self) -> None:
             self._send_bytes(
@@ -1148,7 +1200,10 @@ def make_webdav_handler(
             if self._reject_run_trigger_mutation():
                 return
             remote = self._remote()
-            temp_path, size = self._read_body_to_temp()
+            body = self._read_body_to_temp()
+            if body is None:
+                return
+            temp_path, size = body
 
             def write() -> HTTPStatus:
                 existed = adapter.stat(remote) is not None

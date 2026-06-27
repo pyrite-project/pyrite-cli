@@ -4,50 +4,34 @@
 
 ```
 pyrite-cli/
-├── cli/
-│   ├── main.py              # CLI entry (Typer command definitions)
-│   ├── py.typed             # PEP 561 type marker
-│   └── utils/
-│       ├── flash/
-│       │   ├── core.py      # MicroPython serial device communication,
-│       │   │                   file flash/verify, fs browser, bytes download,
-│       │   │                   recursive fs_ls_recursive
-│       │   ├── flash.py     # Public facade for command-facing flash helpers
-│       │   └── mp_scripts/  # Device-side transfer scripts
-│       ├── transport/
-│       │   ├── base.py      # Transport layer ABC
-│       │   ├── serial.py    # Serial transport implementation
-│       │   └── webrepl.py   # WebREPL (WebSocket) transport
-│       ├── serial_transport.py  # Compatibility wrapper
-│       ├── webrepl_transport.py # Compatibility wrapper
-│       ├── webrepl_micropython.py # WebREPLMicroPython — WebSocket subclass
-│       │                          inheriting all MicroPython high-level ops
-│       ├── pkg.py           # mpremote mip install/cache planning helpers
-│       ├── monitor.py       # GPIO monitor parsing/script/session helpers
-│       ├── types.py         # Type definitions (PyriteConfig dataclass)
-│       ├── config.py        # Config loading & default config generation
-│       ├── compiler.py      # mpy-cross compilation wrapper (parallel support)
-│       ├── ansi.py          # ANSI terminal color constants
-│       ├── preprocessor.py  # Conditional compilation (libcst CST transforms)
-│       ├── manifest_loader.py # Secure manifest.py parser
-│       ├── log.py           # Unified logging: 6 levels, JSONL, operation timing,
-│       │                       traffic monitor (serial/WebSocket)
-│       ├── logger.py        # Logging compatibility shim (re-exports from log.py)
-│       └── output.py        # JSON output formatting, TTY detection
-│   └── project/
-│       ├── project.py       # Project scaffolding, interactive hardware selection
-│       ├── stubs.py         # GitHub API stub downloader
-│       └── sync.py          # ProjectSyncManager — hash-based incremental sync,
-│                              status comparison, batch pull (no device dependency)
-├── test/
-│   ├── test_config.py       # Config loading edge-case tests
-│   ├── test_flash_utils.py  # REPL coloring, CRC32, file hash tests
-│   ├── test_protocol_helpers.py # Protocol parsing function tests
-│   ├── test_manifest_loader.py  # Manifest parser tests
-│   ├── test_logger.py       # Unified logging system tests
-│   └── test_output.py       # JSON output & TTY detection tests
-└── docs/
-    └── ...
+|-- cli/
+|   |-- main.py              # CLI entry (Typer command definitions)
+|   |-- py.typed             # PEP 561 type marker
+|   |-- utils/
+|   |   |-- flash/            # Raw REPL, flash/verify, fs browser, bytes download
+|   |   |   |-- core.py
+|   |   |   |-- flash.py
+|   |   |   `-- mp_scripts/
+|   |   |-- transport/        # Transport ABC and serial implementation
+|   |   |   |-- base.py
+|   |   |   `-- serial.py
+|   |   |-- webrepl/          # WebREPL transport and MicroPython adapter
+|   |   |   |-- transport.py
+|   |   |   `-- micropython.py
+|   |   |-- build/            # mpy-cross, conditional compilation, manifest parser
+|   |   |-- config/           # Config loading and PyriteConfig
+|   |   |-- diagnostics/      # doctor and monitor helpers
+|   |   |-- log/              # Unified logging package
+|   |   |-- ui/               # ANSI, JSON output, terminal selection
+|   |   |-- pkg.py            # mpremote mip planning helpers
+|   |   |-- webdav_mount.py   # WebDAV mount helpers
+|   |   `-- errors.py
+|   `-- project/
+|       |-- project.py
+|       |-- stubs.py
+|       `-- sync.py
+|-- test/
+`-- docs/
 ```
 
 ---
@@ -98,7 +82,7 @@ SerialTransport
 - `connect()` auto-calls `reset_input_buffer()` to clear startup residual data.
 - `disconnect()` also clears parent `_rx_buf`.
 
-### WebREPLTransport (`transport/webrepl.py`)
+### WebREPLTransport (`utils/webrepl/transport.py`)
 
 WebREPL protocol via `websocket-client`, enabling WiFi connections to MicroPython devices:
 
@@ -259,7 +243,7 @@ The former monolithic `cli/utils/flash.py` is now a package:
 |------|----------------|
 | `cli/utils/flash/core.py` | Raw REPL protocol, file transfer, verification, filesystem helpers |
 | `cli/utils/flash/flash.py` | Public command-facing facade |
-| `cli/utils/flash/__init__.py` | Backward-compatible re-export surface |
+| `cli/utils/flash/__init__.py` | Public import surface |
 | `cli/utils/flash/mp_scripts/` | Device-side upload scripts packaged with `cli.utils.flash` |
 
 `from cli.utils.flash import MicroPython` and helper imports such as `_strip_repl_trailer` remain supported.
@@ -329,7 +313,7 @@ syncer.pull("./my_project", "/")
 
 ---
 
-## WebREPLMicroPython (`utils/webrepl_micropython.py`)
+## WebREPLMicroPython (`utils/webrepl/micropython.py`)
 
 A thin subclass of `MicroPython` that uses `WebREPLTransport` instead of `SerialTransport`:
 

@@ -15,7 +15,7 @@ from typing import Set
 
 import libcst as cst
 
-from .log import get_logger
+from ..log import get_logger
 
 log = get_logger(__name__)
 

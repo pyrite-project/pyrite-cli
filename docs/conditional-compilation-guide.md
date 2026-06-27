@@ -378,7 +378,7 @@ Check what a file looks like after preprocessing without connecting a device:
 
 ```bash
 python -c "
-from cli.utils.preprocessor import preprocess
+from cli.utils.build import preprocess
 src = open('main.py').read()
 result = preprocess(src, {'ESP32', 'wifi'}, 'main.py')
 print(result)
@@ -390,7 +390,7 @@ print(result)
 When a device is connected, `pyrite-cli` outputs the detected target:
 
 ```bash
-pyrcli board-info COM3
+pyrcli debug board-info COM3
 ```
 
 The project's `.pyrite_hash.json` also records a snapshot of the active_tags used during each flash (used with `project flash`).
@@ -400,7 +400,8 @@ The project's `.pyrite_hash.json` also records a snapshot of the active_tags use
 After flashing, verify functions exist on the device:
 
 ```bash
-pyrcli run COM3 "import sensor; print(dir(sensor))"
+pyrcli repl COM3
+# In the REPL: import sensor; print(dir(sensor))
 ```
 
 If a function is undefined, check:

@@ -27,7 +27,7 @@ from cli.utils.flash import (
     _windows_repl_key_to_bytes,
 )
 from cli.project.sync import ProjectSyncManager, compute_file_hash
-from cli.utils.compiler import _compile_to_mpy
+from cli.utils.build import _compile_to_mpy
 
 # ── _colorize_repl_output ───────────────────────────────────────────
 
@@ -321,6 +321,43 @@ class TestInteractiveReplUnicode:
 
         assert "中" in stdout.getvalue()
         assert "\ufffd" not in stdout.getvalue()
+
+    def test_repl_command_handler_can_intercept_entered_line(self, monkeypatch):
+        transport = _KeyboardReplTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt(["r", "u", "n", "\r"]))
+        monkeypatch.setattr(sys, "stdout", _ReplStdout())
+        handled = []
+
+        def command_handler(data):
+            handled.append(data)
+            transport.connected = False
+            return True
+
+        mp.repl_(command_handler=command_handler)
+
+        assert handled == [b"run\r"]
+        assert b"run\r" not in transport.writes
+
+    def test_repl_command_handler_decline_sends_entered_line(self, monkeypatch):
+        transport = _KeyboardReplTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setitem(
+            sys.modules,
+            "msvcrt",
+            _FakeMsvcrt(["p", "r", "i", "n", "t", "(", "1", ")", "\r"]),
+        )
+        monkeypatch.setattr(sys, "stdout", _ReplStdout())
+        handled = []
+
+        def command_handler(data):
+            handled.append(data)
+            return False
+
+        mp.repl_(command_handler=command_handler)
+
+        assert handled == [b"print(1)\r"]
+        assert b"print(1)\r" in transport.writes
 
 
 class TestComputeCrc32:

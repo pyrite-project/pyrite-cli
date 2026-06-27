@@ -14,7 +14,7 @@ from getpass import getpass
 from typing import Optional
 
 from ..log import get_logger
-from .base import Transport
+from ..transport.base import Transport
 
 log = get_logger(__name__)
 

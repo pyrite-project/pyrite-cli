@@ -9,15 +9,72 @@ Manifest 安全解析器 — 使用 AST（非 exec）解析 manifest.py。
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Set, Tuple
 
-from .log import get_logger
+from ..log import get_logger
 
 log = get_logger(__name__)
 
 _MAX_MANIFEST_DEPTH = 15
 _MAX_MANIFEST_ENTRIES = 500
+
+
+def _has_parent_reference(path: str) -> bool:
+    return ".." in path.replace("\\", "/").split("/")
+
+
+def _has_windows_drive_or_unc(path: str) -> bool:
+    windows_path = PureWindowsPath(path)
+    return bool(windows_path.drive) or path.startswith(("\\\\", "//"))
+
+
+def _validate_local_path_literal(path: str, lineno: int) -> None:
+    windows_path = PureWindowsPath(path)
+    if (
+        PurePosixPath(path).is_absolute()
+        or bool(windows_path.root)
+        or _has_windows_drive_or_unc(path)
+    ):
+        raise ValueError(
+            f"manifest.py line {lineno}: absolute host paths are not allowed "
+            f"in filename: {path!r}"
+        )
+    if _has_parent_reference(path):
+        raise ValueError(
+            f"manifest.py line {lineno}: path traversal ('..') is not allowed "
+            f"in filename: {path!r}"
+        )
+
+
+def _validate_remote_path_literal(path: str, lineno: int) -> None:
+    if _has_parent_reference(path):
+        raise ValueError(
+            f"manifest.py line {lineno}: path traversal ('..') is not allowed "
+            f"in remote: {path!r}"
+        )
+    if _has_windows_drive_or_unc(path):
+        raise ValueError(
+            f"manifest.py line {lineno}: host-style paths are not allowed "
+            f"in remote: {path!r}"
+        )
+
+
+def _ensure_inside_base(path: Path, base: Path, lineno: int, original: str) -> None:
+    try:
+        path.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(
+            f"manifest.py line {lineno}: path must resolve inside base_dir: "
+            f"{original!r}"
+        ) from exc
+
+
+def _resolve_local_path(base: Path, filename: str, lineno: int) -> Path:
+    _validate_local_path_literal(filename, lineno)
+    resolved = (base / filename).resolve()
+    _ensure_inside_base(resolved, base, lineno, filename)
+    return resolved
 
 
 def _parse_str(node: ast.AST, what: str) -> str:
@@ -61,11 +118,7 @@ def _parse_call(call: ast.Call, lineno: int) -> Tuple[str, str, dict]:
         )
 
     filename = _parse_str(call.args[0], f"{func_name}() first argument")
-    if ".." in Path(filename).parts:
-        raise ValueError(
-            f"manifest.py line {lineno}: path traversal ('..') is not allowed "
-            f"in filename: {filename!r}"
-        )
+    _validate_local_path_literal(filename, lineno)
 
     kwargs: dict = {}
     for kw in call.keywords:
@@ -87,11 +140,7 @@ def _parse_call(call: ast.Call, lineno: int) -> Tuple[str, str, dict]:
     parsed_kwargs: dict = {}
     if "remote" in kwargs:
         remote_str = _parse_str(kwargs["remote"], "remote")
-        if ".." in Path(remote_str).parts:
-            raise ValueError(
-                f"manifest.py line {kw.lineno}: path traversal ('..') is not allowed "
-                f"in remote: {remote_str!r}"
-            )
+        _validate_remote_path_literal(remote_str, kwargs["remote"].lineno)
         parsed_kwargs["remote"] = remote_str
     if "features" in kwargs:
         parsed_kwargs["features"] = _parse_list_of_str(
@@ -149,7 +198,7 @@ def load_manifest(
 
     使用 AST 而非 exec() 解析，仅接受 module()/package() 字面量调用。
     """
-    base = Path(base_dir or Path(manifest_path).parent)
+    base = Path(base_dir or Path(manifest_path).parent).resolve()
     entries: List[Tuple[str, str]] = []
 
     source = Path(manifest_path).read_text(encoding="utf-8")
@@ -175,11 +224,13 @@ def load_manifest(
             continue
 
         remote = kwargs.get("remote")
+        local_path = _resolve_local_path(base, filename, node.value.lineno)
 
         if func_name == "module":
-            entries.append((str(base / filename), str(remote or filename)))
+            entries.append((str(local_path), str(remote or filename)))
         elif func_name == "package":
-            for f in (base / filename).rglob("*.py"):
+            for f in local_path.rglob("*.py"):
+                _ensure_inside_base(f.resolve(), base, node.value.lineno, str(f))
                 rel = str(f.relative_to(base)).replace("\\", "/")
                 if remote:
                     rp = f"{str(remote).rstrip('/')}/{rel}"

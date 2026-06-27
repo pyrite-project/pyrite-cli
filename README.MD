@@ -1,4 +1,7 @@
 <h1 align="center">Pyrite CLI</h1>
+<p align="center">
+  <img src="./docs/img/icon.png" width="128" alt="Pyrcli-icon" align="center">
+</p>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
@@ -49,19 +52,17 @@ pyrcli scan
 pyrcli scan -i
 
 # Inspect a board
-pyrcli board-info COM3
+pyrcli debug board-info COM3
 
-# Flash and run
+# Flash, then use the REPL
 pyrcli flash COM3 main.py /main.py
-pyrcli run COM3 "import machine; print(machine.freq())"
+pyrcli repl COM3
+# In the REPL: import machine; print(machine.freq())
 
 # Work with files
 pyrcli fs ls COM3 /
 pyrcli fs put COM3 local.py /remote.py
 pyrcli fs get COM3 /remote.py local_copy.py
-
-# Open an interactive REPL
-pyrcli repl COM3
 ```
 
 Mount the device filesystem in your desktop file manager:
@@ -93,7 +94,7 @@ pyrcli monitor COM3 --pins 0,2 --format json --count 5
 Use WebREPL instead of serial by adding `--ws`. The positional `PORT` stays in place for a consistent CLI shape; the WebSocket URL is the actual transport target.
 
 ```bash
-pyrcli board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
+pyrcli debug board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
 pyrcli flash COM3 main.py /main.py --ws ws://esp32.local:8266
 pyrcli mount COM3 --ws ws://esp32.local:8266 --password mypass
 ```
@@ -231,10 +232,10 @@ C3 = ["ESP32", "wifi"]
 | `scan` | Scan serial devices, with filters and JSON output |
 | `flash` | Flash one local file to the device |
 | `flash-program` | Recursively flash a local directory |
-| `run` | Execute Python code on the device |
 | `repl` | Open an interactive REPL |
 | `reset` | Soft-reset the device through raw REPL |
-| `board-info` | Print firmware, CPU, memory, flash, and filesystem info |
+| `debug board-info` | Print firmware, CPU, memory, flash, and filesystem info |
+| `debug doctor` | Run serial, raw REPL, filesystem, memory, and runtime feature diagnostics |
 | `monitor` | Monitor GPIO input state |
 | `mount` | Mount the device filesystem through local WebDAV |
 | `remount` | Reverse-mount a host directory to device `/remote` through `mpremote` |

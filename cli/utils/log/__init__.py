@@ -75,6 +75,46 @@ _COLORS: Dict[int, str] = {
 }
 
 
+def safe_text(value: object, *, preserve_newlines: bool = True) -> str:
+    """Return text safe for terminal/log display.
+
+    Device-controlled strings may contain ANSI CSI/OSC or C0/C1 controls.
+    Render those bytes as visible escapes so they cannot clear the terminal,
+    spoof output, or write to the clipboard. Newlines are optionally preserved
+    for multiline human-readable output such as trees and diffs.
+    """
+    text = value if isinstance(value, str) else str(value)
+    out: List[str] = []
+    for ch in text:
+        code = ord(ch)
+        if preserve_newlines and ch == "\n":
+            out.append(ch)
+        elif code <= 0x1F or code == 0x7F or 0x80 <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _safe_field(value: object) -> str:
+    return safe_text(value, preserve_newlines=False)
+
+
+def _safe_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return safe_text(value, preserve_newlines=True)
+    if isinstance(value, dict):
+        return {
+            _safe_field(key): _safe_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_json_value(item) for item in value]
+    return value
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 日志记录
 # ═══════════════════════════════════════════════════════════════════
@@ -154,20 +194,23 @@ class ConsoleHandler(Handler):
             if record.raw_hex:
                 detail = f" [hex] {record.raw_hex}"
             elif record.text:
-                detail = f" {record.text.strip()}"
+                detail = f" {_safe_field(record.text.strip())}"
             else:
                 detail = ""
             line = f"  {level_str} {module_str} {record.dir}{detail}"
         elif record.op:
             icon = {"start": "▶", "end": "✓", "error": "✗"}.get(record.op_status or "", " ")
             dur = f" ({record.duration_ms:.0f}ms)" if record.duration_ms is not None else ""
-            line = f"  {level_str} {module_str} {icon} {record.msg}{dur}"
+            line = f"  {level_str} {module_str} {icon} {safe_text(record.msg)}{dur}"
         else:
-            line = f"  {level_str} {module_str} {record.msg}"
+            line = f"  {level_str} {module_str} {safe_text(record.msg)}"
 
         # 附加字段
         if record.extra:
-            extras = " ".join(f"{k}={v}" for k, v in record.extra.items())
+            extras = " ".join(
+                f"{_safe_field(k)}={_safe_field(v)}"
+                for k, v in record.extra.items()
+            )
             line += f"  {_DIM}{extras}{_RESET}"
 
         sys.stderr.write(line + "\n")
@@ -175,7 +218,8 @@ class ConsoleHandler(Handler):
 
         # 异常堆栈
         if record.exc_text:
-            sys.stderr.write(f"{_COLORS[ERROR]}{record.exc_text}{_RESET}\n")
+            exc_text = safe_text(record.exc_text, preserve_newlines=True)
+            sys.stderr.write(f"{_COLORS[ERROR]}{exc_text}{_RESET}\n")
 
 
 def _rotated_log_path(path: Path, index: int) -> Path:
@@ -263,7 +307,7 @@ class JSONLFileHandler(_RotatingFileHandler):
                 "ts": datetime.fromtimestamp(record.ts).strftime("%H:%M:%S.%f")[:-3],
                 "level": record.level_name,
                 "module": record.module,
-                "msg": record.msg,
+                "msg": safe_text(record.msg),
             }
 
             if record.type == "traffic":
@@ -272,7 +316,7 @@ class JSONLFileHandler(_RotatingFileHandler):
                 if record.raw_hex:
                     obj["hex"] = record.raw_hex
                 if record.text:
-                    obj["text"] = record.text.strip()
+                    obj["text"] = _safe_field(record.text.strip())
             else:
                 if record.op:
                     obj["op"] = record.op
@@ -280,9 +324,9 @@ class JSONLFileHandler(_RotatingFileHandler):
                     if record.duration_ms is not None:
                         obj["duration_ms"] = round(record.duration_ms, 1)
                 if record.exc_text:
-                    obj["exc"] = record.exc_text
+                    obj["exc"] = safe_text(record.exc_text, preserve_newlines=True)
                 if record.extra:
-                    obj["extra"] = record.extra
+                    obj["extra"] = _safe_json_value(record.extra)
 
             self._file.write(json.dumps(obj, ensure_ascii=False) + "\n")  # type: ignore[union-attr]
             self._file.flush()
@@ -299,7 +343,8 @@ class TextFileHandler(_RotatingFileHandler):
             self._ensure_open()
             self._file.write(_format_text_record(record) + "\n")  # type: ignore[union-attr]
             if record.exc_text:
-                self._file.write(record.exc_text.rstrip() + "\n")  # type: ignore[union-attr]
+                exc_text = safe_text(record.exc_text.rstrip(), preserve_newlines=True)
+                self._file.write(exc_text + "\n")  # type: ignore[union-attr]
             self._file.flush()
 
 
@@ -309,14 +354,14 @@ def _format_text_record(record: LogRecord) -> str:
 
     fields: List[str] = []
     if record.type == "traffic":
-        detail = f"{record.dir or ''}"
+        detail = _safe_field(record.dir or "")
         if record.raw_hex:
             fields.append(f"hex={record.raw_hex}")
         if record.text:
-            fields.append(f"text={record.text.strip()}")
+            fields.append(f"text={_safe_field(record.text.strip())}")
         return f"{line} {detail}{_format_fields(fields)}"
 
-    msg = record.msg
+    msg = safe_text(record.msg)
     if record.op:
         fields.append(f"op={record.op}")
         if record.op_status:
@@ -324,7 +369,7 @@ def _format_text_record(record: LogRecord) -> str:
         if record.duration_ms is not None:
             fields.append(f"duration_ms={round(record.duration_ms, 1)}")
     for key, value in record.extra.items():
-        fields.append(f"{key}={value}")
+        fields.append(f"{_safe_field(key)}={_safe_field(value)}")
     return f"{line} {msg}{_format_fields(fields)}"
 
 
@@ -599,7 +644,7 @@ def get_logger(name: str) -> Logger:
 
 
 def _root_logger() -> Logger:
-    """获取根 Logger（供 output.py 兼容层使用）。"""
+    """获取根 Logger（供 UI 输出工具使用）。"""
     return get_logger("cli")
 
 
@@ -685,14 +730,14 @@ def shutdown() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 模块级便捷函数（兼容旧 logger.py 调用风格）
+# 模块级便捷函数
 # ═══════════════════════════════════════════════════════════════════
 
 _current_level = WARN
 
 
 def set_level(level: int) -> None:
-    """设置控制台全局最低级别（兼容旧 API）。"""
+    """设置控制台全局最低级别。"""
     global _current_level
     _current_level = level
     # 线程安全重建 console handler

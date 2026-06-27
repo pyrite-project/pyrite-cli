@@ -43,11 +43,13 @@ testpaths = [
     "test/test_logger.py",
     "test/test_manifest_loader.py",
     "test/test_preprocessor.py",
-    "test/test_serial_transport.py",
+    "test/test_transport_serial.py",
     "test/test_output.py",
     "test/test_webdav_mount.py",
     "test/test_pkg.py",
     "test/test_monitor.py",
+    "test/test_doctor.py",
+    "test/test_project_dev.py",
 ]
 
 [tool.mypy]

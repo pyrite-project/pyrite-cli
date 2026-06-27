@@ -1,15 +1,11 @@
-"""Backward-compatible import surface for flash utilities."""
+"""Public import surface for flash utilities."""
 
-from . import core as _core
+from . import flash as _flash
 
-_export_names = [
-    _name
-    for _name in dir(_core)
-    if not (_name.startswith("__") and _name.endswith("__"))
-]
+_export_names = list(_flash.__all__)
 
 for _name in _export_names:
-    globals()[_name] = getattr(_core, _name)
+    globals()[_name] = getattr(_flash, _name)
 
 __all__ = _export_names
 

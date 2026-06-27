@@ -22,7 +22,7 @@ from .stubs import (
 )
 from ..utils.config import DEFAULT_BAUDRATE
 from ..utils.log import get_logger
-from ..utils.selector import interactive_select
+from ..utils.ui import interactive_select
 
 log = get_logger(__name__)
 

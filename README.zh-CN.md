@@ -1,10 +1,13 @@
 <h1 align="center">Pyrite CLI</h1>
+<p align="center">
+  <img src="./docs/img/icon.png" width="128" alt="Pyrcli-icon" align="center">
+</p>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
 </p>
 
-Pyrite CLI 是一个面向 MicroPython 开发板的精简命令行工具箱。它通过统一的 `pyrcli` 命令界面，帮助你发现设备、刷入文件、同步项目、查看设备文件系统、通过 `mpremote mip` 安装包、监控 GPIO 输入、打开 REPL、通过 WebDAV 挂载设备文件，以及通过 `mpremote` 把上位机目录反向挂载给设备。
+Pyrite CLI 是一个面向 MicroPython 开发板的精简命令行工具箱。它通过统一的 `pyrcli` 命令界面，帮助你发现设备、刷入文件、同步项目、查看设备文件系统、安装包、监控 GPIO 输入、打开 REPL、通过 WebDAV 挂载设备文件，以及通过 `mpremote` 把上位机目录反向挂载给设备。
 
 它默认通过 UART raw REPL 与设备通信；添加 `--ws` 后，可以改用 WebREPL over WebSocket。
 
@@ -49,19 +52,17 @@ pyrcli scan
 pyrcli scan -i
 
 # 查看板级信息
-pyrcli board-info COM3
+pyrcli debug board-info COM3
 
-# 刷入并运行
+# 刷入，然后进入 REPL 运行代码
 pyrcli flash COM3 main.py /main.py
-pyrcli run COM3 "import machine; print(machine.freq())"
+pyrcli repl COM3
+# 在 REPL 中输入：import machine; print(machine.freq())
 
 # 操作文件
 pyrcli fs ls COM3 /
 pyrcli fs put COM3 local.py /remote.py
 pyrcli fs get COM3 /remote.py local_copy.py
-
-# 打开交互式 REPL
-pyrcli repl COM3
 ```
 
 在桌面文件管理器中挂载设备文件系统：
@@ -93,7 +94,7 @@ pyrcli monitor COM3 --pins 0,2 --format json --count 5
 给设备命令添加 `--ws` 即可改用 WebREPL。位置参数 `PORT` 会保留，用来保持 CLI 形状一致；真正的传输目标是 WebSocket URL。
 
 ```bash
-pyrcli board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
+pyrcli debug board-info COM3 --ws ws://192.168.4.1:8266 --password mypass
 pyrcli flash COM3 main.py /main.py --ws ws://esp32.local:8266
 pyrcli mount COM3 --ws ws://esp32.local:8266 --password mypass
 ```
@@ -233,10 +234,10 @@ C3 = ["ESP32", "wifi"]
 | `scan` | 扫描串口设备，支持过滤和 JSON 输出 |
 | `flash` | 刷入单个本地文件到设备 |
 | `flash-program` | 递归刷入本地目录 |
-| `run` | 在设备上执行 Python 代码 |
 | `repl` | 打开交互式 REPL |
 | `reset` | 通过 raw REPL 软重启设备 |
-| `board-info` | 输出固件、CPU、内存、Flash 和文件系统信息 |
+| `debug board-info` | 输出固件、CPU、内存、Flash 和文件系统信息 |
+| `debug doctor` | 运行串口、Raw REPL、文件系统、内存和运行时特性诊断 |
 | `monitor` | 监控 GPIO 输入状态 |
 | `mount` | 通过本地 WebDAV 挂载设备文件系统 |
 | `remount` | 通过 `mpremote` 把上位机目录反向挂载为设备端 `/remote` |

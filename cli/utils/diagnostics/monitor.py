@@ -695,7 +695,7 @@ def _stream_raw_repl_stdout(
     on_line: Callable[[str], None],
     monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
-    from .flash.core import SET_EXECUTE
+    from ..flash.core import SET_EXECUTE
 
     mp._enter_raw_repl()
     mp._write(code)

@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .flash import MicroPython
-from .log import get_logger
-from .transport import Transport, WebREPLTransport
+from ..flash import MicroPython
+from ..log import get_logger
+from ..transport.base import Transport
+from .transport import WebREPLTransport
 
 log = get_logger(__name__)
 

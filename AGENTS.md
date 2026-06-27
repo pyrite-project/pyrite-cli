@@ -8,62 +8,16 @@
 
 pyrite-cli 是一个 MicroPython 设备串口工具，通过 UART 原始 REPL 协议与设备通信，提供文件刷入、交互式 REPL、自动编译、条件编译、增量刷入、项目脚手架等功能。CLI 入口为 `pyrcli`（定义在 `pyproject.toml` 中 `cli.main:main`）。
 
-## 环境
-
-```powershell
-# 开发安装
-pip install -e .
-
-# 运行测试（仅跑纯逻辑测试，不连设备）
-pytest test/test_protocol_helpers.py test/test_flash_utils.py test/test_config.py test/test_manifest_loader.py test/test_logger.py test/test_output.py -v
-
-# 实机测试 — 连上 ESP32/其他 MicroPython 设备
-pyrcli scan
-pyrcli board-info COM3
-pyrcli flash COM3 main.py /main.py
-pyrcli run COM3 "print('hello')"
-pyrcli repl COM3
-pyrcli fs ls COM3 /
-pyrcli fs cat COM3 /main.py
-pyrcli fs put COM3 local.py /remote.py
-pyrcli fs get COM3 /remote.py local_copy.py
-pyrcli fs rm COM3 /remote.py
-
-# 批量和项目命令
-pyrcli flash-program COM3 src/ /app
-pyrcli project flash COM3 src/ /app
-pyrcli project status COM3 src/ /app
-pyrcli project pull COM3 src/ /app
-pyrcli project scan src/
-
-# fs ls 增强功能
-pyrcli fs ls COM3 / -r              # 递归列出
-pyrcli fs ls COM3 / --sort size      # 按文件大小排序
-pyrcli fs ls COM3 / -p              # 分页显示
-
-# 反向挂载（设备端通过 /remote 访问上位机目录，委托 mpremote）
-pyrcli remount COM3 .
-pyrcli remount COM3 src/ --unsafe-links
-
-# 包安装与 GPIO 监控
-pyrcli pkg install COM3 aioble --target /lib --dry-run
-pyrcli pkg install COM3 aioble --target /lib
-pyrcli monitor COM3 --pins 0,2,4,5 --count 20
-
-# 构建
-pip install build
-python -m build
-```
-
 ## 架构
 
 ```
 cli/
   main.py                  # Typer CLI 入口 — scan, flash, flash-program, repl,
-                           # run, reset, board-info, new, init, config
-                           # 子命令组: project, fs, pkg
+                           # reset, debug, new, init, config
+                           # 子命令组: debug, project, fs, pkg, device
                            # 顶层命令: mount, remount, monitor
                            # 含 MSYS2 路径修复 _norm_path()、串口自动补全
+  reg_commands/            # debug/project/fs/pkg/device 子命令组注册与实现
   utils/
     flash/                 # MicroPython 串口类与刷入核心包
       core.py              # 原始 REPL、文件刷入/校验、批量刷入、设备文件浏览器、
@@ -73,11 +27,9 @@ cli/
     transport/             # 传输层包
       base.py              # Transport 抽象基类（ABC）
       serial.py            # pyserial 串口传输实现 SerialTransport
-      webrepl.py           # WebSocket WebREPL 传输实现 WebREPLTransport
-    serial_transport.py    # 旧导入兼容层
-    webrepl_transport.py   # 旧导入兼容层
-    webrepl_micropython.py # WebREPLMicroPython — 通过 WebREPL 连接设备的
-                           # MicroPython 子类（继承所有高级操作）
+    webrepl/               # WebREPL transport and MicroPython adapter
+      transport.py          # WebSocket WebREPL transport
+      micropython.py        # WebREPLMicroPython adapter
     pkg.py                 # mpremote mip install/cache/install-offline 计划与执行
     monitor.py             # GPIO 监控参数解析、采样脚本和 host 侧轮询
     config.py              # 配置加载 _load_config()、create_default_config()
@@ -87,7 +39,6 @@ cli/
                            # mpy-cross Python API 封装
     ansi.py                # ANSI 颜色常量 _GREEN, _YELLOW, _RED, _RESET
     log.py                 # 统一日志系统 — 6 级日志、JSONL 文件、操作计时、流量监控
-    logger.py              # 日志兼容层 — 重导出 log.py（旧 import 无需改动）
     output.py              # 输出工具 — JSON 格式输出、TTY 检测
     preprocessor.py        # 条件编译 — libcst CST 转换 @feature/@target
     manifest_loader.py     # 安全 manifest.py 解析器（AST 非 exec）
@@ -173,15 +124,15 @@ C3 = ["ESP32", "wifi"]
 1. **纯逻辑测试**（无需硬件）：`pytest test/` — 协议解析、配置边界、CRC/SHA 计算、着色逻辑、manifest 解析、日志系统、JSON 输出（共 110+ 项）
 
 2. **命令冒烟测试**（无需设备，修复语法/导入错误后必做）：
-   - `python -c "from cli.main import app; from cli.utils.flash import MicroPython; from cli.utils.config import _load_config; from cli.utils.preprocessor import preprocess; from cli.utils.log import get_logger; from cli.utils.output import print_json"` — 验证所有模块可正常导入
+   - `python -c "from cli.main import app; from cli.utils.flash import MicroPython; from cli.utils.config import _load_config; from cli.utils.build import preprocess; from cli.utils.log import get_logger; from cli.utils.ui import print_json"` — 验证所有模块可正常导入
    - `pyrcli --help` — CLI 入口正常
-  - `pyrcli flash --help` / `pyrcli fs --help` / `pyrcli project --help` / `pyrcli pkg --help` / `pyrcli monitor --help` / `pyrcli remount --help` — 各命令/子命令组正常
+  - `pyrcli flash --help` / `pyrcli debug --help` / `pyrcli debug board-info --help` / `pyrcli debug doctor --help` / `pyrcli fs --help` / `pyrcli project --help` / `pyrcli pkg --help` / `pyrcli monitor --help` / `pyrcli remount --help` — 各命令/子命令组正常
    - `pyrcli scan`（不需要设备，无设备时正常退出即可）
    - `pyrcli scan --version`
 
 3. **实机验证**（仅当用户要求刷入时才执行，需 ESP32/其他设备）：
-   - 基础连通：`pyrcli scan` → `pyrcli board-info COM3`
-   - 刷入测试：`pyrcli flash COM3 <local> <remote>` → `pyrcli run COM3 "..."` 验证
+   - 基础连通：`pyrcli scan` → `pyrcli debug board-info COM3`
+   - 刷入测试：`pyrcli flash COM3 <local> <remote>` → `pyrcli repl COM3` 后手动执行代码验证
    - 文件操作：`pyrcli fs ls/cat/put/get/rm COM3`
    - 批量操作：`pyrcli flash-program COM3 <dir> <prefix>`
    - 项目命令：`pyrcli project flash/status/pull/scan`

@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
-from cli.utils.monitor import (
+from cli.utils.diagnostics import (
     MonitorError,
     build_options,
     build_pin_probe_script,

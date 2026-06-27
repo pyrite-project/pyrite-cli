@@ -234,6 +234,26 @@ def test_jsonl_handler_operation_fields():
         assert data["extra"]["path"] == "/main.py"
 
 
+def test_jsonl_handler_escapes_control_chars_in_messages_and_extra():
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = os.path.join(tmp, "safe.log")
+        h = JSONLFileHandler(log_path)
+
+        rec = LogRecord(
+            INFO, "test", "bad\x1b[2J",
+            extra={"path": "/evil\x1b]52;c;AAAA\x07.py"},
+        )
+        h.emit(rec)
+        h.close()
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            data = json.loads(f.readline())
+        assert "\x1b" not in data["msg"]
+        assert "\x07" not in data["extra"]["path"]
+        assert data["msg"] == "bad\\x1b[2J"
+        assert data["extra"]["path"] == "/evil\\x1b]52;c;AAAA\\x07.py"
+
+
 def test_text_handler_writes_readable_log():
     with tempfile.TemporaryDirectory() as tmp:
         log_path = os.path.join(tmp, "test.log")
@@ -254,6 +274,26 @@ def test_text_handler_writes_readable_log():
         assert "flash_file done" in text
         assert "duration_ms=12.3" in text
         assert "path=/main.py" in text
+
+
+def test_text_handler_escapes_control_chars_in_messages_and_extra():
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = os.path.join(tmp, "safe.log")
+        h = TextFileHandler(log_path)
+
+        rec = LogRecord(
+            INFO, "test.module", "bad\x1b[2J",
+            extra={"path": "/evil\x1b]52;c;AAAA\x07.py"},
+        )
+        h.emit(rec)
+        h.close()
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "\x1b" not in text
+        assert "\x07" not in text
+        assert "bad\\x1b[2J" in text
+        assert "path=/evil\\x1b]52;c;AAAA\\x07.py" in text
 
 
 def test_file_handlers_rotate_with_save_limit():
@@ -388,42 +428,26 @@ def test_logger_operation_fields():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 兼容层测试（logger.py shim）
-# ═══════════════════════════════════════════════════════════════════
-
-def test_shim_imports():
-    """验证旧 import 路径仍然有效。"""
-    from cli.utils.logger import (
-        DEBUG, INFO, WARNING, ERROR,
-        configure_from_verbosity,
-        get_logger, debug, info, warning, error,
-    )
-    assert DEBUG == 10
-    assert INFO == 20
-    assert WARNING == 30
-    assert ERROR == 40
-
-
-def test_shim_module_functions():
+def test_module_level_log_functions():
     """验证模块级便捷函数可正常调用。"""
-    from cli.utils.logger import debug, info, warning, error
-    debug("shim debug")
-    info("shim info")
-    warning("shim warn")
-    error("shim error")
+    from cli.utils.log import debug, error, info, warning
+    debug("module debug")
+    info("module info")
+    warning("module warn")
+    error("module error")
 
 
-def test_shim_set_level():
-    from cli.utils.logger import set_level, get_level, DEBUG
+def test_module_level_set_level():
+    from cli.utils.log import DEBUG, get_level, set_level
     old = get_level()
     set_level(DEBUG)
     assert get_level() == DEBUG
     set_level(old)
 
 
-def test_shim_traffic_monitor():
-    from cli.utils.logger import TrafficMonitor, get_logger
-    log = get_logger("test.shim.traffic")
+def test_module_level_traffic_monitor():
+    from cli.utils.log import TrafficMonitor, get_logger
+    log = get_logger("test.module.traffic")
     m = TrafficMonitor(log, port="TEST")
     m.tx(b"test")
     m.rx(b"response")
@@ -431,10 +455,10 @@ def test_shim_traffic_monitor():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# output.py 兼容测试
+# output helper tests
 # ═══════════════════════════════════════════════════════════════════
 
 def test_output_log():
-    from cli.utils.output import log, print_json, is_tty
+    from cli.utils.ui import is_tty, log, print_json
     log("output log test")
     assert isinstance(is_tty(), bool)

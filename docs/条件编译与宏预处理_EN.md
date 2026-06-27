@@ -222,7 +222,7 @@ Recursively collects all `.py` files in the directory. Parameters are the same a
 ## `preprocessor.py` — Internal API
 
 ```python
-from cli.utils.preprocessor import preprocess
+from cli.utils.build import preprocess
 
 result = preprocess(source: str, active_tags: set[str], filename: str = "") -> str
 ```

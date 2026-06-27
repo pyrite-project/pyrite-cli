@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from cli.utils.preprocessor import preprocess
+from cli.utils.build import preprocess
 
 
 def test_simple_feature_decorator():

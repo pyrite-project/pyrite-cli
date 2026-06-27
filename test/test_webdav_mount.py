@@ -132,12 +132,12 @@ def _request(server, method, path, body=b"", headers=None):
     return resp.status, dict(resp.getheaders()), data
 
 
-def _serve(adapter: FakeAdapter, readonly: bool = False):
+def _serve(adapter: FakeAdapter, readonly: bool = False, **config_kwargs):
     mapper = DevicePathMapper("/flash")
     handler = make_webdav_handler(
         adapter,
         mapper,
-        WebDavConfig(readonly=readonly, empty_list_retry_delay=0),
+        WebDavConfig(readonly=readonly, empty_list_retry_delay=0, **config_kwargs),
     )
     server = WebDavThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -145,13 +145,14 @@ def _serve(adapter: FakeAdapter, readonly: bool = False):
     return server
 
 
-def _serve_with_run(adapter: FakeAdapter):
+def _serve_with_run(adapter: FakeAdapter, config=None, run_state=None):
     mapper = DevicePathMapper("/flash")
-    run_state = MountRunState()
+    config = config or WebDavConfig(empty_list_retry_delay=0)
+    run_state = run_state or MountRunState()
     handler = make_webdav_handler(
         adapter,
         mapper,
-        WebDavConfig(empty_list_retry_delay=0),
+        config,
         run_state=run_state,
         run_controller=adapter,
     )
@@ -807,7 +808,7 @@ def test_delete_is_idempotent_when_file_manager_retries_missing_path():
 
 def test_put_writes_uploaded_body_to_device_path():
     adapter = FakeAdapter()
-    server = _serve(adapter)
+    server = _serve(adapter, max_upload_bytes=3)
     try:
         status, _headers, _body = _request(
             server,
@@ -821,6 +822,92 @@ def test_put_writes_uploaded_body_to_device_path():
 
     assert status == 201
     assert adapter.writes == [("/flash/new.txt", b"abc")]
+
+
+def test_put_rejects_body_larger_than_upload_limit_before_tempfile():
+    adapter = FakeAdapter()
+    server = _serve(adapter, max_upload_bytes=3)
+    try:
+        with patch(
+            "cli.utils.webdav_mount.tempfile.mkstemp",
+            side_effect=AssertionError("oversized PUT should be rejected before tempfile"),
+        ):
+            status, _headers, body = _request(
+                server,
+                "PUT",
+                "/large.bin",
+                body=b"abcd",
+                headers={"Content-Length": "4"},
+            )
+    finally:
+        server.shutdown()
+
+    assert status == 413
+    assert b"upload too large" in body
+    assert adapter.writes == []
+
+
+def test_put_rejects_invalid_content_length_before_tempfile():
+    adapter = FakeAdapter()
+    server = _serve(adapter)
+    try:
+        with patch(
+            "cli.utils.webdav_mount.tempfile.mkstemp",
+            side_effect=AssertionError("invalid PUT should be rejected before tempfile"),
+        ):
+            status, _headers, body = _request(
+                server,
+                "PUT",
+                "/bad.bin",
+                headers={"Content-Length": "abc"},
+            )
+    finally:
+        server.shutdown()
+
+    assert status == 400
+    assert b"invalid Content-Length" in body
+    assert adapter.writes == []
+
+
+def test_put_rejects_run_queue_byte_overflow_before_tempfile():
+    adapter = BlockingRunAdapter()
+    server = _serve_with_run(
+        adapter,
+        config=WebDavConfig(empty_list_retry_delay=0, max_upload_bytes=10),
+        run_state=MountRunState(max_bytes=1),
+    )
+    run_done = threading.Event()
+
+    def run_request():
+        try:
+            _request(server, "GET", "/" + _run_entry().name)
+        finally:
+            run_done.set()
+
+    run_thread = threading.Thread(target=run_request, daemon=True)
+    try:
+        run_thread.start()
+        assert adapter.run_started.wait(1)
+        with patch(
+            "cli.utils.webdav_mount.tempfile.mkstemp",
+            side_effect=AssertionError("queue overflow should be rejected before tempfile"),
+        ):
+            status, _headers, body = _request(
+                server,
+                "PUT",
+                "/queued.bin",
+                body=b"ab",
+                headers={"Content-Length": "2"},
+            )
+
+        adapter.release_run.set()
+        assert run_done.wait(1)
+    finally:
+        server.shutdown()
+
+    assert status == 503
+    assert b"mount run queue is full" in body
+    assert adapter.writes == []
 
 
 def test_put_preserves_utf8_chinese_body_bytes():
@@ -1007,6 +1094,8 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
             "--no-map",
             "--startup-empty-list-grace",
             "12.5",
+            "--max-upload-bytes",
+            "12345",
         ])
 
     assert result.exit_code == 0
@@ -1014,6 +1103,7 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
     mp.connect.assert_called_once()
     serve.assert_called_once()
     assert serve.call_args.args[1].startup_empty_list_grace == 12.5
+    assert serve.call_args.args[1].max_upload_bytes == 12345
     mp.disconnect.assert_called_once()
 
 
@@ -1043,6 +1133,7 @@ def test_mount_help_includes_webrepl_options():
     assert result.exit_code == 0
     assert "--ws" in result.stdout
     assert "--password" in result.stdout
+    assert "--max-upload-bytes" in result.stdout
 
 
 def test_remount_invokes_mpremote_mount(monkeypatch, tmp_path):

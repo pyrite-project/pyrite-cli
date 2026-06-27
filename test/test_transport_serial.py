@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli.utils.transport import Transport
-from cli.utils.serial_transport import SerialTransport
+from cli.utils.transport.serial import SerialTransport
 from cli.utils.flash import MicroPython, SerialTransport as ST
 
 

@@ -2,6 +2,5 @@
 
 from .base import Transport
 from .serial import SerialTransport
-from .webrepl import WebREPLTransport
 
-__all__ = ["Transport", "SerialTransport", "WebREPLTransport"]
+__all__ = ["Transport", "SerialTransport"]

@@ -1,0 +1,314 @@
+{
+  "board": {
+    "implementation": "micropython",
+    "version": "1.12.0",
+    "platform": "esp32",
+    "machine": "mpython with ESP32",
+    "release": "1.12.0",
+    "sysname": "esp32"
+  },
+  "memory": {
+    "free": 91520,
+    "allocated": 19824,
+    "total": 111344
+  },
+  "filesystem": {
+    "total": 2097152,
+    "free": 1499136,
+    "used": 598016
+  },
+  "checks": [
+    {
+      "id": "serial_connect",
+      "status": "ok",
+      "confidence": "behaviour-probe",
+      "message": "connect=977ms"
+    },
+    {
+      "id": "raw_repl",
+      "status": "ok",
+      "confidence": "behaviour-probe",
+      "message": "command execution succeeded",
+      "duration_ms": 12172
+    },
+    {
+      "id": "filesystem_rw",
+      "status": "ok",
+      "confidence": "behaviour-probe",
+      "message": "write/read/delete passed"
+    }
+  ],
+  "firmware_features": {
+    "items": [
+      {
+        "id": "os.statvfs",
+        "category": "filesystem",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_OS_STATVFS",
+        "probe": "hasattr(os, \"statvfs\")"
+      },
+      {
+        "id": "gc.mem_free",
+        "category": "memory",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_GC",
+        "probe": "hasattr(gc, \"mem_free\")"
+      },
+      {
+        "id": "micropython.kbd_intr",
+        "category": "debug",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_KBD_EXCEPTION",
+        "probe": "hasattr(micropython, \"kbd_intr\")"
+      },
+      {
+        "id": "micropython.mem_info",
+        "category": "memory",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MICROPYTHON_MEM_INFO",
+        "probe": "hasattr(micropython, \"mem_info\")"
+      },
+      {
+        "id": "micropython.stack_use",
+        "category": "memory",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MICROPYTHON_STACK_USE",
+        "probe": "hasattr(micropython, \"stack_use\")"
+      },
+      {
+        "id": "micropython.schedule",
+        "category": "runtime",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_ENABLE_SCHEDULER",
+        "probe": "hasattr(micropython, \"schedule\")"
+      },
+      {
+        "id": "filesystem.write",
+        "category": "filesystem",
+        "status": "supported",
+        "confidence": "behaviour-probe",
+        "macro_hint": "MICROPY_VFS_WRITABLE",
+        "probe": "open(path, \"wb\").write(...)"
+      },
+      {
+        "id": "external_import",
+        "category": "filesystem",
+        "status": "supported",
+        "confidence": "behaviour-probe",
+        "macro_hint": "MICROPY_ENABLE_EXTERNAL_IMPORT",
+        "probe": "write temp .py then import"
+      },
+      {
+        "id": "eval",
+        "category": "compiler",
+        "status": "supported",
+        "confidence": "behaviour-probe",
+        "macro_hint": "MICROPY_PY_BUILTINS_EVAL_EXEC",
+        "probe": "eval(\"1+1\")"
+      },
+      {
+        "id": "compile",
+        "category": "compiler",
+        "status": "supported",
+        "confidence": "behaviour-probe",
+        "macro_hint": "MICROPY_PY_BUILTINS_COMPILE",
+        "probe": "compile(\"1+1\", \"<doctor>\", \"eval\")"
+      },
+      {
+        "id": "async_await",
+        "category": "compiler",
+        "status": "supported",
+        "confidence": "behaviour-probe",
+        "macro_hint": "MICROPY_PY_ASYNC_AWAIT",
+        "probe": "compile async def"
+      },
+      {
+        "id": "sys.settrace",
+        "category": "debug",
+        "status": "unsupported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_SYS_SETTRACE",
+        "probe": "hasattr(sys, \"settrace\")"
+      },
+      {
+        "id": "sys.tracebacklimit",
+        "category": "debug",
+        "status": "unsupported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_SYS_TRACEBACKLIMIT",
+        "probe": "hasattr(sys, \"tracebacklimit\")"
+      },
+      {
+        "id": "sys.stdin.buffer",
+        "category": "runtime",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_SYS_STDIO_BUFFER",
+        "probe": "hasattr(sys.stdin, \"buffer\")"
+      },
+      {
+        "id": "asyncio",
+        "category": "runtime",
+        "status": "unsupported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_ASYNCIO",
+        "probe": "import asyncio"
+      },
+      {
+        "id": "machine",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_MACHINE",
+        "probe": "import machine"
+      },
+      {
+        "id": "network",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_NETWORK",
+        "probe": "import network"
+      },
+      {
+        "id": "socket",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_SOCKET",
+        "probe": "import socket"
+      },
+      {
+        "id": "ssl",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_SSL",
+        "probe": "import ssl"
+      },
+      {
+        "id": "bluetooth",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_BLUETOOTH",
+        "probe": "import bluetooth"
+      },
+      {
+        "id": "webrepl",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_WEBREPL",
+        "probe": "import webrepl"
+      },
+      {
+        "id": "websocket",
+        "category": "network",
+        "status": "supported",
+        "confidence": "import-probe",
+        "macro_hint": "MICROPY_PY_WEBSOCKET",
+        "probe": "import websocket"
+      },
+      {
+        "id": "machine.reset",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_RESET",
+        "probe": "hasattr(machine, \"reset\")"
+      },
+      {
+        "id": "machine.freq",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE",
+        "probe": "hasattr(machine, \"freq\")"
+      },
+      {
+        "id": "machine.Pin",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_PIN",
+        "probe": "hasattr(machine, \"Pin\")"
+      },
+      {
+        "id": "machine.I2C",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_I2C",
+        "probe": "hasattr(machine, \"I2C\")"
+      },
+      {
+        "id": "machine.SPI",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_SPI",
+        "probe": "hasattr(machine, \"SPI\")"
+      },
+      {
+        "id": "machine.UART",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_UART",
+        "probe": "hasattr(machine, \"UART\")"
+      },
+      {
+        "id": "machine.WDT",
+        "category": "hardware",
+        "status": "supported",
+        "confidence": "hasattr-probe",
+        "macro_hint": "MICROPY_PY_MACHINE_WDT",
+        "probe": "hasattr(machine, \"WDT\")"
+      }
+    ]
+  },
+  "raw": {
+    "info": {
+      "firmware.name": "micropython",
+      "firmware.version": "1.12.0",
+      "firmware.platform": "esp32",
+      "sys.version": "3.4.0",
+      "firmware.machine": "mpython with ESP32",
+      "firmware.release": "1.12.0",
+      "firmware.sysname": "esp32",
+      "filesystem.total": 2097152,
+      "filesystem.free": 1499136,
+      "memory.free": 91520,
+      "memory.allocated": 19824
+    }
+  },
+  "connection": {
+    "connect_ms": 977,
+    "raw_repl_ms": 12172
+  },
+  "configuration": {
+    "chunk_size": 4096,
+    "verify": "size",
+    "max_retries": 2,
+    "recommendations": [
+      "keep verify=size unless a board needs stronger crc32 validation",
+      "max_retries=2 is available for transient serial failures",
+      "chunk_size=4096 is the active host transfer chunk size"
+    ]
+  },
+  "summary": {
+    "ok": true,
+    "checks": 3,
+    "failed_checks": 0,
+    "features_supported": 26,
+    "features_unsupported": 3,
+    "feature_errors": 0
+  }
+}

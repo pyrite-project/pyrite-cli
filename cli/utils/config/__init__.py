@@ -17,7 +17,7 @@ try:
 except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
 
-from .log import get_logger
+from ..log import get_logger
 from .types import PyriteConfig
 
 log = get_logger(__name__)

@@ -259,12 +259,19 @@ def fs_put(
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     force: bool = typer.Option(False, "--force", "-F", help="强制覆盖"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    safe_main: bool = typer.Option(
+        True,
+        "--safe-main/--no-safe-main",
+        help="上传根 /main.py 前先 Ctrl+C 打断并备份原文件",
+    ),
 ) -> None:
     """连接设备并上传本地文件。"""
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
+        if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
+            mp.safe_break()
         if not force:
             try:
                 mp.run(f"import os;os.stat({repr(remote_path)})")
@@ -282,6 +289,7 @@ def fs_put(
             local_path, remote_path, compile=not no_compile,
             bytecode_ver=ver, arch=arch,
             active_tags=active_tags or None, dry_run=dry_run,
+            safe_main=safe_main,
         )
     finally:
         mp.disconnect()

@@ -495,6 +495,211 @@ class TestFilesystemMountGuard:
         assert kwargs == {"timeout": 5, "raise_on_error": False}
 
 
+class _SafeBreakTransport:
+    def __init__(self):
+        self.connected = True
+        self.writes = []
+        self.reset_count = 0
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def read(self, _size):
+        return b""
+
+    @property
+    def in_waiting(self):
+        return 0
+
+    def reset_input_buffer(self):
+        self.reset_count += 1
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+
+class TestSafeMain:
+    def test_safe_break_sends_ctrl_c_burst_then_clears_input(self, monkeypatch):
+        transport = _SafeBreakTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        sleeps = []
+        monkeypatch.setattr("cli.utils.flash.core.time.sleep", lambda value: sleeps.append(value))
+
+        mp.safe_break(attempts=3, interval=0.01, settle=0.2)
+
+        assert transport.writes == [b"\x03", b"\x03", b"\x03"]
+        assert sleeps == [0.01, 0.01, 0.01, 0.2]
+        assert transport.reset_count == 1
+
+    def test_safe_main_backup_path_stays_next_to_root_main(self):
+        assert (
+            MicroPython.safe_main_backup_path(
+                "/main.py", timestamp="20260627-010203"
+            )
+            == "/main.py.pyrite-bak-20260627-010203"
+        )
+        assert (
+            MicroPython.safe_main_backup_path(
+                "main.py", timestamp="20260627-010203"
+            )
+            == "main.py.pyrite-bak-20260627-010203"
+        )
+
+    def test_safe_main_plan_targets_only_root_main_and_can_be_disabled(self):
+        plan = MicroPython.plan_safe_main_overwrites(
+            ["/main.py", "/lib/main.py", "/boot.py", "main.py"],
+            enabled=True,
+            timestamp="20260627-010203",
+        )
+
+        assert [(item.remote_path, item.backup_path) for item in plan] == [
+            ("/main.py", "/main.py.pyrite-bak-20260627-010203"),
+            ("main.py", "main.py.pyrite-bak-20260627-010203"),
+        ]
+        assert MicroPython.plan_safe_main_overwrites(["/main.py"], enabled=False) == []
+
+    def test_flash_file_safe_main_backs_up_root_main_before_payload(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "main.py"
+        local.write_text("print('safe')\n", encoding="utf-8")
+        mp = MicroPython(port="COM99")
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "safe_break", lambda **_kwargs: calls.append(("break", None)))
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: calls.append(("raw", None)))
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: calls.append(("mkdirs", paths)))
+        monkeypatch.setattr(
+            MicroPython,
+            "safe_main_backup_path",
+            staticmethod(lambda path: f"{path}.pyrite-bak-test"),
+        )
+
+        def fake_execute(code, **kwargs):
+            calls.append(("execute", code, kwargs))
+            return "BACKUP:/main.py.pyrite-bak-test"
+
+        def fake_send(script, *args, **kwargs):
+            calls.append(("send", script, kwargs))
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+        monkeypatch.setattr(mp, "_send_flash_payload", fake_send)
+
+        mp.flash_file(str(local), "/main.py", compile=False, safe_main=True)
+
+        assert [call[0] for call in calls] == [
+            "break",
+            "raw",
+            "execute",
+            "mkdirs",
+            "send",
+        ]
+        backup_code = calls[2][1]
+        assert "_src='/main.py'" in backup_code
+        assert "_dst_base='/main.py.pyrite-bak-test'" in backup_code
+        assert calls[2][2] == {"timeout": 10}
+
+    def test_flash_file_safe_main_does_not_touch_non_root_main(
+        self, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "payload.py"
+        local.write_text("print('payload')\n", encoding="utf-8")
+        mp = MicroPython(port="COM99")
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "safe_break", lambda **_kwargs: pytest.fail("no safe break"))
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: calls.append(("raw", None)))
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: calls.append(("mkdirs", paths)))
+        monkeypatch.setattr(mp, "_execute", lambda *args, **kwargs: pytest.fail("no backup"))
+        monkeypatch.setattr(
+            mp,
+            "_send_flash_payload",
+            lambda script, *args, **kwargs: calls.append(("send", script, kwargs)),
+        )
+
+        mp.flash_file(str(local), "/lib/main.py", compile=False, safe_main=True)
+
+        assert [call[0] for call in calls] == ["raw", "mkdirs", "send"]
+
+    def test_flash_entries_safe_main_backs_up_once_before_batch_payload(
+        self, tmp_path, monkeypatch
+    ):
+        main = tmp_path / "main.py"
+        helper = tmp_path / "helper.py"
+        main.write_text("print('main')\n", encoding="utf-8")
+        helper.write_text("print('helper')\n", encoding="utf-8")
+        mp = MicroPython(port="COM99")
+        mp.config.auto_compile = False
+        mp.config.verify = "off"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "safe_break", lambda **_kwargs: calls.append(("break", None)))
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: calls.append(("raw", None)))
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: calls.append(("mkdirs", paths)))
+        monkeypatch.setattr(
+            MicroPython,
+            "safe_main_backup_path",
+            staticmethod(lambda path: f"{path}.pyrite-bak-test"),
+        )
+
+        def fake_execute(code, **kwargs):
+            calls.append(("execute", code, kwargs))
+            return "BACKUP:/main.py.pyrite-bak-test"
+
+        def fake_write(data):
+            calls.append(("write", data))
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+        monkeypatch.setattr(mp, "_write", fake_write)
+        monkeypatch.setattr(
+            mp,
+            "_read_until_marker",
+            lambda marker, timeout=30: (
+                (True, b"READY") if marker == b"READY" else (True, b"\x04\x04>")
+            ),
+        )
+        monkeypatch.setattr(
+            mp,
+            "_send_data_with_sparse_ack",
+            lambda data_iter, total, **kwargs: calls.append(("payload", total)),
+        )
+
+        result = mp.flash_entries(
+            [
+                (str(main), "/main.py"),
+                (str(helper), "/lib/helper.py"),
+            ],
+            safe_main=True,
+        )
+
+        assert result == [
+            (str(main), "/main.py", True),
+            (str(helper), "/lib/helper.py", True),
+        ]
+        assert [call[0] for call in calls[:5]] == [
+            "break",
+            "raw",
+            "execute",
+            "mkdirs",
+            "write",
+        ]
+        assert calls[2][1].count("_src='/main.py'") == 1
+        assert "_src='/lib/helper.py'" not in calls[2][1]
+
+
 class TestUploadAckWindow:
     def test_slow_serial_uploads_wait_for_every_chunk(self):
         assert MicroPython(port="COM99", baudrate=115200)._upload_ack_every() == 1

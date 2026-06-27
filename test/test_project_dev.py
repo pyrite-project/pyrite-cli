@@ -20,6 +20,7 @@ class _FakeMicroPython:
         self.writes = []
         self.exits = 0
         self.disconnects = 0
+        self.repl_kwargs = None
 
     @property
     def is_connected(self):
@@ -43,6 +44,9 @@ class _FakeMicroPython:
 
     def _exit_raw_repl(self):
         self.exits += 1
+
+    def repl_(self, **kwargs):
+        self.repl_kwargs = kwargs
 
 
 def test_project_watcher_ignores_hash_config_updates(tmp_path: Path):
@@ -142,3 +146,33 @@ def test_run_project_dev_once_prints_busy_and_ready_status(tmp_path: Path):
     assert manager.flash.call_args.kwargs["changed_paths"] == {
         str(tmp_path / "main.py")
     }
+
+
+def test_dev_session_passes_traceback_mapper_to_repl(tmp_path: Path):
+    source = tmp_path / "lib" / "sensor.py"
+    source.parent.mkdir()
+    source.write_text("print('sensor')\n", encoding="utf-8")
+    mp = _FakeMicroPython()
+    manager = MagicMock()
+    manager.flash.return_value = [(str(source), "/app/lib/sensor.mpy", True)]
+
+    run_project_dev(
+        DevOptions(
+            port="COM99",
+            local_dir=str(tmp_path),
+            remote_path="/app",
+            map_traceback=True,
+            once=True,
+        ),
+        mp_factory=lambda *_args, **_kwargs: mp,
+        manager_factory=lambda _mp: manager,
+        stderr=io.StringIO(),
+    )
+
+    output_mapper = mp.repl_kwargs["output_mapper"]
+    mapped = output_mapper('  File "/app/lib/sensor.mpy", line 3, in read\n')
+
+    assert (
+        "/app/lib/sensor.mpy:3 -> lib/sensor.py "
+        "(.mpy bytecode; source line unavailable)"
+    ) in mapped

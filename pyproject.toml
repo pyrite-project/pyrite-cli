@@ -37,11 +37,13 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 
 [tool.pytest.ini_options]
 testpaths = [
+    "test/test_board_profile.py",
     "test/test_protocol_helpers.py",
     "test/test_flash_utils.py",
     "test/test_config.py",
     "test/test_logger.py",
     "test/test_manifest_loader.py",
+    "test/test_manifest_lock.py",
     "test/test_preprocessor.py",
     "test/test_transport_serial.py",
     "test/test_output.py",
@@ -50,6 +52,9 @@ testpaths = [
     "test/test_monitor.py",
     "test/test_doctor.py",
     "test/test_project_dev.py",
+    "test/test_device_runner.py",
+    "test/test_traceback_map.py",
+    "test/test_trace.py",
 ]
 
 [tool.mypy]

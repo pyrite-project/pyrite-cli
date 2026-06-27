@@ -9,6 +9,7 @@ Manifest 安全解析器 — 使用 AST（非 exec）解析 manifest.py。
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Set, Tuple
 
@@ -18,6 +19,27 @@ log = get_logger(__name__)
 
 _MAX_MANIFEST_DEPTH = 15
 _MAX_MANIFEST_ENTRIES = 500
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    """Expanded, included manifest entry."""
+
+    directive: str
+    local_path: str
+    remote_path: str
+    source: str
+    features: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManifestPlan:
+    """Structured manifest parse result used by lockfile generation."""
+
+    entries: Tuple[ManifestEntry, ...]
+    active_tags: Tuple[str, ...]
+    included_features: Tuple[str, ...]
+    excluded_features: Tuple[str, ...]
 
 
 def _has_parent_reference(path: str) -> bool:
@@ -198,8 +220,20 @@ def load_manifest(
 
     使用 AST 而非 exec() 解析，仅接受 module()/package() 字面量调用。
     """
+    plan = load_manifest_plan(manifest_path, active_tags, base_dir=base_dir)
+    return [(entry.local_path, entry.remote_path) for entry in plan.entries]
+
+
+def load_manifest_plan(
+    manifest_path: str,
+    active_tags: Set[str],
+    base_dir: str | None = None,
+) -> ManifestPlan:
+    """安全解析 manifest.py，返回结构化解析计划。"""
     base = Path(base_dir or Path(manifest_path).parent).resolve()
-    entries: List[Tuple[str, str]] = []
+    entries: List[ManifestEntry] = []
+    included_features: Set[str] = set()
+    excluded_features: Set[str] = set()
 
     source = Path(manifest_path).read_text(encoding="utf-8")
     try:
@@ -221,22 +255,37 @@ def load_manifest(
 
         features = kwargs.get("features")
         if features is not None and not (set(features) & active_tags):
+            excluded_features.update(features)
             continue
+        if features is not None:
+            included_features.update(features)
 
         remote = kwargs.get("remote")
         local_path = _resolve_local_path(base, filename, node.value.lineno)
 
         if func_name == "module":
-            entries.append((str(local_path), str(remote or filename)))
+            entries.append(ManifestEntry(
+                directive=func_name,
+                local_path=str(local_path),
+                remote_path=str(remote or filename),
+                source=filename,
+                features=tuple(features or ()),
+            ))
         elif func_name == "package":
-            for f in local_path.rglob("*.py"):
+            for f in sorted(local_path.rglob("*.py")):
                 _ensure_inside_base(f.resolve(), base, node.value.lineno, str(f))
                 rel = str(f.relative_to(base)).replace("\\", "/")
                 if remote:
                     rp = f"{str(remote).rstrip('/')}/{rel}"
                 else:
                     rp = rel
-                entries.append((str(f), rp))
+                entries.append(ManifestEntry(
+                    directive=func_name,
+                    local_path=str(f),
+                    remote_path=rp,
+                    source=filename,
+                    features=tuple(features or ()),
+                ))
                 if len(entries) > _MAX_MANIFEST_ENTRIES:
                     raise ValueError(
                         f"manifest.py: 条目数超过上限 ({_MAX_MANIFEST_ENTRIES})，已拒绝"
@@ -248,4 +297,9 @@ def load_manifest(
             )
 
     log.debug("manifest 解析完成: %s (%d 个条目)", manifest_path, len(entries))
-    return entries
+    return ManifestPlan(
+        entries=tuple(entries),
+        active_tags=tuple(sorted(active_tags)),
+        included_features=tuple(sorted(included_features)),
+        excluded_features=tuple(sorted(excluded_features - included_features)),
+    )

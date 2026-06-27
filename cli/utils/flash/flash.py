@@ -47,9 +47,129 @@ class _PreparedFlashFile:
     size: int
 
 
+@dataclass(frozen=True)
+class SafeMainOverwritePlan:
+    remote_path: str
+    backup_path: str
+
+
+def _safe_main_timestamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def _normalize_remote_for_safe_main(remote_path: str) -> str:
+    path = remote_path.replace("\\", "/").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _build_safe_main_backup_script(remote_path: str, backup_path: str) -> str:
+    return (
+        "import os\n"
+        f"_src={remote_path!r}\n"
+        f"_dst_base={backup_path!r}\n"
+        "_exists=True\n"
+        "try:\n"
+        " os.stat(_src)\n"
+        "except OSError:\n"
+        " _exists=False\n"
+        "if not _exists:\n"
+        " print('NO_BACKUP')\n"
+        "else:\n"
+        " _dst=_dst_base\n"
+        " _i=1\n"
+        " while True:\n"
+        "  try:\n"
+        "   os.stat(_dst)\n"
+        "   _dst=_dst_base+'.'+str(_i)\n"
+        "   _i+=1\n"
+        "  except OSError:\n"
+        "   break\n"
+        " with open(_src,'rb') as _s:\n"
+        "  with open(_dst,'wb') as _d:\n"
+        "   while True:\n"
+        "    _b=_s.read(512)\n"
+        "    if not _b:\n"
+        "     break\n"
+        "    _d.write(_b)\n"
+        " print('BACKUP:'+_dst)\n"
+    )
+
+
 
 class MicroPython(MicroPythonBase):
     """High-level MicroPython operations built on ``MicroPythonBase``."""
+
+    @staticmethod
+    def is_safe_main_path(remote_path: str) -> bool:
+        normalized = _normalize_remote_for_safe_main(remote_path)
+        return normalized in {"main.py", "/main.py"}
+
+    @staticmethod
+    def safe_main_backup_path(
+        remote_path: str,
+        timestamp: Optional[str] = None,
+    ) -> str:
+        normalized = _normalize_remote_for_safe_main(remote_path)
+        stamp = timestamp or _safe_main_timestamp()
+        return f"{normalized}.pyrite-bak-{stamp}"
+
+    @classmethod
+    def plan_safe_main_overwrites(
+        cls,
+        remote_paths: Sequence[str],
+        enabled: bool = True,
+        timestamp: Optional[str] = None,
+    ) -> List[SafeMainOverwritePlan]:
+        if not enabled:
+            return []
+        plans: List[SafeMainOverwritePlan] = []
+        seen: Set[str] = set()
+        for remote_path in remote_paths:
+            normalized = _normalize_remote_for_safe_main(remote_path)
+            if normalized in seen or not cls.is_safe_main_path(normalized):
+                continue
+            seen.add(normalized)
+            if timestamp is None:
+                backup_path = cls.safe_main_backup_path(normalized)
+            else:
+                backup_path = cls.safe_main_backup_path(
+                    normalized,
+                    timestamp=timestamp,
+                )
+            plans.append(SafeMainOverwritePlan(normalized, backup_path))
+        return plans
+
+    def safe_break(
+        self,
+        attempts: int = 12,
+        interval: float = 0.03,
+        settle: float = 0.15,
+    ) -> None:
+        """Send a Ctrl+C burst before Raw REPL entry to stop a bad main.py."""
+        self._ensure_connected()
+        self._interrupt_running_program(
+            attempts=attempts,
+            interval=interval,
+            settle=settle,
+        )
+
+    def _backup_remote_file_if_exists(
+        self,
+        remote_path: str,
+        backup_path: str,
+    ) -> Optional[str]:
+        script = _build_safe_main_backup_script(remote_path, backup_path)
+        out = self._execute(script, timeout=10)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("BACKUP:"):
+                actual_backup = line[len("BACKUP:"):]
+                log.info("Safe Main backup: %s → %s", remote_path, actual_backup)
+                return actual_backup
+        log.debug("Safe Main backup skipped; no existing file: %s", remote_path)
+        return None
 
     def _upload_ack_every(self) -> int:
         if isinstance(self.transport, SerialTransport) and self.baudrate <= 230400:
@@ -60,6 +180,7 @@ class MicroPython(MicroPythonBase):
         self,
         command_handler: Optional[Callable[[bytes], bool]] = None,
         idle_hook: Optional[Callable[[], None]] = None,
+        output_mapper: Optional[Callable[[str], str]] = None,
     ) -> None:
         """交互式 MicroPython REPL（串口透传模式）。"""
         import codecs
@@ -131,6 +252,8 @@ class MicroPython(MicroPythonBase):
                     text = utf8_decoder.decode(chunk, final=False)
                     if not text:
                         continue
+                    if output_mapper is not None:
+                        text = output_mapper(text)
                     output, in_error = _colorize_repl_output(text, in_error)
                     sys.stdout.write(output)
                     sys.stdout.flush()
@@ -184,6 +307,8 @@ class MicroPython(MicroPythonBase):
                 keyboard_stop.set()
             pending_text = utf8_decoder.decode(b"", final=True)
             if pending_text:
+                if output_mapper is not None:
+                    pending_text = output_mapper(pending_text)
                 output, _ = _colorize_repl_output(pending_text, in_error)
                 sys.stdout.write(output)
                 sys.stdout.flush()
@@ -209,6 +334,13 @@ class MicroPython(MicroPythonBase):
             if self._traffic_monitor:
                 self._traffic_monitor.log.traffic(
                     "TX", f"[data block {total} bytes]".encode()
+                )
+            if self._trace_recorder:
+                self._trace_recorder.traffic_summary(
+                    "TX",
+                    total,
+                    phase=self._trace_phase,
+                    text=f"[data block {total} bytes]",
                 )
 
             sent = 0
@@ -559,6 +691,7 @@ class MicroPython(MicroPythonBase):
         arch: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         dry_run: bool = False,
+        safe_main: bool = False,
     ) -> None:
         """连接设备并通过原始 REPL 刷入单个文件。"""
         if not os.path.exists(local_path):
@@ -627,9 +760,30 @@ class MicroPython(MicroPythonBase):
             "刷入: %s → %s (%d 字节, 块=%d)",
             local_path, actual_remote, file_size, chunk_size,
         )
+        self._trace_event(
+            "operation_prepared",
+            phase="prepare",
+            local_path=local_path,
+            remote_path=actual_remote,
+            file_size=file_size,
+            chunk_size=chunk_size,
+            verify_mode=verify_mode,
+            delta_enabled=delta_enabled,
+        )
 
+        safe_main_plan = self.plan_safe_main_overwrites(
+            [actual_remote],
+            enabled=safe_main,
+        )
         if dry_run:
+            self._trace_event("operation_skipped", phase="prepare", reason="dry_run")
             log.info("[DRY-RUN] 将刷入 %s → %s (%d 字节)", local_path, actual_remote, file_size)
+            for plan in safe_main_plan:
+                log.info(
+                    "[DRY-RUN] 将备份 %s → %s",
+                    plan.remote_path,
+                    plan.backup_path,
+                )
             return
 
         upload_ack_every = self._upload_ack_every()
@@ -647,57 +801,72 @@ class MicroPython(MicroPythonBase):
             confirm_timeout = max(10, inline_verify_timeout)
 
             if allow_delta and local_content is not None:
-                local_blocks = _compute_block_crc32(local_content, chunk_size)
-                delta_script = (
-                    FLASH_DELTA.replace("FILE", repr(actual_remote))
-                    .replace("LOCAL_BLOCKS", repr(local_blocks))
-                    .replace("BLOCK_SIZE", str(chunk_size))
+                with self._trace_phase_ctx("transfer_delta", remote_path=actual_remote):
+                    local_blocks = _compute_block_crc32(local_content, chunk_size)
+                    delta_script = (
+                        FLASH_DELTA.replace("FILE", repr(actual_remote))
+                        .replace("LOCAL_BLOCKS", repr(local_blocks))
+                        .replace("BLOCK_SIZE", str(chunk_size))
+                        .replace("BFSIZE", str(chunk_size))
+                        .replace("FSIZE", str(file_size))
+                        .replace("ACK_EVERY", str(upload_ack_every))
+                        .replace("VERIFY_CODE", inline_verify_code)
+                    )
+                    action = self._send_delta_flash_payload(
+                        delta_script,
+                        actual_local,
+                        chunk_size,
+                        confirm_timeout=max(10, file_size // max(chunk_size, 1) + confirm_timeout),
+                        ack_every=upload_ack_every,
+                    )
+                    if action != "skip":
+                        log.info("delta flash action=%s (%s)", action, actual_remote)
+                    return action
+
+            with self._trace_phase_ctx("transfer_full", remote_path=actual_remote):
+                full_script = (
+                    FLASH.replace("FILE", repr(actual_remote))
                     .replace("BFSIZE", str(chunk_size))
                     .replace("FSIZE", str(file_size))
                     .replace("ACK_EVERY", str(upload_ack_every))
                     .replace("VERIFY_CODE", inline_verify_code)
                 )
-                action = self._send_delta_flash_payload(
-                    delta_script,
+                self._send_flash_payload(
+                    full_script,
                     actual_local,
+                    file_size,
                     chunk_size,
-                    confirm_timeout=max(10, file_size // max(chunk_size, 1) + confirm_timeout),
+                    confirm_timeout=confirm_timeout,
                     ack_every=upload_ack_every,
                 )
-                if action != "skip":
-                    log.info("delta flash action=%s (%s)", action, actual_remote)
-                return action
 
-            full_script = (
-                FLASH.replace("FILE", repr(actual_remote))
-                .replace("BFSIZE", str(chunk_size))
-                .replace("FSIZE", str(file_size))
-                .replace("ACK_EVERY", str(upload_ack_every))
-                .replace("VERIFY_CODE", inline_verify_code)
-            )
-            self._send_flash_payload(
-                full_script,
-                actual_local,
-                file_size,
-                chunk_size,
-                confirm_timeout=confirm_timeout,
-                ack_every=upload_ack_every,
-            )
-
-            return "full"
+                return "full"
 
         _t0 = time.time()
         try:
             with self._traffic_log_ctx():
-                self._enter_raw_repl()
+                if safe_main_plan:
+                    with self._trace_phase_ctx("safe_main"):
+                        self.safe_break()
+                with self._trace_phase_ctx("raw_repl"):
+                    self._enter_raw_repl()
+
+                for plan in safe_main_plan:
+                    with self._trace_phase_ctx("safe_main", remote_path=plan.remote_path):
+                        self._backup_remote_file_if_exists(
+                            plan.remote_path,
+                            plan.backup_path,
+                        )
 
                 # 创建远程目录
-                self._mkdirs_on_device([actual_remote])
+                with self._trace_phase_ctx("filesystem", remote_path=actual_remote):
+                    self._mkdirs_on_device([actual_remote])
 
                 if delta_enabled:
                     for attempt in range(max_retries + 1):
                         if attempt > 0:
-                            self._enter_raw_repl()
+                            with self._trace_phase_ctx("raw_repl", retry=attempt):
+                                self._enter_raw_repl()
                             log.warning("增量刷入重试 %d/%d", attempt, max_retries)
                         try:
                             action = _flash_once(allow_delta=True)
@@ -724,7 +893,8 @@ class MicroPython(MicroPythonBase):
 
                 for attempt in range(max_retries + 1):
                     if attempt > 0:
-                        self._enter_raw_repl()
+                        with self._trace_phase_ctx("raw_repl", retry=attempt):
+                            self._enter_raw_repl()
                         log.warning("重试 %d/%d", attempt, max_retries)
 
                     try:
@@ -761,6 +931,7 @@ class MicroPython(MicroPythonBase):
         arch: Optional[str] = None,
         active_tags: Optional[Set[str]] = None,
         dry_run: bool = False,
+        safe_main: bool = False,
     ) -> List[Tuple[str, str, bool]]:
         tmp_dirs: List[str] = []
         verify_mode = self.config.verify
@@ -868,6 +1039,10 @@ class MicroPython(MicroPythonBase):
                 compile_elapsed,
             )
 
+            safe_main_plan = self.plan_safe_main_overwrites(
+                [item.remote_path for item in prepared],
+                enabled=safe_main,
+            )
             if dry_run:
                 log.info("[DRY-RUN] would flash %d files", len(prepared))
                 for item in prepared:
@@ -876,6 +1051,12 @@ class MicroPython(MicroPythonBase):
                         item.source_path,
                         item.remote_path,
                         item.size,
+                    )
+                for plan in safe_main_plan:
+                    log.info(
+                        "[DRY-RUN] would back up %s -> %s",
+                        plan.remote_path,
+                        plan.backup_path,
                     )
                 return []
 
@@ -894,11 +1075,24 @@ class MicroPython(MicroPythonBase):
             )
             max_retries = self.config.max_retries
             transfer_t0 = time.time()
+            safe_break_done = False
+            backup_done = False
 
             for attempt in range(max_retries + 1):
+                if safe_main_plan and not safe_break_done:
+                    self.safe_break()
+                    safe_break_done = True
                 self._enter_raw_repl()
                 if attempt > 0:
                     log.warning("retry %d/%d", attempt, max_retries)
+
+                if safe_main_plan and not backup_done:
+                    for plan in safe_main_plan:
+                        self._backup_remote_file_if_exists(
+                            plan.remote_path,
+                            plan.backup_path,
+                        )
+                    backup_done = True
 
                 self._mkdirs_on_device([item.remote_path for item in prepared])
 
@@ -993,6 +1187,7 @@ class MicroPython(MicroPythonBase):
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
         dry_run: bool = False,
+        safe_main: bool = False,
     ) -> List[Tuple[str, str, bool]]:
         """连接设备并递归刷入整个本地目录。"""
         if not os.path.isdir(local_dir):
@@ -1021,6 +1216,7 @@ class MicroPython(MicroPythonBase):
             arch=arch,
             active_tags=active_tags,
             dry_run=dry_run,
+            safe_main=safe_main,
         )
 
     # 设备信息查询

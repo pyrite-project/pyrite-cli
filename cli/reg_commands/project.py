@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -27,6 +28,44 @@ project_app = typer.Typer(help="项目脚手架、存根、文件哈希与增量
 
 def register(app: typer.Typer) -> None:
     app.add_typer(project_app, name="project")
+
+
+def _apply_feature_options(
+    active_tags: set[str],
+    feature: Optional[str],
+    no_feature: Optional[str],
+) -> None:
+    if feature:
+        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
+    if no_feature:
+        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+
+
+def _check_project_manifest_lock(
+    manifest: str,
+    directory: str,
+    lockfile: str,
+    active_tags: set[str],
+    target: Optional[str],
+    auto_compile: bool,
+) -> None:
+    from ..utils.build import ManifestLockError, check_manifest_lock_current
+
+    lock_path = Path(lockfile)
+    if not lock_path.is_absolute():
+        lock_path = Path(directory) / lock_path
+    try:
+        check_manifest_lock_current(
+            manifest,
+            active_tags=active_tags,
+            base_dir=directory,
+            lock_path=lock_path,
+            profile=target,
+            build_settings={"auto_compile": auto_compile},
+        )
+    except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
 
 
 @project_app.command("new")
@@ -110,13 +149,31 @@ def project_flash(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
+    locked: bool = typer.Option(False, "--locked", help="要求 manifest 与 pyrite.lock 一致后才刷入"),
+    lockfile: str = typer.Option("pyrite.lock", "--lockfile", help="lockfile 路径；相对路径基于项目目录"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
 ) -> None:
     """连接设备并根据哈希配置增量刷入新增或变更的文件。"""
     remote_path = _norm_path(remote_path)
+    if locked and manifest is None:
+        manifest = str(Path(directory) / "manifest.py")
     mp = _mp_factory(port, baudrate, timeout, ws, password)
+    lock_checked = False
+    if locked and target:
+        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
+        active_tags.add(target.upper())
+        _apply_feature_options(active_tags, feature, no_feature)
+        _check_project_manifest_lock(
+            manifest,
+            directory,
+            lockfile,
+            active_tags,
+            target,
+            auto_compile=bool(mp.config.auto_compile and not no_compile),
+        )
+        lock_checked = True
     try:
         mp.connect()
         if no_compile:
@@ -130,10 +187,16 @@ def project_flash(
             if not active_tags:
                 log.error("无法识别设备 target，请使用 --target 手动指定")
                 raise typer.Exit(1)
-        if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
-        if no_feature:
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+        _apply_feature_options(active_tags, feature, no_feature)
+        if locked and not lock_checked:
+            _check_project_manifest_lock(
+                manifest,
+                directory,
+                lockfile,
+                active_tags or set(),
+                target,
+                auto_compile=bool(mp.config.auto_compile and not no_compile),
+            )
         ProjectSyncManager(mp).flash(
             directory, remote_path, hash_config_path=hash_config,
             bytecode_ver=ver, arch=arch,
@@ -311,6 +374,7 @@ def project_dev(
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
     auto_run: bool = typer.Option(False, "--run", help="每次成功刷入后软重启，按 boot.py/main.py 正常启动"),
     no_repl: bool = typer.Option(False, "--no-repl", help="只监听和刷入，不进入交互 REPL"),
+    map_traceback: bool = typer.Option(False, "--map-traceback", help="将设备 traceback 路径映射到本地源码"),
     once: bool = typer.Option(False, "--once", help="执行一轮同步后退出（适合测试/CI）"),
     poll_interval: float = typer.Option(0.3, "--poll-interval", help="文件轮询间隔秒数"),
     debounce: float = typer.Option(0.5, "--debounce", help="文件变化稳定等待秒数"),
@@ -340,6 +404,7 @@ def project_dev(
             dry_run=dry_run,
             auto_run=auto_run,
             no_repl=no_repl,
+            map_traceback=map_traceback,
             once=once,
             poll_interval=poll_interval,
             debounce=debounce,

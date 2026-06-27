@@ -22,6 +22,11 @@ import typer
 
 from . import __version__
 
+from .utils.board_profile import (
+    BoardProfileError,
+    BoardProfileStore,
+    resolve_port_alias,
+)
 from .utils.config import DEFAULT_BAUDRATE, create_default_config
 from .utils.errors import humanize_exception
 from .utils.log import configure_from_verbosity, get_logger
@@ -110,11 +115,18 @@ def _norm_path(p: str) -> str:
 
 def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List[str]:
     """Shell 补全回调：自动补全可用串口号。"""
+    matches: list[str] = []
     try:
         ports = MicroPython.scan_ports(require_vid=False)
-        return [p["device"] for p in ports if incomplete in p["device"]]
+        matches.extend(p["device"] for p in ports if incomplete in p["device"])
     except Exception:
-        return []
+        pass
+    try:
+        aliases = [f"@{profile.name}" for profile in BoardProfileStore().list()]
+        matches.extend(alias for alias in aliases if incomplete in alias)
+    except Exception:
+        pass
+    return matches
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -183,6 +195,11 @@ def _mp_factory(
     """创建 MicroPython 实例，支持串口和 WebREPL。"""
     if webrepl:
         return WebREPLMicroPython(url=webrepl, password=password, timeout=timeout)
+    try:
+        port = resolve_port_alias(port)
+    except BoardProfileError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 
 
@@ -279,12 +296,54 @@ def flash(
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     force: bool = typer.Option(False, "--force", "-F", help="强制覆盖"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    safe_main: bool = typer.Option(
+        True,
+        "--safe-main/--no-safe-main",
+        help="刷入根 /main.py 前先 Ctrl+C 打断并备份原文件",
+    ),
+    trace: bool = typer.Option(False, "--trace", help="记录本次 flash 的 Flight Recorder trace"),
+    trace_path: Optional[str] = typer.Option(None, "--trace-path", help="指定 trace 输出文件路径"),
 ) -> None:
     """连接设备并通过原始 REPL 刷入单个文件。"""
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
+    recorder = None
+    trace_status = "ok"
     try:
+        if trace:
+            from .utils.trace import TraceRecorder, default_trace_path, make_session_id
+
+            session_id = make_session_id()
+            output_path = trace_path or default_trace_path(
+                operation="flash",
+                session_id=session_id,
+            )
+            recorder = TraceRecorder(
+                output_path,
+                operation="flash",
+                port=ws or port,
+                session_id=session_id,
+                metadata={
+                    "baudrate": baudrate,
+                    "timeout": timeout,
+                    "webrepl": ws,
+                    "password": password,
+                    "local_file": file,
+                    "remote_path": remote_path,
+                    "no_compile": no_compile,
+                    "target": target,
+                    "feature": feature,
+                    "no_feature": no_feature,
+                    "dry_run": dry_run,
+                    "safe_main": safe_main,
+                },
+            )
+            mp.set_trace_recorder(recorder)
+            log.info("trace 文件: %s", recorder.path)
+
         mp.connect()
+        if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
+            mp.safe_break()
         if not force and remote_path:
             try:
                 mp.run(f"import os;os.stat({remote_path!r})")
@@ -310,9 +369,19 @@ def flash(
             file, remote_path, compile=not no_compile,
             bytecode_ver=ver, arch=arch,
             active_tags=active_tags or None, dry_run=dry_run,
+            safe_main=safe_main,
         )
+    except Exception as exc:
+        trace_status = "error"
+        if recorder is not None:
+            recorder.failure(exc, phase="flash")
+        raise
     finally:
-        mp.disconnect()
+        try:
+            mp.disconnect()
+        finally:
+            if recorder is not None:
+                recorder.close(status=trace_status)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -326,12 +395,26 @@ def repl(
     timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    map_traceback: bool = typer.Option(
+        False,
+        "--map-traceback",
+        help="将 MicroPython traceback 的设备路径映射到本地源码",
+    ),
 ) -> None:
     """连接设备并进入交互式 REPL 终端。"""
     mp = _mp_factory(port, baudrate, timeout, ws, password)
+    output_mapper = None
+    if map_traceback:
+        from .utils.traceback_map import create_traceback_output_mapper
+
+        output_mapper = create_traceback_output_mapper(
+            local_dir=".",
+            remote_prefix="/",
+            auto_manifest=True,
+        )
     try:
         mp.connect()
-        mp.repl_()
+        mp.repl_(output_mapper=output_mapper)
     finally:
         mp.disconnect()
 
@@ -355,6 +438,11 @@ def flash_program(
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    safe_main: bool = typer.Option(
+        True,
+        "--safe-main/--no-safe-main",
+        help="批量刷入根 /main.py 前先 Ctrl+C 打断并备份原文件",
+    ),
 ) -> None:
     """连接设备并递归刷入整个本地目录。"""
     remote_path = _norm_path(remote_path)
@@ -380,6 +468,7 @@ def flash_program(
             directory, remote_path, bytecode_ver=ver, arch=arch,
             active_tags=active_tags or None,
             manifest_path=manifest, dry_run=dry_run,
+            safe_main=safe_main,
         )
         ok = sum(1 for _, _, s in results if s)
         fail = sum(1 for _, _, s in results if not s)
@@ -511,6 +600,10 @@ def monitor(
             if ws or password:
                 raise MonitorError("--uart does not support WebREPL options")
 
+            try:
+                port = resolve_port_alias(port)
+            except BoardProfileError as exc:
+                raise MonitorError(str(exc)) from exc
             uart_ports = parse_uart_ports(port)
             for uart_port in uart_ports:
                 transport = _serial_transport_factory(uart_port, baudrate, timeout)
@@ -793,12 +886,16 @@ def remount(
         raise typer.Exit(1)
 
     try:
+        port = resolve_port_alias(port)
         cmd = _build_remount_command(
             port,
             local_dir,
             mpremote=mpremote_cmd,
             unsafe_links=unsafe_links,
         )
+    except BoardProfileError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
     except FileNotFoundError as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc

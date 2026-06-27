@@ -55,6 +55,7 @@ class DevOptions:
     dry_run: bool = False
     auto_run: bool = False
     no_repl: bool = False
+    map_traceback: bool = False
     once: bool = False
     poll_interval: float = 0.3
     debounce: float = 0.5
@@ -184,6 +185,7 @@ class DevSession:
             self.mp.repl_(
                 command_handler=self.handle_repl_command,
                 idle_hook=self.process_pending_sync,
+                output_mapper=self._traceback_output_mapper(),
             )
         finally:
             self._stop.set()
@@ -354,6 +356,19 @@ class DevSession:
             self.mp._exit_raw_repl()
         except Exception as exc:
             log.debug("return to repl skipped: %s", exc)
+
+    def _traceback_output_mapper(self):
+        if not self.options.map_traceback:
+            return None
+        from ..utils.traceback_map import create_traceback_output_mapper
+
+        return create_traceback_output_mapper(
+            local_dir=self.options.local_dir,
+            remote_prefix=self.options.remote_path,
+            manifest_path=self.options.manifest_path,
+            active_tags=self._active_tags or set(),
+            auto_compile=not self.options.no_compile,
+        )
 
     def _disconnect(self) -> None:
         try:

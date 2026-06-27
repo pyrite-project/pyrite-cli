@@ -10,6 +10,11 @@ from typing import List, Optional
 import click
 import typer
 
+from ..utils.board_profile import (
+    BoardProfileError,
+    BoardProfileStore,
+    resolve_port_alias,
+)
 from ..utils.config import DEFAULT_BAUDRATE
 from ..utils.log import get_logger
 
@@ -95,11 +100,18 @@ def _norm_path(p: str) -> str:
 
 def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List[str]:
     """Shell 补全回调：自动补全可用串口号。"""
+    matches: list[str] = []
     try:
         ports = MicroPython.scan_ports(require_vid=False)
-        return [p["device"] for p in ports if incomplete in p["device"]]
+        matches.extend(p["device"] for p in ports if incomplete in p["device"])
     except Exception:
-        return []
+        pass
+    try:
+        aliases = [f"@{profile.name}" for profile in BoardProfileStore().list()]
+        matches.extend(alias for alias in aliases if incomplete in alias)
+    except Exception:
+        pass
+    return matches
 
 
 def _mp_factory(
@@ -112,6 +124,11 @@ def _mp_factory(
     """创建 MicroPython 实例，支持串口和 WebREPL。"""
     if webrepl:
         return WebREPLMicroPython(url=webrepl, password=password, timeout=timeout)
+    try:
+        port = resolve_port_alias(port)
+    except BoardProfileError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 
 

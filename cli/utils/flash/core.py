@@ -15,6 +15,7 @@ import serial.tools.list_ports
 
 from ..config import DEFAULT_BAUDRATE, _load_config
 from ..log import TrafficMonitor, get_logger
+from ..trace import TraceRecorder
 from ..transport import SerialTransport, Transport
 from ..config import PyriteConfig
 
@@ -373,6 +374,8 @@ class MicroPythonBase:
         self.timeout = timeout or self.config.timeout or 10
         self.transport = transport or SerialTransport(port, self.baudrate, self.timeout)  # type: ignore[arg-type]
         self._traffic_monitor: Optional[TrafficMonitor] = None
+        self._trace_recorder: Optional[TraceRecorder] = None
+        self._trace_phase = "idle"
         self._suppress_traffic = False
 
     # ── 静态/工具方法 ──
@@ -666,6 +669,8 @@ class MicroPythonBase:
         """非阻塞记录 RX 数据（如果监控器激活）。"""
         if self._traffic_monitor and not self._suppress_traffic:
             self._traffic_monitor.rx(data)
+        if self._trace_recorder and not self._suppress_traffic:
+            self._trace_recorder.traffic("RX", data, phase=self._trace_phase)
 
     def _drain_rx(self) -> None:
         """排空串口 RX 缓冲并记录。"""
@@ -684,7 +689,50 @@ class MicroPythonBase:
             data = data.encode("utf-8")
         if self._traffic_monitor and not self._suppress_traffic:
             self._traffic_monitor.tx(data)
+        if self._trace_recorder and not self._suppress_traffic:
+            self._trace_recorder.traffic("TX", data, phase=self._trace_phase)
         self.transport.write(data)
+
+    def set_trace_recorder(self, recorder: Optional[TraceRecorder]) -> None:
+        """Attach a Flight Recorder trace writer to this device session."""
+        self._trace_recorder = recorder
+        if recorder is not None:
+            recorder.event(
+                "device_attached",
+                phase="session",
+                baudrate=self.baudrate,
+                timeout=self.timeout,
+            )
+
+    def _trace_event(self, event: str, phase: Optional[str] = None, **fields: Any) -> None:
+        if self._trace_recorder is not None:
+            self._trace_recorder.event(event, phase=phase or self._trace_phase, **fields)
+
+    @contextmanager
+    def _trace_phase_ctx(self, phase: str, **fields: Any) -> Iterator[None]:
+        previous = self._trace_phase
+        self._trace_phase = phase
+        t0 = time.time()
+        self._trace_event("phase_start", phase=phase, **fields)
+        try:
+            yield
+        except Exception as exc:
+            self._trace_event(
+                "phase_error",
+                phase=phase,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                duration_ms=round((time.time() - t0) * 1000, 1),
+            )
+            raise
+        else:
+            self._trace_event(
+                "phase_end",
+                phase=phase,
+                duration_ms=round((time.time() - t0) * 1000, 1),
+            )
+        finally:
+            self._trace_phase = previous
 
     def _read_until(
         self,

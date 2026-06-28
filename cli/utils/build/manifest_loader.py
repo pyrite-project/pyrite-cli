@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from ..log import get_logger
 
@@ -213,7 +213,7 @@ def _check_unsafe_nodes(tree: ast.Module) -> None:
 
 def load_manifest(
     manifest_path: str,
-    active_tags: Set[str],
+    active_tags: Optional[Set[str]],
     base_dir: str | None = None,
 ) -> List[Tuple[str, str]]:
     """安全解析 manifest.py，返回 ``[(local_path, remote_path), ...]``。
@@ -226,7 +226,7 @@ def load_manifest(
 
 def load_manifest_plan(
     manifest_path: str,
-    active_tags: Set[str],
+    active_tags: Optional[Set[str]],
     base_dir: str | None = None,
 ) -> ManifestPlan:
     """安全解析 manifest.py，返回结构化解析计划。"""
@@ -254,7 +254,11 @@ def load_manifest_plan(
         )
 
         features = kwargs.get("features")
-        if features is not None and not (set(features) & active_tags):
+        if (
+            features is not None
+            and active_tags is not None
+            and not (set(features) & active_tags)
+        ):
             excluded_features.update(features)
             continue
         if features is not None:
@@ -299,7 +303,7 @@ def load_manifest_plan(
     log.debug("manifest 解析完成: %s (%d 个条目)", manifest_path, len(entries))
     return ManifestPlan(
         entries=tuple(entries),
-        active_tags=tuple(sorted(active_tags)),
+        active_tags=tuple(sorted(active_tags or set())),
         included_features=tuple(sorted(included_features)),
         excluded_features=tuple(sorted(excluded_features - included_features)),
     )

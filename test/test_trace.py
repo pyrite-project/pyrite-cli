@@ -94,11 +94,13 @@ def test_summarize_trace_reports_counts_tail_and_failures(tmp_path: Path) -> Non
     assert summary["phases"]["raw_repl"]["traffic_events"] == 2
     assert summary["failures"][0]["error_type"] == "RuntimeError"
     assert "secret" not in summary["failures"][0]["message"]
+    assert summary["recommendations"][0]["id"] == "attach_trace_on_failure"
     assert len(summary["tail"]) == 3
 
     text = format_trace_summary(summary)
     assert "sum-test" in text
     assert "RuntimeError" in text
+    assert "recommendations:" in text
     assert "secret" not in text
 
 

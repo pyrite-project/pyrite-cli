@@ -131,6 +131,7 @@ def test_cli_uploads_runs_and_cleans_default_test_files(tmp_path, monkeypatch):
         result = runner.invoke(app, ["test", "COM3"])
 
     assert result.exit_code == 0
+    assert "CLEANED remote test files from /.pyrite_tests" in result.stdout
     mp.connect.assert_called_once()
     mp.flash_file.assert_called_once_with(
         str(test_dir / "test_gpio.py"),
@@ -163,6 +164,7 @@ def test_cli_keep_files_skips_cleanup_for_specific_file(tmp_path):
         ])
 
     assert result.exit_code == 0
+    assert "KEEP-FILES remote test files retained at /.pyrite_tests" in result.stdout
     mp.run.assert_called_once()
     assert mp.run.call_args.kwargs["timeout"] == 12
     mp.fs_rm.assert_not_called()

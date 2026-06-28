@@ -27,7 +27,7 @@ from .utils.board_profile import (
     BoardProfileStore,
     resolve_port_alias,
 )
-from .utils.config import DEFAULT_BAUDRATE, create_default_config
+from .utils.config import DEFAULT_BAUDRATE, create_default_config, _load_config
 from .utils.errors import humanize_exception
 from .utils.log import configure_from_verbosity, get_logger
 from .utils.ui import is_tty, print_json
@@ -76,6 +76,82 @@ _JSON_OPTION = typer.Option(False, "--json", help="等同于 --format json")
 
 def _resolve_format(fmt: str, json_output: bool) -> str:
     return "json" if json_output else fmt
+
+
+def _tags_from_cli(
+    cfg,
+    target: Optional[str],
+    feature: Optional[str],
+    no_feature: Optional[str],
+) -> Optional[set[str]]:
+    active_tags: Optional[set[str]]
+    if target:
+        active_tags = set(cfg.board_tags.get(target.upper(), [target.upper()]))
+        active_tags.add(target.upper())
+    else:
+        active_tags = None
+    if feature:
+        if active_tags is None:
+            active_tags = set()
+        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
+    if no_feature and active_tags is not None:
+        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+    return active_tags
+
+
+def _run_precheck_or_exit(
+    entries,
+    check: Optional[str],
+    no_check: bool,
+    active_tags: Optional[set[str]] = None,
+) -> None:
+    if no_check:
+        return
+    from .utils.precheck import PrecheckError, run_precheck, validate_precheck_mode
+
+    cfg = _load_config()
+    try:
+        mode = validate_precheck_mode(check if check is not None else cfg.precheck)
+        report = run_precheck(
+            entries,
+            mode=mode,
+            compat=cfg.precheck_compat,
+            active_tags=active_tags,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(2) from exc
+    except PrecheckError as exc:
+        log.error("precheck failed:\n%s", exc)
+        raise typer.Exit(1) from exc
+    for item in report.warnings:
+        log.warning("%s", item.format())
+
+
+def _consume_check_option(args: list[str]) -> Optional[str]:
+    check: Optional[str] = None
+    leftovers: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--check":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                check = args[i + 1]
+                i += 2
+            else:
+                check = "basic"
+                i += 1
+            continue
+        if arg.startswith("--check="):
+            check = arg.split("=", 1)[1] or "basic"
+            i += 1
+            continue
+        leftovers.append(arg)
+        i += 1
+    if leftovers:
+        log.error("unknown option(s): %s", " ".join(leftovers))
+        raise typer.Exit(2)
+    return check
 
 
 def _norm_path(p: str) -> str:
@@ -280,8 +356,9 @@ def scan(
 # flash — 单文件刷入
 # ═══════════════════════════════════════════════════════════════════
 
-@app.command()
+@app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def flash(
+    ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
                                autocompletion=_complete_port),
     file: str = typer.Argument(..., help="待刷入的本地文件路径"),
@@ -303,9 +380,21 @@ def flash(
     ),
     trace: bool = typer.Option(False, "--trace", help="记录本次 flash 的 Flight Recorder trace"),
     trace_path: Optional[str] = typer.Option(None, "--trace-path", help="指定 trace 输出文件路径"),
+    no_check: bool = typer.Option(False, "--no-check", help="跳过刷入前预检查"),
 ) -> None:
-    """连接设备并通过原始 REPL 刷入单个文件。"""
+    """连接设备并通过原始 REPL 刷入单个文件。
+
+    预检查可用 --check、--check=basic|strict 或 --no-check 控制。
+    """
     remote_path = _norm_path(remote_path)
+    check = _consume_check_option(list(ctx.args))
+    cfg = _load_config()
+    _run_precheck_or_exit(
+        [(file, remote_path)],
+        check,
+        no_check,
+        active_tags=_tags_from_cli(cfg, target, feature, no_feature),
+    )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     recorder = None
     trace_status = "ok"
@@ -423,8 +512,9 @@ def repl(
 # flash-program — 批量刷入
 # ═══════════════════════════════════════════════════════════════════
 
-@app.command()
+@app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def flash_program(
+    ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
@@ -443,9 +533,30 @@ def flash_program(
         "--safe-main/--no-safe-main",
         help="批量刷入根 /main.py 前先 Ctrl+C 打断并备份原文件",
     ),
+    no_check: bool = typer.Option(False, "--no-check", help="跳过刷入前预检查"),
 ) -> None:
-    """连接设备并递归刷入整个本地目录。"""
+    """连接设备并递归刷入整个本地目录。
+
+    预检查可用 --check、--check=basic|strict 或 --no-check 控制。
+    """
     remote_path = _norm_path(remote_path)
+    check = _consume_check_option(list(ctx.args))
+    cfg = _load_config()
+    precheck_tags = _tags_from_cli(cfg, target, feature, no_feature)
+    if not no_check:
+        from .utils.precheck import collect_directory_entries
+
+        _run_precheck_or_exit(
+            collect_directory_entries(
+                directory,
+                remote_path,
+                active_tags=precheck_tags,
+                manifest_path=manifest,
+            ),
+            check,
+            no_check,
+            active_tags=precheck_tags,
+        )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()

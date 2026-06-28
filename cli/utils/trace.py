@@ -309,6 +309,7 @@ def summarize_trace(path: str | Path, tail: int = 10) -> Dict[str, Any]:
         },
         "phases": {},
         "failures": [],
+        "recommendations": [],
         "tail": [_compact_record(record) for record in records[-tail:]],
     }
     if not records:
@@ -355,7 +356,31 @@ def summarize_trace(path: str | Path, tail: int = 10) -> Dict[str, Any]:
     summary["phases"] = phases
     if summary["status"] == "unknown" and summary["failures"]:
         summary["status"] = "error"
+    summary["recommendations"] = _trace_recommendations(summary)
     return summary
+
+
+def _trace_recommendations(summary: Dict[str, Any]) -> List[Dict[str, str]]:
+    recommendations: List[Dict[str, str]] = []
+    if summary.get("failures"):
+        recommendations.append({
+            "id": "attach_trace_on_failure",
+            "severity": "info",
+            "message": "Attach this .pyrite-trace when reporting disconnect, verify, or Raw REPL failures.",
+        })
+    if summary.get("traffic", {}).get("RX", {}).get("bytes", 0) == 0:
+        recommendations.append({
+            "id": "no_rx_traffic",
+            "severity": "warning",
+            "message": "No RX traffic was recorded; check port selection, reset timing, or board boot state.",
+        })
+    if "raw_repl" in summary.get("phases", {}) and summary.get("status") != "ok":
+        recommendations.append({
+            "id": "raw_repl_failure_context",
+            "severity": "info",
+            "message": "Use the raw_repl phase tail to compare control characters such as <RAW>, <C>, and <D>.",
+        })
+    return recommendations
 
 
 def format_trace_view(records: Iterable[Dict[str, Any]], limit: Optional[int] = None) -> str:
@@ -418,4 +443,8 @@ def format_trace_summary(summary: Dict[str, Any]) -> str:
                 f"  [{failure.get('phase')}] {failure.get('error_type')}: "
                 f"{failure.get('message')}"
             )
+    if summary.get("recommendations"):
+        lines.append("recommendations:")
+        for item in summary["recommendations"]:
+            lines.append(f"  {item.get('severity', 'info')}: {item.get('message')}")
     return "\n".join(redact_text(line) for line in lines)

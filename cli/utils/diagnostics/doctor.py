@@ -286,6 +286,7 @@ def run_doctor(mp: Any, connect_ms: int | None = None) -> dict[str, Any]:
         "raw_repl_ms": raw_repl_ms,
     }
     report["configuration"] = _configuration_report(mp)
+    report["recommendations"] = _doctor_recommendations(report)
     report["summary"] = _summary(report)
     return report
 
@@ -325,6 +326,67 @@ def _configuration_report(mp: Any) -> dict[str, Any]:
         "max_retries": max_retries,
         "recommendations": recommendations,
     }
+
+
+def _feature_status(report: dict[str, Any], feature_id: str) -> str | None:
+    for item in report.get("firmware_features", {}).get("items", []):
+        if item.get("id") == feature_id:
+            return item.get("status")
+    return None
+
+
+def _doctor_recommendations(report: dict[str, Any]) -> list[dict[str, str]]:
+    recommendations: list[dict[str, str]] = []
+    board = report.get("board", {})
+    version = board.get("version") or board.get("release")
+
+    if _feature_status(report, "network") == "unsupported":
+        recommendations.append({
+            "id": "host_assisted_tunnel_candidate",
+            "category": "network",
+            "severity": "info",
+            "message": (
+                "network is unavailable on this firmware; for development-only checks, "
+                "try a host-assisted tunnel when that command is available."
+            ),
+        })
+
+    if version:
+        recommendations.append({
+            "id": "firmware_version_precheck",
+            "category": "compatibility",
+            "severity": "info",
+            "message": (
+                f"Firmware version {version} is available for compatibility precheck rules "
+                "before flashing syntax-sensitive code."
+            ),
+        })
+
+    missing_dev_features: list[str] = []
+    for feature_id in ("micropython.kbd_intr", "sys.stdin.buffer", "external_import"):
+        if _feature_status(report, feature_id) == "unsupported":
+            missing_dev_features.append(feature_id)
+    if missing_dev_features:
+        recommendations.append({
+            "id": "project_dev_degraded",
+            "category": "project_dev",
+            "severity": "warning",
+            "message": (
+                "Missing "
+                + ", ".join(missing_dev_features)
+                + "; project dev workflows should fall back to simpler flash/run behaviour."
+            ),
+        })
+
+    if _feature_status(report, "sys.settrace") == "unsupported":
+        recommendations.append({
+            "id": "traceback_observability_limited",
+            "category": "debug",
+            "severity": "info",
+            "message": "sys.settrace is unavailable; prefer Flight Recorder traces and captured traceback output.",
+        })
+
+    return recommendations
 
 
 def _summary(report: dict[str, Any]) -> dict[str, Any]:

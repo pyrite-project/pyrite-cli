@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from cli.reg_commands.project import _resolve_dev_deep_options
 from cli.project.dev import DevOptions, DevSession, ProjectWatcher, run_project_dev
 from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.flash import SET_EXECUTE
@@ -148,6 +149,54 @@ def test_run_project_dev_once_prints_busy_and_ready_status(tmp_path: Path):
     }
 
 
+def test_run_project_dev_once_exits_before_repl_by_default(tmp_path: Path):
+    (tmp_path / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    mp = _FakeMicroPython()
+    manager = MagicMock()
+    manager.flash.return_value = [(str(tmp_path / "main.py"), "/main.py", True)]
+
+    run_project_dev(
+        DevOptions(
+            port="COM99",
+            local_dir=str(tmp_path),
+            once=True,
+        ),
+        mp_factory=lambda *_args, **_kwargs: mp,
+        manager_factory=lambda _mp: manager,
+        stderr=io.StringIO(),
+    )
+
+    assert mp.repl_kwargs is None
+    assert mp.disconnects == 1
+    manager.flash.assert_called_once()
+
+
+def test_deep_dev_defaults_to_run_and_traceback_mapping():
+    assert _resolve_dev_deep_options(
+        deep=False,
+        auto_run=None,
+        map_traceback=None,
+    ) == (False, False)
+    assert _resolve_dev_deep_options(
+        deep=True,
+        auto_run=None,
+        map_traceback=None,
+    ) == (True, True)
+
+
+def test_deep_dev_respects_explicit_fine_grained_options():
+    assert _resolve_dev_deep_options(
+        deep=True,
+        auto_run=False,
+        map_traceback=False,
+    ) == (False, False)
+    assert _resolve_dev_deep_options(
+        deep=False,
+        auto_run=True,
+        map_traceback=True,
+    ) == (True, True)
+
+
 def test_dev_session_passes_traceback_mapper_to_repl(tmp_path: Path):
     source = tmp_path / "lib" / "sensor.py"
     source.parent.mkdir()
@@ -162,7 +211,6 @@ def test_dev_session_passes_traceback_mapper_to_repl(tmp_path: Path):
             local_dir=str(tmp_path),
             remote_path="/app",
             map_traceback=True,
-            once=True,
         ),
         mp_factory=lambda *_args, **_kwargs: mp,
         manager_factory=lambda _mp: manager,

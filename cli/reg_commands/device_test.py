@@ -35,7 +35,7 @@ def _print_block(text: str) -> None:
         print(f"    {line}")
 
 
-def _print_session(session: DeviceTestSession) -> None:
+def _print_session(session: DeviceTestSession, *, keep_files: bool = False) -> None:
     by_path = {result.remote_path: result for result in session.results}
     for item in session.plan.files:
         result = by_path.get(item.remote_path)
@@ -57,6 +57,10 @@ def _print_session(session: DeviceTestSession) -> None:
 
     passed = sum(1 for result in session.results if result.passed)
     failed = len(session.plan.files) - passed
+    if keep_files:
+        typer.echo(f"KEEP-FILES remote test files retained at {session.plan.remote_dir}")
+    else:
+        typer.echo(f"CLEANED remote test files from {session.plan.remote_dir}")
     log.info("测试完成: %d 通过, %d 失败", passed, failed)
 
 
@@ -110,7 +114,7 @@ def device_test(
             timeout=timeout,
             keep_files=keep_files,
         )
-        _print_session(session)
+        _print_session(session, keep_files=keep_files)
         if not session.ok:
             raise typer.Exit(1)
     finally:

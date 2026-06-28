@@ -31,6 +31,8 @@ class TestLoadConfig:
         assert cfg.verify == "size"
         assert cfg.max_retries == 2
         assert cfg.baudrate == DEFAULT_BAUDRATE
+        assert cfg.precheck == "basic"
+        assert cfg.precheck_compat == "warn"
         assert "ESP32" in cfg.board_tags
 
     def test_custom_chunk_size(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -100,6 +102,28 @@ class TestLoadConfig:
         _write_json(tmp_path / CONFIG_FILE, {"verify": "sha256"})
         assert _load_config().verify == "size"
 
+    def test_precheck_modes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        for mode in ("off", "basic", "strict"):
+            _write_json(tmp_path / CONFIG_FILE, {"precheck": mode})
+            assert _load_config().precheck == mode
+
+    def test_precheck_compat_modes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        for mode in ("warn", "error", "off"):
+            _write_json(tmp_path / CONFIG_FILE, {"precheck_compat": mode})
+            assert _load_config().precheck_compat == mode
+
+    def test_invalid_precheck_config_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {
+            "precheck": "always",
+            "precheck_compat": "fail",
+        })
+        cfg = _load_config()
+        assert cfg.precheck == "basic"
+        assert cfg.precheck_compat == "warn"
+
     def test_max_retries_zero(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {"max_retries": 0})
@@ -168,6 +192,8 @@ class TestCreateDefaultConfig:
         assert data["auto_compile"] is True
         assert data["baudrate"] == DEFAULT_BAUDRATE
         assert data["delta_flash"] == "auto"
+        assert data["precheck"] == "basic"
+        assert data["precheck_compat"] == "warn"
 
     def test_default_config_is_loadable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)

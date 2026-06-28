@@ -246,6 +246,11 @@ def _print_doctor_text(report: dict) -> None:
         if item:
             _row(feature_id, _feature_status(item))
 
+    if report.get("recommendations"):
+        _section("Recommendations")
+        for item in report.get("recommendations", []):
+            _row(item.get("category", "info"), item.get("message", ""))
+
     _section("配置")
     config = report.get("configuration", {})
     if config.get("verify") is not None:

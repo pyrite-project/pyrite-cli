@@ -64,6 +64,12 @@ def _load_config() -> PyriteConfig:
                 delta_min = data.get("delta_min_size", 10240)
                 if isinstance(delta_min, int) and delta_min >= 0:
                     cfg.delta_min_size = delta_min
+                precheck = data.get("precheck", "basic")
+                if precheck in ("off", "basic", "strict"):
+                    cfg.precheck = precheck
+                precheck_compat = data.get("precheck_compat", "warn")
+                if precheck_compat in ("warn", "error", "off"):
+                    cfg.precheck_compat = precheck_compat
                 r = data.get("max_retries", 2)
                 if isinstance(r, int) and r >= 0:
                     cfg.max_retries = r
@@ -119,6 +125,8 @@ def create_default_config() -> str:
             "auto_compile": True,
             "verify": "size",
             "delta_flash": "auto",
+            "precheck": "basic",
+            "precheck_compat": "warn",
             "max_retries": 2,
             "baudrate": DEFAULT_BAUDRATE,
         }, indent=2),
@@ -129,6 +137,8 @@ def create_default_config() -> str:
     print("  download_threads = 4（存根下载线程数，范围 1~12）")
     print("  auto_compile = true（自动编译 .py -> .mpy，设为 false 可关闭）")
     print('  verify = "size"（校验模式：off=不校验, size=文件大小, crc32=文件大小+CRC32）')
+    print('  precheck = "basic"（刷入前代码预检查：off/basic/strict）')
+    print('  precheck_compat = "warn"（strict 兼容性问题：warn/error/off）')
     print("  max_retries = 2（校验失败时最大重试次数，设为 0 关闭重试）")
     print(f"  baudrate = {DEFAULT_BAUDRATE}（默认串口波特率，可按板子稳定性调整）")
     return str(cfg_path)

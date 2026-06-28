@@ -19,6 +19,7 @@ from .common import (
     _resolve_format,
     log,
 )
+from ..utils.config import _load_config
 
 # project 子命令组
 # ═══════════════════════════════════════════════════════════════════
@@ -39,6 +40,82 @@ def _apply_feature_options(
         active_tags.update(t.strip() for t in feature.split(",") if t.strip())
     if no_feature:
         active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+
+
+def _tags_from_cli(
+    cfg,
+    target: Optional[str],
+    feature: Optional[str],
+    no_feature: Optional[str],
+) -> Optional[set[str]]:
+    active_tags: Optional[set[str]]
+    if target:
+        active_tags = set(cfg.board_tags.get(target.upper(), [target.upper()]))
+        active_tags.add(target.upper())
+    else:
+        active_tags = None
+    if feature:
+        if active_tags is None:
+            active_tags = set()
+        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
+    if no_feature and active_tags is not None:
+        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+    return active_tags
+
+
+def _run_precheck_or_exit(
+    entries,
+    check: Optional[str],
+    no_check: bool,
+    active_tags: Optional[set[str]] = None,
+) -> None:
+    if no_check:
+        return
+    from ..utils.precheck import PrecheckError, run_precheck, validate_precheck_mode
+
+    cfg = _load_config()
+    try:
+        mode = validate_precheck_mode(check if check is not None else cfg.precheck)
+        report = run_precheck(
+            entries,
+            mode=mode,
+            compat=cfg.precheck_compat,
+            active_tags=active_tags,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(2) from exc
+    except PrecheckError as exc:
+        log.error("precheck failed:\n%s", exc)
+        raise typer.Exit(1) from exc
+    for item in report.warnings:
+        log.warning("%s", item.format())
+
+
+def _consume_check_option(args: list[str]) -> Optional[str]:
+    check: Optional[str] = None
+    leftovers: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--check":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                check = args[i + 1]
+                i += 2
+            else:
+                check = "basic"
+                i += 1
+            continue
+        if arg.startswith("--check="):
+            check = arg.split("=", 1)[1] or "basic"
+            i += 1
+            continue
+        leftovers.append(arg)
+        i += 1
+    if leftovers:
+        log.error("unknown option(s): %s", " ".join(leftovers))
+        raise typer.Exit(2)
+    return check
 
 
 def _check_project_manifest_lock(
@@ -66,6 +143,18 @@ def _check_project_manifest_lock(
     except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
+
+
+def _resolve_dev_deep_options(
+    *,
+    deep: bool,
+    auto_run: Optional[bool],
+    map_traceback: Optional[bool],
+) -> tuple[bool, bool]:
+    return (
+        deep if auto_run is None else auto_run,
+        deep if map_traceback is None else map_traceback,
+    )
 
 
 @project_app.command("new")
@@ -136,8 +225,9 @@ def project_scan(
     )
 
 
-@project_app.command("flash")
+@project_app.command("flash", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def project_flash(
+    ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
@@ -154,11 +244,33 @@ def project_flash(
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    no_check: bool = typer.Option(False, "--no-check", help="跳过刷入前预检查"),
 ) -> None:
-    """连接设备并根据哈希配置增量刷入新增或变更的文件。"""
+    """连接设备并根据哈希配置增量刷入新增或变更的文件。
+
+    预检查可用 --check、--check=basic|strict 或 --no-check 控制。
+    """
     remote_path = _norm_path(remote_path)
+    check = _consume_check_option(list(ctx.args))
     if locked and manifest is None:
         manifest = str(Path(directory) / "manifest.py")
+    cfg = _load_config()
+    precheck_tags = _tags_from_cli(cfg, target, feature, no_feature)
+    if not no_check:
+        from ..utils.precheck import collect_project_precheck_entries
+
+        _run_precheck_or_exit(
+            collect_project_precheck_entries(
+                directory,
+                remote_path,
+                hash_config_path=hash_config,
+                active_tags=precheck_tags,
+                manifest_path=manifest,
+            ),
+            check,
+            no_check,
+            active_tags=precheck_tags,
+        )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     lock_checked = False
     if locked and target:
@@ -372,9 +484,10 @@ def project_dev(
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
-    auto_run: bool = typer.Option(False, "--run", help="每次成功刷入后软重启，按 boot.py/main.py 正常启动"),
+    deep: bool = typer.Option(False, "--deep", help="启用深度开发会话：默认刷入后运行并映射 traceback"),
+    auto_run: Optional[bool] = typer.Option(None, "--run/--no-run", help="每次成功刷入后软重启，按 boot.py/main.py 正常启动"),
     no_repl: bool = typer.Option(False, "--no-repl", help="只监听和刷入，不进入交互 REPL"),
-    map_traceback: bool = typer.Option(False, "--map-traceback", help="将设备 traceback 路径映射到本地源码"),
+    map_traceback: Optional[bool] = typer.Option(None, "--map-traceback/--no-map-traceback", help="将设备 traceback 路径映射到本地源码"),
     once: bool = typer.Option(False, "--once", help="执行一轮同步后退出（适合测试/CI）"),
     poll_interval: float = typer.Option(0.3, "--poll-interval", help="文件轮询间隔秒数"),
     debounce: float = typer.Option(0.5, "--debounce", help="文件变化稳定等待秒数"),
@@ -386,6 +499,11 @@ def project_dev(
         raise typer.Exit(2)
     from ..project.dev import DevOptions, run_project_dev
 
+    resolved_auto_run, resolved_map_traceback = _resolve_dev_deep_options(
+        deep=deep,
+        auto_run=auto_run,
+        map_traceback=map_traceback,
+    )
     run_project_dev(
         DevOptions(
             port=port,
@@ -402,9 +520,9 @@ def project_dev(
             ws=ws,
             password=password,
             dry_run=dry_run,
-            auto_run=auto_run,
+            auto_run=resolved_auto_run,
             no_repl=no_repl,
-            map_traceback=map_traceback,
+            map_traceback=resolved_map_traceback,
             once=once,
             poll_interval=poll_interval,
             debounce=debounce,

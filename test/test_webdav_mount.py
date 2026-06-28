@@ -221,6 +221,21 @@ class RecursiveListingAdapter(FakeAdapter):
         ]
 
 
+class CacheProbeAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.stat_calls = []
+        self.list_calls = {}
+
+    def stat(self, path: str):
+        self.stat_calls.append(path)
+        return super().stat(path)
+
+    def list_dir(self, path: str):
+        self.list_calls[path] = self.list_calls.get(path, 0) + 1
+        return super().list_dir(path)
+
+
 class DeleteReturnsFalseButRemovedMicroPython:
     def __init__(self):
         self.removed = False
@@ -717,6 +732,73 @@ def test_directory_cache_updates_file_write_without_root_rescan():
     assert cache.stat("/flash/new.py") == DeviceFileStat(path="/flash/new.py", is_dir=False, size=9)
 
 
+def test_directory_cache_caches_child_stats_from_first_directory_listing():
+    adapter = CacheProbeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+    assert cache.stat("/flash/main.py") == DeviceFileStat(path="/flash/main.py", is_dir=False, size=15)
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+
+    assert adapter.list_calls["/flash"] == 1
+    assert adapter.stat_calls == []
+
+
+def test_directory_cache_invalidates_after_mkcol_and_refreshes_parent_listing():
+    adapter = CacheProbeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    assert [child.path for child in cache.list_dir("/flash")] == ["/flash/main.py"]
+    cache.make_dir("/flash/lib")
+    children = cache.list_dir("/flash")
+
+    assert [child.path for child in children] == ["/flash/lib", "/flash/main.py"]
+    assert adapter.list_calls["/flash"] == 2
+    assert cache.stat("/flash/lib") == DeviceFileStat(path="/flash/lib", is_dir=True, size=0)
+
+
+def test_directory_cache_invalidates_after_move_and_drops_source_stat():
+    adapter = CacheProbeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    cache.list_dir("/flash")
+    assert cache.stat("/flash/main.py") is not None
+    cache.move("/flash/main.py", "/flash/renamed.py")
+    children = cache.list_dir("/flash")
+
+    assert [child.path for child in children] == ["/flash/renamed.py"]
+    assert cache.stat("/flash/main.py") is None
+    assert cache.stat("/flash/renamed.py") == DeviceFileStat(path="/flash/renamed.py", is_dir=False, size=15)
+
+
+def test_directory_cache_invalidates_after_copy_and_refreshes_destination_stat():
+    adapter = CacheProbeAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+
+    cache.list_dir("/flash")
+    cache.copy("/flash/main.py", "/flash/copy.py")
+    children = cache.list_dir("/flash")
+
+    assert [child.path for child in children] == ["/flash/copy.py", "/flash/main.py"]
+    assert cache.stat("/flash/copy.py") == DeviceFileStat(path="/flash/copy.py", is_dir=False, size=15)
+
+
 def test_directory_cache_primes_from_recursive_listing_without_incremental_ls():
     adapter = RecursiveListingAdapter()
     cache = DirectoryCachingWebDavAdapter(
@@ -1092,6 +1174,7 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
             "--password",
             "secret",
             "--no-map",
+            "--load-all",
             "--startup-empty-list-grace",
             "12.5",
             "--max-upload-bytes",
@@ -1104,6 +1187,7 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
     serve.assert_called_once()
     assert serve.call_args.args[1].startup_empty_list_grace == 12.5
     assert serve.call_args.args[1].max_upload_bytes == 12345
+    assert serve.call_args.args[1].load_all is True
     mp.disconnect.assert_called_once()
 
 

@@ -25,7 +25,10 @@ INFO|filesystem.free|1048576
 CHECK|raw_repl|ok|behaviour-probe|command execution succeeded
 CHECK|filesystem_rw|ok|behaviour-probe|write/read/delete passed
 FEATURE|sys.settrace|debug|unsupported|hasattr-probe|MICROPY_PY_SYS_SETTRACE|hasattr(sys, "settrace")
-FEATURE|network|network|supported|import-probe|MICROPY_PY_NETWORK|import network
+FEATURE|micropython.kbd_intr|debug|unsupported|hasattr-probe|MICROPY_KBD_EXCEPTION|hasattr(micropython, "kbd_intr")
+FEATURE|sys.stdin.buffer|runtime|unsupported|hasattr-probe|MICROPY_PY_SYS_STDIO_BUFFER|hasattr(sys.stdin, "buffer")
+FEATURE|external_import|filesystem|unsupported|behaviour-probe|MICROPY_ENABLE_EXTERNAL_IMPORT|write temp .py then import
+FEATURE|network|network|unsupported|import-probe|MICROPY_PY_NETWORK|import network
 PYRITE_DOCTOR_END
 """
 
@@ -57,6 +60,14 @@ def test_run_doctor_reports_observable_firmware_features():
         "probe": 'hasattr(sys, "settrace")',
     }
     assert "macro_value" not in items[0]
+    assert [item["id"] for item in report["recommendations"]] == [
+        "host_assisted_tunnel_candidate",
+        "firmware_version_precheck",
+        "project_dev_degraded",
+        "traceback_observability_limited",
+    ]
+    assert "tunnel" in report["recommendations"][0]["message"]
+    assert "1.22.0" in report["recommendations"][1]["message"]
 
 
 def test_debug_doctor_outputs_and_saves_json(tmp_path):
@@ -74,6 +85,7 @@ def test_debug_doctor_outputs_and_saves_json(tmp_path):
     data = json.loads(result.stdout)
     saved = json.loads(save_path.read_text(encoding="utf-8"))
     assert data["summary"]["ok"] is True
+    assert data["recommendations"][0]["id"] == "host_assisted_tunnel_candidate"
     assert saved["board"]["machine"] == "ESP32-S3 module"
     mp.connect.assert_called_once()
     mp.disconnect.assert_called_once()
@@ -92,5 +104,7 @@ def test_debug_doctor_text_uses_board_info_section_style():
     assert "── 特性" in result.stdout
     assert "Raw REPL" in result.stdout
     assert "sys.settrace" in result.stdout
+    assert "Recommendations" in result.stdout
+    assert "host-assisted tunnel" in result.stdout
     assert "Board:" not in result.stdout
     assert "Firmware:" not in result.stdout

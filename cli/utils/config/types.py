@@ -14,3 +14,5 @@ class PyriteConfig:
     timeout: int = 0  # 0 means use CLI default
     delta_flash: str = "auto"
     delta_min_size: int = 10240
+    precheck: str = "basic"
+    precheck_compat: str = "warn"

@@ -180,6 +180,9 @@ class DevSession:
 
         self._ensure_connected()
         self._run_sync_with_error_policy(self.options.changed_paths)
+        if self.options.once:
+            self._disconnect()
+            return
         self._start_watcher()
         try:
             self.mp.repl_(

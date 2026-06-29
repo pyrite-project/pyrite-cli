@@ -28,8 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 
-from ..flash import MicroPython
-from ..log import get_logger
+from .flash import MicroPython
+from .log import get_logger
 
 log = get_logger(__name__)
 ET.register_namespace("D", "DAV:")

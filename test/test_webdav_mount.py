@@ -6,6 +6,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -1213,11 +1214,12 @@ def test_mount_run_requests_current_mount_session():
 
 def test_mount_help_includes_webrepl_options():
     result = runner.invoke(app, ["mount", "--help"])
+    help_text = click.utils.strip_ansi(result.stdout)
 
     assert result.exit_code == 0
-    assert "--ws" in result.stdout
-    assert "--password" in result.stdout
-    assert "--max-upload-bytes" in result.stdout
+    assert "--ws" in help_text
+    assert "--password" in help_text
+    assert "--max-upload-bytes" in help_text
 
 
 def test_remount_invokes_mpremote_mount(monkeypatch, tmp_path):

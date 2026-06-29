@@ -104,6 +104,7 @@ def _run_precheck_or_exit(
     check: Optional[str],
     no_check: bool,
     active_tags: Optional[set[str]] = None,
+    mp_version: Optional[str] = None,
 ) -> None:
     if no_check:
         return
@@ -117,6 +118,7 @@ def _run_precheck_or_exit(
             mode=mode,
             compat=cfg.precheck_compat,
             active_tags=active_tags,
+            mp_version=mp_version if mp_version is not None else cfg.precheck_mp_version,
         )
     except ValueError as exc:
         log.error("%s", exc)
@@ -369,6 +371,7 @@ def flash(
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
+    mp_version: Optional[str] = typer.Option(None, "--mp-version", help="目标 MicroPython 固件版本，用于 strict 兼容性预检查"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     force: bool = typer.Option(False, "--force", "-F", help="强制覆盖"),
@@ -394,6 +397,7 @@ def flash(
         check,
         no_check,
         active_tags=_tags_from_cli(cfg, target, feature, no_feature),
+        mp_version=mp_version,
     )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     recorder = None
@@ -524,6 +528,7 @@ def flash_program(
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
+    mp_version: Optional[str] = typer.Option(None, "--mp-version", help="目标 MicroPython 固件版本，用于 strict 兼容性预检查"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -556,6 +561,7 @@ def flash_program(
             check,
             no_check,
             active_tags=precheck_tags,
+            mp_version=mp_version,
         )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:

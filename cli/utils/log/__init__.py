@@ -89,6 +89,8 @@ def safe_text(value: object, *, preserve_newlines: bool = True) -> str:
         code = ord(ch)
         if preserve_newlines and ch == "\n":
             out.append(ch)
+        elif ch == "\x1b":
+            out.append("\\x1b")
         elif code <= 0x1F or code == 0x7F or 0x80 <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
         else:

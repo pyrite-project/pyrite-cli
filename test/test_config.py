@@ -33,6 +33,7 @@ class TestLoadConfig:
         assert cfg.baudrate == DEFAULT_BAUDRATE
         assert cfg.precheck == "basic"
         assert cfg.precheck_compat == "warn"
+        assert cfg.precheck_mp_version == ""
         assert "ESP32" in cfg.board_tags
 
     def test_custom_chunk_size(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -114,6 +115,11 @@ class TestLoadConfig:
             _write_json(tmp_path / CONFIG_FILE, {"precheck_compat": mode})
             assert _load_config().precheck_compat == mode
 
+    def test_precheck_mp_version_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"precheck_mp_version": " 1.20.0 "})
+        assert _load_config().precheck_mp_version == "1.20.0"
+
     def test_invalid_precheck_config_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {
@@ -194,6 +200,7 @@ class TestCreateDefaultConfig:
         assert data["delta_flash"] == "auto"
         assert data["precheck"] == "basic"
         assert data["precheck_compat"] == "warn"
+        assert data["precheck_mp_version"] == ""
 
     def test_default_config_is_loadable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)

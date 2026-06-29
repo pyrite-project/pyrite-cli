@@ -11,6 +11,7 @@ from cli.utils.precheck import (
     PrecheckError,
     collect_directory_entries,
     collect_project_precheck_entries,
+    normalize_micropython_version,
     run_precheck,
 )
 
@@ -70,6 +71,215 @@ def test_strict_can_warn_or_error_for_compat_findings(tmp_path: Path):
         )
 
 
+def test_normalize_micropython_version_uses_known_tag_order():
+    assert normalize_micropython_version("1.20") == "v1.20.0"
+    assert normalize_micropython_version("MicroPython v1.22.0 on ESP32") == "v1.22.0"
+    assert normalize_micropython_version("v1.24.0-preview") == "v1.24.0-preview"
+
+
+def test_strict_version_errors_for_feature_before_target_runtime(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "name = 'pyrite'\nprint(f'{name}')\n")
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.16",
+        )
+
+    message = str(excinfo.value)
+    assert "f-string requires MicroPython v1.17+" in message
+    assert "target v1.16" in message
+
+
+def test_strict_version_warns_for_config_gated_feature(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "if (value := 1):\n    print(value)\n")
+
+    report = run_precheck(
+        [(str(source), "/main.py")],
+        mode="strict",
+        compat="warn",
+        mp_version="1.20.0",
+    )
+
+    assert report.ok is True
+    assert any("gated by firmware build options" in item.message for item in report.warnings)
+
+
+def test_strict_version_reports_unsupported_modern_python_syntax(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "match value:\n    case 1:\n        pass\n")
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.29.0-preview",
+        )
+
+    assert "match/case is not supported" in str(excinfo.value)
+
+
+def test_token_feature_detection_for_numeric_underscore_and_fstring_forms(tmp_path: Path):
+    source = _write(
+        tmp_path / "main.py",
+        "value = 1_000\n"
+        "name = 'pyrite'\n"
+        "print(rf'{name}')\n"
+        "print(f'a' f'{name}')\n",
+    )
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.23.0",
+        )
+
+    message = str(excinfo.value)
+    assert "raw f-string prefix requires MicroPython v1.24.0+" in message
+    assert "adjacent f-string concatenation requires MicroPython v1.24.0+" in message
+    assert "numeric literal underscores" not in message
+
+
+def test_tstring_detection_requires_new_micropython(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "name = 'pyrite'\nprint(t'hello {name}')\n")
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.27.0",
+        )
+
+    assert "t-string requires MicroPython v1.28.0+" in str(excinfo.value)
+
+
+def test_token_feature_detection_runs_when_host_ast_rejects_syntax(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "name = 'pyrite'\nprint(t'hello {name}')\n")
+
+    with patch("cli.utils.precheck.ast.parse", side_effect=SyntaxError("host parser rejected t-string")):
+        with pytest.raises(PrecheckError) as excinfo:
+            run_precheck(
+                [(str(source), "/main.py")],
+                mode="strict",
+                compat="warn",
+                mp_version="1.27.0",
+            )
+
+    message = str(excinfo.value)
+    assert "syntax error: host parser rejected t-string" in message
+    assert "t-string requires MicroPython v1.28.0+" in message
+
+
+def test_source_fallback_detects_except_star_when_ast_rejects_syntax(tmp_path: Path):
+    source = _write(
+        tmp_path / "main.py",
+        "try:\n"
+        "    risky()\n"
+        "except* ValueError:\n"
+        "    pass\n",
+    )
+
+    with patch("cli.utils.precheck.ast.parse", side_effect=SyntaxError("host parser rejected except star")):
+        with pytest.raises(PrecheckError) as excinfo:
+            run_precheck(
+                [(str(source), "/main.py")],
+                mode="strict",
+                compat="warn",
+                mp_version="1.29.0-preview",
+            )
+
+    assert "except* / ExceptionGroup is not supported" in str(excinfo.value)
+
+
+def test_source_fallback_detects_pep695_type_params(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "type Box[T] = list[T]\n")
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.29.0-preview",
+        )
+
+    assert "PEP 695 type parameters is not supported" in str(excinfo.value)
+
+
+def test_dict_union_flags_dict_like_operands_but_not_set_union(tmp_path: Path):
+    source = _write(
+        tmp_path / "main.py",
+        "a = {'x': 1}\n"
+        "b = {'y': 2}\n"
+        "merged = a | b\n"
+        "set_union = {1} | {2}\n",
+    )
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="strict",
+            compat="warn",
+            mp_version="1.19.1",
+        )
+
+    message = str(excinfo.value)
+    assert message.count("dict union operator | requires MicroPython v1.20.0+") == 1
+
+
+def test_unknown_bitor_does_not_warn_when_target_supports_dict_union(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "merged = left | right\n")
+
+    report = run_precheck(
+        [(str(source), "/main.py")],
+        mode="strict",
+        compat="warn",
+        mp_version="1.20.0",
+    )
+
+    assert not any("static detector confidence is low" in item.message for item in report.warnings)
+
+
+def test_function_annotation_semantics_warns_only_when_runtime_accessed(tmp_path: Path):
+    source = _write(
+        tmp_path / "main.py",
+        "def f(value: int) -> int:\n"
+        "    return value\n"
+        "print(f.__annotations__)\n",
+    )
+
+    report = run_precheck(
+        [(str(source), "/main.py")],
+        mode="strict",
+        compat="warn",
+        mp_version="1.29.0-preview",
+    )
+
+    assert any("runtime __annotations__ access" in item.message for item in report.warnings)
+
+
+def test_function_annotation_semantics_detects_access_before_function(tmp_path: Path):
+    source = _write(
+        tmp_path / "main.py",
+        "print(f.__annotations__)\n"
+        "def f(value: int) -> int:\n"
+        "    return value\n",
+    )
+
+    report = run_precheck(
+        [(str(source), "/main.py")],
+        mode="strict",
+        compat="warn",
+        mp_version="1.29.0-preview",
+    )
+
+    assert any("runtime __annotations__ access" in item.message for item in report.warnings)
+
+
 def test_rejects_empty_file_and_remote_path_conflict(tmp_path: Path):
     a = _write(tmp_path / "a.py", "")
     b = _write(tmp_path / "b.py", "print('b')\n")
@@ -125,6 +335,19 @@ def test_project_flash_accepts_check_equals_strict(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+
+
+def test_flash_strict_with_mp_version_fails_before_mp_factory(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "print(f'{1}')\n")
+
+    with patch("cli.main._mp_factory", side_effect=AssertionError("must not connect")):
+        result = runner.invoke(app, [
+            "flash", "COM3", str(source), "/main.py",
+            "--dry-run", "--check=strict", "--mp-version", "1.16",
+        ])
+
+    assert result.exit_code == 1
+    assert "f-string requires micropython v1.17+" in result.output.lower()
 
 
 def test_flash_no_check_skips_precheck(tmp_path: Path):

@@ -237,7 +237,9 @@ def parse_recommended_items(items: Iterable[str] | None) -> dict[str, Any]:
             raise InvalidProfileError("recommended entries must use KEY=VALUE")
         if key not in _RECOMMENDED_KEYS:
             raise InvalidProfileError(f"unsupported recommended key: {key}")
-        recommended[key] = _parse_scalar(raw_value.strip())
+        value = _parse_scalar(raw_value.strip())
+        _validate_recommended_value(key, value)
+        recommended[key] = value
     return recommended
 
 

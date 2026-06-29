@@ -70,6 +70,9 @@ def _load_config() -> PyriteConfig:
                 precheck_compat = data.get("precheck_compat", "warn")
                 if precheck_compat in ("warn", "error", "off"):
                     cfg.precheck_compat = precheck_compat
+                precheck_mp_version = data.get("precheck_mp_version", "")
+                if isinstance(precheck_mp_version, str):
+                    cfg.precheck_mp_version = precheck_mp_version.strip()
                 r = data.get("max_retries", 2)
                 if isinstance(r, int) and r >= 0:
                     cfg.max_retries = r
@@ -127,6 +130,7 @@ def create_default_config() -> str:
             "delta_flash": "auto",
             "precheck": "basic",
             "precheck_compat": "warn",
+            "precheck_mp_version": "",
             "max_retries": 2,
             "baudrate": DEFAULT_BAUDRATE,
         }, indent=2),
@@ -139,6 +143,7 @@ def create_default_config() -> str:
     print('  verify = "size"（校验模式：off=不校验, size=文件大小, crc32=文件大小+CRC32）')
     print('  precheck = "basic"（刷入前代码预检查：off/basic/strict）')
     print('  precheck_compat = "warn"（strict 兼容性问题：warn/error/off）')
+    print('  precheck_mp_version = ""（可选目标 MicroPython 固件版本，如 1.20.0）')
     print("  max_retries = 2（校验失败时最大重试次数，设为 0 关闭重试）")
     print(f"  baudrate = {DEFAULT_BAUDRATE}（默认串口波特率，可按板子稳定性调整）")
     return str(cfg_path)

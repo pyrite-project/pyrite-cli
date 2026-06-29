@@ -1242,6 +1242,13 @@ class MicroPython(MicroPythonBase):
 
     def get_mpy_version(self) -> Tuple[Optional[int], Optional[str]]:
         """从设备读取 mpy 字节码版本号和架构。"""
+        if self.runtime_info.mpy_version is not None:
+            log.debug(
+                "使用已缓存 mpy 版本: ver=%d, arch=%s",
+                self.runtime_info.mpy_version,
+                self.runtime_info.arch,
+            )
+            return self.runtime_info.mpy_version, self.runtime_info.arch
         try:
             out = self.run(
                 "import sys\n"
@@ -1252,6 +1259,8 @@ class MicroPython(MicroPythonBase):
             parts = out.strip().split()
             ver = int(parts[0])
             arch = parts[1] if len(parts) > 1 and parts[1] else None
+            self.runtime_info.mpy_version = ver
+            self.runtime_info.arch = arch
             log.debug("mpy 版本: ver=%d, arch=%s", ver, arch)
             return ver, arch
         except Exception as e:
@@ -1260,15 +1269,28 @@ class MicroPython(MicroPythonBase):
 
     def detect_tags(self) -> Set[str]:
         """从设备读取 board 信息，返回 active_tags 集合。"""
-        try:
-            out = self.run(
-                "import os,sys\nprint(os.uname().machine)\nprint(sys.platform)",
+        lines = [
+            item
+            for item in (
+                self.runtime_info.machine,
+                self.runtime_info.platform,
+                self.runtime_info.sysname,
             )
-        except Exception as e:
-            log.debug("设备 tag 检测失败: %s", e)
-            return set()
-
-        lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+            if item
+        ]
+        if not lines:
+            try:
+                out = self.run(
+                    "import os,sys\nprint(os.uname().machine)\nprint(sys.platform)",
+                )
+            except Exception as e:
+                log.debug("设备 tag 检测失败: %s", e)
+                return set()
+            lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+            if lines:
+                self.runtime_info.machine = lines[0]
+            if len(lines) > 1:
+                self.runtime_info.platform = lines[1]
         combined = " ".join(lines).upper()
         board_tags = self.config.board_tags
         tags: Set[str] = set()
@@ -1276,7 +1298,9 @@ class MicroPython(MicroPythonBase):
             if kw in combined:
                 tags.update(tag_list)
                 break
-        if len(lines) > 1:
+        if self.runtime_info.platform:
+            tags.add(self.runtime_info.platform.upper())
+        elif len(lines) > 1:
             tags.add(lines[1].upper())
         log.debug("检测到设备 tags: %s", tags)
         return tags

@@ -35,6 +35,34 @@ from .utils.ui import is_tty, print_json
 log = get_logger(__name__)
 
 
+def _device_precheck_mp_version(mp, explicit_version: Optional[str]) -> Optional[str]:
+    if explicit_version is not None:
+        return explicit_version
+    version = getattr(getattr(mp, "runtime_info", None), "version", None)
+    return version if isinstance(version, str) and version.strip() else None
+
+
+def _resolve_flash_tags(
+    mp,
+    target: Optional[str],
+    feature: Optional[str],
+    no_feature: Optional[str],
+) -> set[str]:
+    if target:
+        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
+        active_tags.add(target.upper())
+    else:
+        active_tags = set(mp.detect_tags())
+        if not active_tags:
+            log.error("无法识别设备 target，请使用 --target 手动指定")
+            raise typer.Exit(1)
+    if feature:
+        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
+    if no_feature:
+        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+    return active_tags
+
+
 class _LazyObject:
     def __init__(self, module_name: str, attr_name: str) -> None:
         self._module_name = module_name
@@ -78,27 +106,6 @@ def _resolve_format(fmt: str, json_output: bool) -> str:
     return "json" if json_output else fmt
 
 
-def _tags_from_cli(
-    cfg,
-    target: Optional[str],
-    feature: Optional[str],
-    no_feature: Optional[str],
-) -> Optional[set[str]]:
-    active_tags: Optional[set[str]]
-    if target:
-        active_tags = set(cfg.board_tags.get(target.upper(), [target.upper()]))
-        active_tags.add(target.upper())
-    else:
-        active_tags = None
-    if feature:
-        if active_tags is None:
-            active_tags = set()
-        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
-    if no_feature and active_tags is not None:
-        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
-    return active_tags
-
-
 def _run_precheck_or_exit(
     entries,
     check: Optional[str],
@@ -121,11 +128,11 @@ def _run_precheck_or_exit(
             mp_version=mp_version if mp_version is not None else cfg.precheck_mp_version,
         )
     except ValueError as exc:
-        log.error("%s", exc)
-        raise typer.Exit(2) from exc
+        log.error("%s", exc, exc_info=False)
+        raise typer.Exit(2) from None
     except PrecheckError as exc:
-        log.error("precheck failed:\n%s", exc)
-        raise typer.Exit(1) from exc
+        log.error("precheck failed:\n%s", exc, exc_info=False)
+        raise typer.Exit(1) from None
     for item in report.warnings:
         log.warning("%s", item.format())
 
@@ -215,6 +222,7 @@ app = typer.Typer(
     name="pyrite-cli",
     help="## PYRITE-CLI ## - MicroPython 设备刷入工具",
     add_completion=True,
+    pretty_exceptions_enable=False,
 )
 
 
@@ -391,14 +399,6 @@ def flash(
     """
     remote_path = _norm_path(remote_path)
     check = _consume_check_option(list(ctx.args))
-    cfg = _load_config()
-    _run_precheck_or_exit(
-        [(file, remote_path)],
-        check,
-        no_check,
-        active_tags=_tags_from_cli(cfg, target, feature, no_feature),
-        mp_version=mp_version,
-    )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     recorder = None
     trace_status = "ok"
@@ -435,6 +435,16 @@ def flash(
             log.info("trace 文件: %s", recorder.path)
 
         mp.connect()
+        with mp._trace_phase_ctx("raw_repl"):
+            mp._enter_raw_repl()
+        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        _run_precheck_or_exit(
+            [(file, remote_path)],
+            check,
+            no_check,
+            active_tags=active_tags,
+            mp_version=_device_precheck_mp_version(mp, mp_version),
+        )
         if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
             mp.safe_break()
         if not force and remote_path:
@@ -446,18 +456,6 @@ def flash(
                 pass
 
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        if target:
-            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-            active_tags.add(target.upper())
-        else:
-            active_tags = mp.detect_tags()
-            if not active_tags:
-                log.error("无法识别设备 target，请使用 --target 手动指定")
-                raise typer.Exit(1)
-        if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
-        if no_feature:
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
         mp.flash_file(
             file, remote_path, compile=not no_compile,
             bytecode_ver=ver, arch=arch,
@@ -546,41 +544,29 @@ def flash_program(
     """
     remote_path = _norm_path(remote_path)
     check = _consume_check_option(list(ctx.args))
-    cfg = _load_config()
-    precheck_tags = _tags_from_cli(cfg, target, feature, no_feature)
-    if not no_check:
-        from .utils.precheck import collect_directory_entries
-
-        _run_precheck_or_exit(
-            collect_directory_entries(
-                directory,
-                remote_path,
-                active_tags=precheck_tags,
-                manifest_path=manifest,
-            ),
-            check,
-            no_check,
-            active_tags=precheck_tags,
-            mp_version=mp_version,
-        )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
+        mp._enter_raw_repl()
+        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        if not no_check:
+            from .utils.precheck import collect_directory_entries
+
+            _run_precheck_or_exit(
+                collect_directory_entries(
+                    directory,
+                    remote_path,
+                    active_tags=active_tags,
+                    manifest_path=manifest,
+                ),
+                check,
+                no_check,
+                active_tags=active_tags,
+                mp_version=_device_precheck_mp_version(mp, mp_version),
+            )
         if no_compile:
             mp.config.auto_compile = False
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        if target:
-            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-            active_tags.add(target.upper())
-        else:
-            active_tags = mp.detect_tags()
-            if not active_tags:
-                log.error("无法识别设备 target，请使用 --target 手动指定")
-                raise typer.Exit(1)
-        if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
-        if no_feature:
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
         results = mp.flash_program(
             directory, remote_path, bytecode_ver=ver, arch=arch,
             active_tags=active_tags or None,
@@ -1022,9 +1008,6 @@ def remount(
     if result.returncode != 0:
         raise typer.Exit(result.returncode)
 
-
-# command groups
-# ═══════════════════════════════════════════════════════════════════
 
 register_command_groups(app)
 

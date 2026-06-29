@@ -483,7 +483,8 @@ class Logger:
         _mgr.emit(LogRecord(WARN, self._name, msg, extra=extra or None))
 
     def error(self, msg: str, *args: object, **extra: Any) -> None:
-        exc_text = _capture_exc()
+        exc_info = extra.pop("exc_info", None)
+        exc_text = None if exc_info is False else _capture_exc()
         if args:
             try:
                 msg = msg % args

@@ -32,6 +32,21 @@ class _WindowsReplInput:
     echo_as: Optional[str] = None
 
 
+@dataclass
+class DeviceRuntimeInfo:
+    """MicroPython runtime details discovered during Raw REPL setup."""
+
+    banner: str = ""
+    implementation: Optional[str] = None
+    version: Optional[str] = None
+    platform: Optional[str] = None
+    machine: Optional[str] = None
+    release: Optional[str] = None
+    sysname: Optional[str] = None
+    mpy_version: Optional[int] = None
+    arch: Optional[str] = None
+
+
 # ── 原始 REPL 协议常量 ──
 ENTER_RAW_REPL = b"\x01"
 EXIT_RAW_REPL = b"\x02"
@@ -184,6 +199,121 @@ def _colorize_repl_output(text: str, in_error: bool) -> Tuple[str, bool]:
             return "\033[31m" + text[:m.end()] + "\033[0m" + text[m.end():], False
         return "\033[31m" + text + "\033[0m", True
     return text, False
+
+
+_BANNER_VERSION_RE = re.compile(
+    r"\bMicroPython\s+v?([0-9][0-9A-Za-z.+_-]*(?:-[0-9A-Za-z.+_-]+)?)",
+    re.IGNORECASE,
+)
+_BANNER_MACHINE_RE = re.compile(r";\s*([^\r\n]+)")
+_MPY_ARCHES = (
+    None,
+    "x86",
+    "x64",
+    "armv6",
+    "armv6m",
+    "armv7m",
+    "armv7em",
+    "armv7emsp",
+    "armv7emdp",
+    "xtensa",
+    "xtensawin",
+)
+
+
+def _clean_runtime_field(value: str) -> Optional[str]:
+    text = str(value).strip()
+    return text if text and text != "-" else None
+
+
+def _version_tuple_to_text(value: str) -> Optional[str]:
+    parts = [part.strip() for part in value.split(".") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) >= 4 and parts[3].lower() in {"preview", "alpha", "beta"}:
+        return ".".join(parts[:3]) + "-" + parts[3].lower()
+    if len(parts) >= 4 and re.fullmatch(r"rc\d+", parts[3], re.IGNORECASE):
+        return ".".join(parts[:3]) + "-" + parts[3].lower()
+    while len(parts) > 3 and parts[-1] == "0":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _runtime_info_from_banner(data: bytes | str) -> DeviceRuntimeInfo:
+    if isinstance(data, bytes):
+        text = data.decode("utf-8", errors="replace")
+    else:
+        text = data
+    info = DeviceRuntimeInfo(banner=text.strip())
+    version_match = _BANNER_VERSION_RE.search(text)
+    if version_match:
+        info.implementation = "micropython"
+        info.version = version_match.group(1).lstrip("vV")
+    machine_match = _BANNER_MACHINE_RE.search(text)
+    if machine_match:
+        info.machine = machine_match.group(1).strip()
+    return info
+
+
+def _merge_runtime_info(base: DeviceRuntimeInfo, update: DeviceRuntimeInfo) -> DeviceRuntimeInfo:
+    if update.banner:
+        if base.banner and update.banner not in base.banner:
+            base.banner = base.banner + "\n" + update.banner
+        elif not base.banner:
+            base.banner = update.banner
+    for field in (
+        "implementation",
+        "platform",
+        "machine",
+        "release",
+        "sysname",
+        "mpy_version",
+        "arch",
+    ):
+        value = getattr(update, field)
+        if value is not None:
+            setattr(base, field, value)
+    if update.version is not None:
+        if base.version and "-" in base.version and "-" not in update.version:
+            pass
+        else:
+            base.version = update.version
+    return base
+
+
+def _parse_runtime_probe_output(output: str) -> DeviceRuntimeInfo:
+    info = DeviceRuntimeInfo()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("PYRITE_INFO|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        key, value = parts[1], parts[2]
+        cleaned = _clean_runtime_field(value)
+        if key == "implementation":
+            info.implementation = cleaned
+        elif key == "version":
+            info.version = _version_tuple_to_text(value)
+        elif key == "platform":
+            info.platform = cleaned
+        elif key == "machine":
+            info.machine = cleaned
+        elif key == "release":
+            info.release = cleaned
+        elif key == "sysname":
+            info.sysname = cleaned
+        elif key == "mpy":
+            try:
+                mpy = int(value)
+            except ValueError:
+                continue
+            info.mpy_version = mpy & 0xFF
+            arch_index = mpy >> 10
+            if 0 <= arch_index < len(_MPY_ARCHES):
+                info.arch = _MPY_ARCHES[arch_index]
+    return info
 
 
 _WINDOWS_EXT_KEYS = {
@@ -377,6 +507,8 @@ class MicroPythonBase:
         self._trace_recorder: Optional[TraceRecorder] = None
         self._trace_phase = "idle"
         self._suppress_traffic = False
+        self.runtime_info = DeviceRuntimeInfo()
+        self._runtime_info_probed = False
 
     # ── 静态/工具方法 ──
 
@@ -428,12 +560,15 @@ class MicroPythonBase:
             raise ValueError("未提供串口号，请先调用 scan_ports() 或指定 port")
 
         log.debug("连接设备 %s (波特率=%d)", self.port, self.baudrate)
+        self.runtime_info = DeviceRuntimeInfo()
+        self._runtime_info_probed = False
         self.transport.connect()
 
         # 串口传输：自动 DTR/RTS 硬件复位设备
         if isinstance(self.transport, SerialTransport):
             try:
-                self.transport.dtr_rts_reset()
+                self.transport.dtr_rts_reset(clear_input=False)
+                self._capture_initial_banner()
                 log.trace("DTR/RTS 硬件复位完成")
             except Exception as e:
                 log.trace("DTR/RTS 复位跳过: %s", e)
@@ -498,6 +633,26 @@ class MicroPythonBase:
                     return True, buf
             time.sleep(0.02)
         return False, buf
+
+    def _capture_initial_banner(self, timeout: float = 0.5) -> None:
+        """Capture the normal REPL boot banner before Raw REPL setup clears RX."""
+        deadline = time.time() + timeout
+        buf = b""
+        while time.time() < deadline:
+            if self.transport.in_waiting:
+                chunk = self.transport.read(self.transport.in_waiting)
+                buf += chunk
+                self._record_rx(chunk)
+                deadline = time.time() + 0.08
+            else:
+                time.sleep(0.02)
+        if not buf:
+            return
+        self.runtime_info = _merge_runtime_info(
+            self.runtime_info,
+            _runtime_info_from_banner(buf),
+        )
+        log.debug("已捕获设备欢迎信息: %s", self.runtime_info.banner)
 
     def _interrupt_running_program(
         self,
@@ -624,6 +779,62 @@ class MicroPythonBase:
         if "FS_NOT_READY" in out:
             log.debug("设备文件系统未就绪，后续文件操作可能返回空目录")
 
+    def _probe_runtime_info(self) -> None:
+        """Read runtime details once Raw REPL is available."""
+        if self._runtime_info_probed:
+            return
+        script = (
+            "import sys\n"
+            "def _p(k,v):\n"
+            " try:\n"
+            "  print('PYRITE_INFO|'+k+'|'+str(v).replace('|','/'))\n"
+            " except Exception:\n"
+            "  pass\n"
+            "try:\n"
+            " _p('implementation', sys.implementation.name)\n"
+            "except Exception:\n"
+            " pass\n"
+            "try:\n"
+            " _p('version', '.'.join(str(x) for x in sys.implementation.version))\n"
+            "except Exception:\n"
+            " pass\n"
+            "try:\n"
+            " _p('platform', sys.platform)\n"
+            "except Exception:\n"
+            " pass\n"
+            "try:\n"
+            " _p('mpy', sys.implementation.mpy)\n"
+            "except Exception:\n"
+            " pass\n"
+            "try:\n"
+            " import os\n"
+            " u=os.uname()\n"
+            " _p('machine', getattr(u,'machine',''))\n"
+            " _p('release', getattr(u,'release',''))\n"
+            " _p('sysname', getattr(u,'sysname',''))\n"
+            "except Exception:\n"
+            " pass\n"
+        )
+        out = self._execute(script, timeout=5, raise_on_error=False)
+        self.runtime_info = _merge_runtime_info(
+            self.runtime_info,
+            _parse_runtime_probe_output(out),
+        )
+        details = []
+        if self.runtime_info.version:
+            details.append(f"version={self.runtime_info.version}")
+        if self.runtime_info.platform:
+            details.append(f"platform={self.runtime_info.platform}")
+        if self.runtime_info.machine:
+            details.append(f"machine={self.runtime_info.machine}")
+        if self.runtime_info.mpy_version is not None:
+            details.append(
+                f"mpy={self.runtime_info.mpy_version}/{self.runtime_info.arch or '-'}"
+            )
+        if details:
+            log.info("检测到 MicroPython: %s", ", ".join(details))
+        self._runtime_info_probed = True
+
     def _init_device_state(self) -> None:
         """初始化设备到原始 REPL 模式并设置 kbd_intr(-1)。
 
@@ -645,6 +856,7 @@ class MicroPythonBase:
                         ok, data = self._read_until_raw_repl(timeout=3)
                         if ok:
                             self._ensure_filesystem_mounted()
+                            self._probe_runtime_info()
                             self._execute(
                                 "import micropython; micropython.kbd_intr(-1)",
                                 timeout=3, raise_on_error=False,
@@ -657,6 +869,7 @@ class MicroPythonBase:
             )
 
         self._ensure_filesystem_mounted()
+        self._probe_runtime_info()
         self._execute(
             "import micropython; micropython.kbd_intr(-1)",
             timeout=3, raise_on_error=False,

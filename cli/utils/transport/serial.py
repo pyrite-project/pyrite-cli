@@ -94,7 +94,7 @@ class SerialTransport(Transport):
         if self._ser and self._ser.is_open:
             self._ser.rts = state
 
-    def dtr_rts_reset(self) -> None:
+    def dtr_rts_reset(self, clear_input: bool = True) -> None:
         """通过 DTR/RTS 信号线硬件复位设备。
 
         标准 ESP32/ESP8266 自动复位电路：
@@ -113,7 +113,8 @@ class SerialTransport(Transport):
         # 释放复位：RTS=低 → EN=高，GPIO0 仍为高 → 芯片正常启动
         self._ser.rts = False
         time.sleep(0.5)
-        self.reset_input_buffer()
+        if clear_input:
+            self.reset_input_buffer()
 
     @property
     def is_connected(self) -> bool:

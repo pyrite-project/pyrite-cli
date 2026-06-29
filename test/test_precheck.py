@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +28,15 @@ def _write(path: Path, text: str, encoding: str = "utf-8") -> Path:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _fake_flash_mp(version: str = "1.22.0") -> MagicMock:
+    mp = MagicMock()
+    mp.runtime_info = SimpleNamespace(version=version)
+    mp.config.board_tags = {"ESP32": ["ESP32", "wifi"]}
+    mp.get_mpy_version.return_value = (6, "xtensa")
+    mp.detect_tags.return_value = {"ESP32"}
+    return mp
 
 
 def test_basic_reports_syntax_error_with_path_and_location(tmp_path: Path):
@@ -72,8 +82,12 @@ def test_strict_can_warn_or_error_for_compat_findings(tmp_path: Path):
 
 
 def test_normalize_micropython_version_uses_known_tag_order():
+    assert normalize_micropython_version("1.12.0") == "v1.12"
+    assert normalize_micropython_version("1.12.1") == "v1.12"
+    assert normalize_micropython_version("1.19.2") == "v1.19.1"
     assert normalize_micropython_version("1.20") == "v1.20.0"
     assert normalize_micropython_version("MicroPython v1.22.0 on ESP32") == "v1.22.0"
+    assert normalize_micropython_version("MicroPython v1.22.3 on ESP32") == "v1.22.2"
     assert normalize_micropython_version("v1.24.0-preview") == "v1.24.0-preview"
 
 
@@ -91,6 +105,19 @@ def test_strict_version_errors_for_feature_before_target_runtime(tmp_path: Path)
     message = str(excinfo.value)
     assert "f-string requires MicroPython v1.17+" in message
     assert "target v1.16" in message
+
+
+def test_basic_version_errors_for_hard_unsupported_feature(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "print(f'{1}')\n")
+
+    with pytest.raises(PrecheckError) as excinfo:
+        run_precheck(
+            [(str(source), "/main.py")],
+            mode="basic",
+            mp_version="1.12.0",
+        )
+
+    assert "f-string requires MicroPython v1.17+" in str(excinfo.value)
 
 
 def test_strict_version_warns_for_config_gated_feature(tmp_path: Path):
@@ -301,46 +328,87 @@ def test_rejects_obviously_invalid_remote_paths(tmp_path: Path, remote: str):
         run_precheck([(str(source), remote)])
 
 
-def test_flash_dry_run_precheck_runs_before_mp_factory(tmp_path: Path):
+def test_flash_dry_run_precheck_runs_after_device_probe_before_flash(tmp_path: Path):
     source = _write(tmp_path / "main.py", "def broken(:\n    pass\n")
+    mp = _fake_flash_mp()
 
-    with patch("cli.main._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "flash", "COM3", str(source), "/main.py", "--dry-run",
         ])
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp._enter_raw_repl.assert_called_once()
+    mp.flash_file.assert_not_called()
 
 
 def test_flash_accepts_bare_check_option(tmp_path: Path):
     source = _write(tmp_path / "main.py", "def broken(:\n    pass\n")
+    mp = _fake_flash_mp()
 
-    with patch("cli.main._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "flash", "COM3", str(source), "/main.py", "--dry-run", "--check",
         ])
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp.flash_file.assert_not_called()
 
 
 def test_project_flash_accepts_check_equals_strict(tmp_path: Path):
     _write(tmp_path / "main.py", "def broken(:\n    pass\n")
+    mp = _fake_flash_mp()
 
-    with patch("cli.reg_commands.project._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.reg_commands.project._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "project", "flash", "COM3", str(tmp_path), "/app", "--dry-run", "--check=strict",
         ])
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp._enter_raw_repl.assert_called_once()
 
 
-def test_flash_strict_with_mp_version_fails_before_mp_factory(tmp_path: Path):
+def test_flash_strict_uses_detected_device_mp_version_for_precheck(tmp_path: Path):
     source = _write(tmp_path / "main.py", "print(f'{1}')\n")
+    mp = _fake_flash_mp(version="1.16")
 
-    with patch("cli.main._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.main._mp_factory", return_value=mp):
+        result = runner.invoke(app, [
+            "flash", "COM3", str(source), "/main.py", "--dry-run", "--check=strict",
+        ])
+
+    assert result.exit_code == 1
+    assert "f-string requires micropython v1.17+" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp.flash_file.assert_not_called()
+
+
+def test_flash_default_check_uses_detected_device_version_for_hard_errors(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "print(f'{1}')\n")
+    mp = _fake_flash_mp(version="1.12.0")
+
+    with patch("cli.main._mp_factory", return_value=mp):
+        result = runner.invoke(app, [
+            "flash", "COM3", str(source), "/main.py", "--dry-run",
+        ])
+
+    assert result.exit_code == 1
+    assert "f-string requires micropython v1.17+" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp.flash_file.assert_not_called()
+
+
+def test_flash_strict_explicit_mp_version_overrides_detected_version(tmp_path: Path):
+    source = _write(tmp_path / "main.py", "print(f'{1}')\n")
+    mp = _fake_flash_mp(version="1.22.0")
+
+    with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "flash", "COM3", str(source), "/main.py",
             "--dry-run", "--check=strict", "--mp-version", "1.16",
@@ -348,13 +416,54 @@ def test_flash_strict_with_mp_version_fails_before_mp_factory(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "f-string requires micropython v1.17+" in result.output.lower()
+    mp.flash_file.assert_not_called()
+
+
+def test_flash_program_manifest_precheck_uses_detected_device_tags(tmp_path: Path):
+    _write(tmp_path / "wifi_case.py", "def broken(:\n    pass\n")
+    manifest = _write(
+        tmp_path / "manifest.py",
+        'module("wifi_case.py", features=["wifi"])\n',
+    )
+    mp = _fake_flash_mp()
+    mp.detect_tags.return_value = {"USB_ONLY"}
+
+    with patch("cli.main._mp_factory", return_value=mp):
+        result = runner.invoke(app, [
+            "flash-program", "COM3", str(tmp_path), "/app",
+            "--manifest", str(manifest), "--dry-run",
+        ])
+
+    assert result.exit_code == 0
+    mp.flash_program.assert_called_once()
+    assert mp.flash_program.call_args.kwargs["active_tags"] == {"USB_ONLY"}
+
+
+def test_flash_program_manifest_precheck_uses_explicit_target_over_detected_tags(tmp_path: Path):
+    _write(tmp_path / "wifi_case.py", "def broken(:\n    pass\n")
+    manifest = _write(
+        tmp_path / "manifest.py",
+        'module("wifi_case.py", features=["wifi"])\n',
+    )
+    mp = _fake_flash_mp()
+    mp.config.board_tags = {"ESP32": ["ESP32", "wifi"]}
+    mp.detect_tags.return_value = {"USB_ONLY"}
+
+    with patch("cli.main._mp_factory", return_value=mp):
+        result = runner.invoke(app, [
+            "flash-program", "COM3", str(tmp_path), "/app",
+            "--manifest", str(manifest), "--dry-run", "--target", "ESP32",
+        ])
+
+    assert result.exit_code == 1
+    assert "precheck failed" in result.output.lower()
+    mp.detect_tags.assert_not_called()
+    mp.flash_program.assert_not_called()
 
 
 def test_flash_no_check_skips_precheck(tmp_path: Path):
     source = _write(tmp_path / "main.py", "def broken(:\n    pass\n")
-    mp = MagicMock()
-    mp.get_mpy_version.return_value = (6, "xtensawin")
-    mp.detect_tags.return_value = {"ESP32"}
+    mp = _fake_flash_mp()
 
     with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
@@ -365,28 +474,35 @@ def test_flash_no_check_skips_precheck(tmp_path: Path):
     mp.connect.assert_called_once()
 
 
-def test_flash_program_dry_run_precheck_runs_before_mp_factory(tmp_path: Path):
+def test_flash_program_dry_run_precheck_runs_after_device_probe(tmp_path: Path):
     _write(tmp_path / "main.py", "def broken(:\n    pass\n")
+    mp = _fake_flash_mp()
 
-    with patch("cli.main._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "flash-program", "COM3", str(tmp_path), "/app", "--dry-run",
         ])
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp._enter_raw_repl.assert_called_once()
+    mp.flash_program.assert_not_called()
 
 
-def test_project_flash_dry_run_precheck_runs_before_mp_factory(tmp_path: Path):
+def test_project_flash_dry_run_precheck_runs_after_device_probe(tmp_path: Path):
     _write(tmp_path / "main.py", "def broken(:\n    pass\n")
+    mp = _fake_flash_mp()
 
-    with patch("cli.reg_commands.project._mp_factory", side_effect=AssertionError("must not connect")):
+    with patch("cli.reg_commands.project._mp_factory", return_value=mp):
         result = runner.invoke(app, [
             "project", "flash", "COM3", str(tmp_path), "/app", "--dry-run",
         ])
 
     assert result.exit_code == 1
     assert "precheck failed" in result.output.lower()
+    mp.connect.assert_called_once()
+    mp._enter_raw_repl.assert_called_once()
 
 
 def test_project_precheck_filters_to_incremental_changed_entries(tmp_path: Path):

@@ -16,11 +16,15 @@ from cli.utils.flash import (
     FLASH_DELTA,
     FLASH_PROGRAM,
     MicroPython,
+    DeviceRuntimeInfo,
     _build_inline_batch_verify_code,
     _build_inline_verify_code,
     _colorize_repl_output,
     _compute_block_crc32,
     _load_mp_script,
+    _merge_runtime_info,
+    _parse_runtime_probe_output,
+    _runtime_info_from_banner,
     _WindowsReplEchoFilter,
     _WindowsReplLineEditor,
     _windows_repl_input_reader,
@@ -35,6 +39,74 @@ _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
+
+
+class TestDeviceRuntimeInfo:
+    def test_runtime_info_from_banner_extracts_version_and_machine(self):
+        info = _runtime_info_from_banner(
+            b"MicroPython v1.22.2 on 2024-02-22; ESP32 module with ESP32\r\n>>> "
+        )
+
+        assert info.banner.startswith("MicroPython v1.22.2")
+        assert info.implementation == "micropython"
+        assert info.version == "1.22.2"
+        assert info.machine == "ESP32 module with ESP32"
+
+    def test_runtime_probe_output_extracts_version_platform_and_mpy(self):
+        info = _parse_runtime_probe_output(
+            "\n".join([
+                "PYRITE_INFO|implementation|micropython",
+                "PYRITE_INFO|version|1.22.0",
+                "PYRITE_INFO|platform|esp32",
+                "PYRITE_INFO|machine|ESP32-S3 module",
+                "PYRITE_INFO|release|1.22.0",
+                "PYRITE_INFO|mpy|9734",
+            ])
+        )
+
+        assert info.implementation == "micropython"
+        assert info.version == "1.22.0"
+        assert info.platform == "esp32"
+        assert info.machine == "ESP32-S3 module"
+        assert info.release == "1.22.0"
+        assert info.mpy_version == 6
+        assert info.arch == "xtensa"
+
+    def test_runtime_probe_keeps_preview_version_from_banner(self):
+        base = DeviceRuntimeInfo(version="1.29.0-preview")
+        update = _parse_runtime_probe_output("PYRITE_INFO|version|1.29.0\n")
+
+        info = _merge_runtime_info(base, update)
+
+        assert info.version == "1.29.0-preview"
+
+    def test_runtime_probe_version_tuple_preserves_preview_suffix(self):
+        info = _parse_runtime_probe_output("PYRITE_INFO|version|1.29.0.preview.0\n")
+
+        assert info.version == "1.29.0-preview"
+
+    def test_get_mpy_version_reuses_cached_runtime_info(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        mp.runtime_info = DeviceRuntimeInfo(mpy_version=6, arch="xtensawin")
+        monkeypatch.setattr(
+            mp,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("cached mpy info should be used"),
+        )
+
+        assert mp.get_mpy_version() == (6, "xtensawin")
+
+    def test_detect_tags_reuses_cached_runtime_info(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        mp.config.board_tags = {"ESP32-S3": ["ESP32", "wifi"]}
+        mp.runtime_info = DeviceRuntimeInfo(platform="esp32", machine="ESP32-S3 module")
+        monkeypatch.setattr(
+            mp,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("cached board info should be used"),
+        )
+
+        assert mp.detect_tags() == {"ESP32", "wifi", "ESP32"}
 
 
 class TestColorizeReplOutput:
@@ -944,6 +1016,34 @@ class TestRawReplBaudFallback:
         assert mp.baudrate == 115200
         assert ("fs", 115200) in calls
         assert ("execute", 115200) in calls
+
+    def test_init_device_state_probes_runtime_info_once_per_connection(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        calls = []
+
+        monkeypatch.setattr(
+            mp,
+            "_try_raw_repl_sequence",
+            lambda: calls.append("raw") or (True, b"raw REPL; CTRL-B to exit\r\n>"),
+        )
+        monkeypatch.setattr(mp, "_ensure_filesystem_mounted", lambda: calls.append("fs"))
+
+        def fake_execute(code, **_kwargs):
+            calls.append(code)
+            if "PYRITE_INFO|" in code:
+                return "PYRITE_INFO|version|1.12.0\nPYRITE_INFO|platform|esp32\n"
+            return ""
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+
+        mp._init_device_state()
+        mp._init_device_state()
+
+        runtime_probes = [
+            call for call in calls
+            if isinstance(call, str) and "PYRITE_INFO|" in call
+        ]
+        assert len(runtime_probes) == 1
 
 
 class TestFlashBatchHelpers:

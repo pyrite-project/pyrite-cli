@@ -27,6 +27,31 @@ from ..utils.config import _load_config
 project_app = typer.Typer(help="项目脚手架、存根、文件哈希与增量刷入", add_completion=False)
 
 
+def _device_precheck_mp_version(mp, explicit_version: Optional[str]) -> Optional[str]:
+    if explicit_version is not None:
+        return explicit_version
+    version = getattr(getattr(mp, "runtime_info", None), "version", None)
+    return version if isinstance(version, str) and version.strip() else None
+
+
+def _resolve_flash_tags(
+    mp,
+    target: Optional[str],
+    feature: Optional[str],
+    no_feature: Optional[str],
+) -> set[str]:
+    if target:
+        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
+        active_tags.add(target.upper())
+    else:
+        active_tags = set(mp.detect_tags())
+        if not active_tags:
+            log.error("无法识别设备 target，请使用 --target 手动指定")
+            raise typer.Exit(1)
+    _apply_feature_options(active_tags, feature, no_feature)
+    return active_tags
+
+
 def register(app: typer.Typer) -> None:
     app.add_typer(project_app, name="project")
 
@@ -40,27 +65,6 @@ def _apply_feature_options(
         active_tags.update(t.strip() for t in feature.split(",") if t.strip())
     if no_feature:
         active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
-
-
-def _tags_from_cli(
-    cfg,
-    target: Optional[str],
-    feature: Optional[str],
-    no_feature: Optional[str],
-) -> Optional[set[str]]:
-    active_tags: Optional[set[str]]
-    if target:
-        active_tags = set(cfg.board_tags.get(target.upper(), [target.upper()]))
-        active_tags.add(target.upper())
-    else:
-        active_tags = None
-    if feature:
-        if active_tags is None:
-            active_tags = set()
-        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
-    if no_feature and active_tags is not None:
-        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
-    return active_tags
 
 
 def _run_precheck_or_exit(
@@ -85,11 +89,11 @@ def _run_precheck_or_exit(
             mp_version=mp_version if mp_version is not None else cfg.precheck_mp_version,
         )
     except ValueError as exc:
-        log.error("%s", exc)
-        raise typer.Exit(2) from exc
+        log.error("%s", exc, exc_info=False)
+        raise typer.Exit(2) from None
     except PrecheckError as exc:
-        log.error("precheck failed:\n%s", exc)
-        raise typer.Exit(1) from exc
+        log.error("precheck failed:\n%s", exc, exc_info=False)
+        raise typer.Exit(1) from None
     for item in report.warnings:
         log.warning("%s", item.format())
 
@@ -257,24 +261,6 @@ def project_flash(
     check = _consume_check_option(list(ctx.args))
     if locked and manifest is None:
         manifest = str(Path(directory) / "manifest.py")
-    cfg = _load_config()
-    precheck_tags = _tags_from_cli(cfg, target, feature, no_feature)
-    if not no_check:
-        from ..utils.precheck import collect_project_precheck_entries
-
-        _run_precheck_or_exit(
-            collect_project_precheck_entries(
-                directory,
-                remote_path,
-                hash_config_path=hash_config,
-                active_tags=precheck_tags,
-                manifest_path=manifest,
-            ),
-            check,
-            no_check,
-            active_tags=precheck_tags,
-            mp_version=mp_version,
-        )
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     lock_checked = False
     if locked and target:
@@ -292,18 +278,27 @@ def project_flash(
         lock_checked = True
     try:
         mp.connect()
+        mp._enter_raw_repl()
+        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        if not no_check:
+            from ..utils.precheck import collect_project_precheck_entries
+
+            _run_precheck_or_exit(
+                collect_project_precheck_entries(
+                    directory,
+                    remote_path,
+                    hash_config_path=hash_config,
+                    active_tags=active_tags,
+                    manifest_path=manifest,
+                ),
+                check,
+                no_check,
+                active_tags=active_tags,
+                mp_version=_device_precheck_mp_version(mp, mp_version),
+            )
         if no_compile:
             mp.config.auto_compile = False
         ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        if target:
-            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-            active_tags.add(target.upper())
-        else:
-            active_tags = mp.detect_tags()
-            if not active_tags:
-                log.error("无法识别设备 target，请使用 --target 手动指定")
-                raise typer.Exit(1)
-        _apply_feature_options(active_tags, feature, no_feature)
         if locked and not lock_checked:
             _check_project_manifest_lock(
                 manifest,

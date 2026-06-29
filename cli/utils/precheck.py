@@ -320,6 +320,32 @@ _FEATURE_RULES: dict[str, _FeatureRule] = {
 _VERSION_TOKEN_RE = re.compile(r"v?\d+(?:\.\d+)*(?:-(?:preview|rc\d+))?", re.IGNORECASE)
 
 
+def _release_parts(tag: str) -> Optional[tuple[int, ...]]:
+    match = re.fullmatch(r"v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", tag)
+    if not match:
+        return None
+    parts = [int(part) for part in match.groups() if part is not None]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _minor_floor_tag(tag: str) -> Optional[str]:
+    target = _release_parts(tag)
+    if target is None or len(target) < 2:
+        return None
+    best: Optional[str] = None
+    best_parts: Optional[tuple[int, ...]] = None
+    for known in _MICROPYTHON_TAG_ORDER:
+        parts = _release_parts(known)
+        if parts is None or parts[:2] != target[:2] or parts > target:
+            continue
+        if best_parts is None or parts > best_parts:
+            best = known
+            best_parts = parts
+    return best
+
+
 def normalize_micropython_version(version: Optional[str]) -> Optional[str]:
     """Return the generated MicroPython tag for a user/device version string."""
     if version in (None, ""):
@@ -342,6 +368,13 @@ def normalize_micropython_version(version: Optional[str]) -> Optional[str]:
             patch_zero = exact + ".0"
             if patch_zero in _TAG_INDEX:
                 return patch_zero
+        if re.fullmatch(r"v\d+\.\d+\.0", exact):
+            minor_tag = exact[:-2]
+            if minor_tag in _TAG_INDEX:
+                return minor_tag
+        floor_tag = _minor_floor_tag(exact)
+        if floor_tag is not None:
+            return floor_tag
     raise ValueError(
         "unknown MicroPython version for precheck: "
         f"{version!r}; known range is {_MICROPYTHON_TAG_ORDER[0]}..{_MICROPYTHON_TAG_ORDER[-1]}"
@@ -1013,6 +1046,19 @@ def _versioned_strict_items(
     return items
 
 
+def _versioned_hard_error_items(
+    uses: Iterable[_FeatureUse],
+    path: str,
+    remote_path: str,
+    target_tag: str,
+) -> list[PrecheckItem]:
+    return [
+        item
+        for item in _versioned_strict_items(uses, path, remote_path, "warn", target_tag)
+        if item.severity == "error"
+    ]
+
+
 def _strict_items_from_uses(
     uses: Iterable[_FeatureUse],
     path: str,
@@ -1083,7 +1129,7 @@ def run_precheck(
             continue
 
         token_uses: list[_FeatureUse] = []
-        if mode == "strict":
+        if mode == "strict" or target_tag is not None:
             try:
                 token_uses = _scan_source_features(source)
             except (tokenize.TokenError, IndentationError) as exc:
@@ -1095,6 +1141,8 @@ def run_precheck(
             items.append(_syntax_error_item(path, remote, exc))
             if mode == "strict" and token_uses:
                 items.extend(_strict_items_from_uses(token_uses, path, remote, compat, target_tag))
+            elif target_tag is not None and token_uses:
+                items.extend(_versioned_hard_error_items(token_uses, path, remote, target_tag))
             continue
 
         try:
@@ -1112,6 +1160,13 @@ def run_precheck(
 
         if mode == "strict":
             items.extend(_strict_items(tree, source, path, remote, compat, target_tag))
+        elif target_tag is not None:
+            items.extend(_versioned_hard_error_items(
+                _detect_feature_uses(tree, source),
+                path,
+                remote,
+                target_tag,
+            ))
 
     report = PrecheckReport(tuple(items))
     if not report.ok:

@@ -213,6 +213,23 @@ def test_jsonl_handler_level_filter():
         assert "ERROR" in levels
 
 
+def test_logger_error_can_suppress_current_exception_trace(capsys):
+    log = Logger("test")
+    original_level = get_level()
+    set_level(ERROR)
+    try:
+        try:
+            raise ValueError("internal")
+        except ValueError:
+            log.error("business error", exc_info=False)
+    finally:
+        set_level(original_level)
+
+    captured = capsys.readouterr()
+    assert "business error" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_jsonl_handler_operation_fields():
     with tempfile.TemporaryDirectory() as tmp:
         log_path = os.path.join(tmp, "test_op.log")

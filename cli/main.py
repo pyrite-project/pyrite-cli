@@ -11,7 +11,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import http.client
 from importlib import import_module
 from typing import List, Optional
@@ -21,6 +20,7 @@ import click
 import typer
 
 from . import __version__
+from .reg_commands import register_command_groups
 
 from .utils.board_profile import (
     BoardProfileError,
@@ -253,7 +253,7 @@ def _fetch_brief(port: str) -> str:
         return ""
     finally:
         mp.disconnect()
-    lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
     return "  " + "  ".join(lines) if lines else ""
 
 
@@ -1025,9 +1025,6 @@ def remount(
 
 # command groups
 # ═══════════════════════════════════════════════════════════════════
-
-from .reg_commands import register_command_groups
-
 
 register_command_groups(app)
 

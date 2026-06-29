@@ -862,7 +862,6 @@ class ProjectSyncManager:
                             except Exception:
                                 pass
                 if expected_total >= 0:
-                    raw_len = len(buf) - raw_start
                     raw = _strip_repl_trailer(buf[raw_start:])
                     if len(raw) >= expected_total:
                         time.sleep(0.05)

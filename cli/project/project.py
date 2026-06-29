@@ -48,7 +48,7 @@ def detect_device_info(
     finally:
         mp.disconnect()
 
-    lines = [l.strip() for l in output.strip().split("\n") if l.strip()]
+    lines = [line.strip() for line in output.strip().split("\n") if line.strip()]
     if len(lines) < 2:
         raise RuntimeError(f"设备返回数据异常:\n{output}")
 

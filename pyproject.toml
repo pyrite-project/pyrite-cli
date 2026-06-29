@@ -58,6 +58,9 @@ testpaths = [
     "test/test_trace.py",
 ]
 
+[tool.ruff]
+extend-exclude = ["cli/utils/flash/mp_scripts"]
+
 [tool.mypy]
 python_version = "3.10"
 warn_unused_configs = true

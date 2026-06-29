@@ -20,6 +20,24 @@ from ..config import DEFAULT_CHUNK_SIZE
 from ..log import get_logger
 from ..transport import SerialTransport
 from . import core as _core
+from .core import (
+    BATCH_ACK_EVERY,
+    EXIT_RAW_REPL,
+    FLASH,
+    FLASH_DELTA,
+    FLASH_PROGRAM,
+    MicroPythonBase,
+    SET_EXECUTE,
+    SET_RESET,
+    _WindowsReplEchoFilter,
+    _WindowsReplLineEditor,
+    _build_inline_batch_verify_code,
+    _build_inline_verify_code,
+    _colorize_repl_output,
+    _compute_block_crc32,
+    _strip_repl_trailer,
+    _windows_repl_input_reader,
+)
 
 try:
     from tqdm import tqdm
@@ -1250,7 +1268,7 @@ class MicroPython(MicroPythonBase):
             log.debug("设备 tag 检测失败: %s", e)
             return set()
 
-        lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+        lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
         combined = " ".join(lines).upper()
         board_tags = self.config.board_tags
         tags: Set[str] = set()

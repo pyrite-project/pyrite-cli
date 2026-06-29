@@ -33,7 +33,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, TextIO
+from typing import Any, Dict, Iterator, List, Optional, TextIO
 
 DEFAULT_JSON_LOG_NAME = "pyrite.jsonl"
 DEFAULT_TEXT_LOG_NAME = "pyrite.log"

@@ -15,7 +15,7 @@ from ..utils.board_profile import (
     BoardProfileStore,
     resolve_port_alias,
 )
-from ..utils.config import DEFAULT_BAUDRATE
+from ..utils.config import DEFAULT_BAUDRATE as DEFAULT_BAUDRATE
 from ..utils.log import get_logger
 
 log = get_logger(__name__)

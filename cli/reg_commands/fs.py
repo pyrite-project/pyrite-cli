@@ -66,7 +66,6 @@ def _read_one_key() -> str:
             return "q"
         return "enter"
     except ImportError:
-        import select
         import termios
         import tty
         fd = sys.stdin.fileno()

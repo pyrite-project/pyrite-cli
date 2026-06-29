@@ -6,7 +6,7 @@ import typer
 
 
 def register_command_groups(app: typer.Typer) -> None:
-    from . import board, debug, device, device_test, fs, manifest, pkg, project, trace
+    from . import board, debug, device, device_test, fs, manifest, pkg, project, trace, tunnel
 
     board.register(app)
     debug.register(app)
@@ -17,3 +17,4 @@ def register_command_groups(app: typer.Typer) -> None:
     fs.register(app)
     device_test.register(app)
     trace.register(app)
+    tunnel.register(app)

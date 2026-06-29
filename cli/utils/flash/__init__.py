@@ -9,4 +9,6 @@ for _name in _export_names:
 
 __all__ = _export_names
 
+MicroPython = _flash.MicroPython
+
 del _export_names, _name

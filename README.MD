@@ -267,12 +267,12 @@ C3 = ["ESP32", "wifi"]
 
 | Topic | Document |
 |-------|----------|
-| First steps, commands, config | [快速上手](docs/快速上手.md) |
-| Flashing protocol and project sync | [设备刷入与项目同步](docs/设备刷入与项目同步.md) |
+| First steps, commands, config | [Quick Start](docs/quick-start.md) |
+| Flashing protocol and project sync | [Device Flashing and Project Sync](docs/device-flashing-and-project-sync.md) |
 | Conditional compilation guide | [Conditional Compilation: Practical Guide](docs/conditional-compilation-guide.md) |
-| Conditional compilation, Chinese | [条件编译实战](docs/条件编译实战.md) |
-| WebDAV desktop mount | [WebDAV 挂载](docs/WebDAV挂载.md) |
-| v0.0.3 implementation notes | [v0.0.3 计划](docs/v0.0.3-plan.md) |
+| Conditional compilation syntax | [Conditional Compilation & Macro Preprocessing](docs/条件编译与宏预处理_EN.md) |
+| WebDAV desktop mount | [WebDAV Mount](docs/webdav-mount.md) |
+| MicroPython firmware feature probes | [MicroPython Firmware Feature Probes](docs/micropython-firmware-feature-probes.md) |
 | Architecture notes | [Architecture](docs/architecture.md) |
 
 ## Command Reference
@@ -330,7 +330,3 @@ C3 = ["ESP32", "wifi"]
 | `pkg install` | Run or dry-run `mpremote mip install` for a package name or URL |
 | `pkg cache` | Plan local cache paths and audit local package metadata |
 | `pkg install-offline` | Install a local `package.json` or package directory through `mpremote mip` |
-
-## v0.0.3 Status
-
-`pyrcli` v0.0.3 removes firmware flashing, adds `remount`, `pkg`, and `monitor`, and splits flash/transport internals into smaller packages. `pkg cache` is an audit/planning surface for now; package installation itself is delegated to `mpremote mip install`.

@@ -271,11 +271,9 @@ C3 = ["ESP32", "wifi"]
 |------|------|
 | 入门、命令、配置 | [快速上手](docs/快速上手.md) |
 | 刷入协议与项目同步 | [设备刷入与项目同步](docs/设备刷入与项目同步.md) |
-| 条件编译指南 | [Conditional Compilation: Practical Guide](docs/conditional-compilation-guide.md) |
-| 条件编译中文实战 | [条件编译实战](docs/条件编译实战.md) |
+| 条件编译实战 | [条件编译实战](docs/条件编译实战.md) |
 | WebDAV 桌面挂载 | [WebDAV 挂载](docs/WebDAV挂载.md) |
-| v0.0.3 实现说明 | [v0.0.3 计划](docs/v0.0.3-plan.md) |
-| 架构说明 | [Architecture](docs/architecture.md) |
+| MicroPython 固件能力探测 | [MicroPython 表层可探测固件能力清单](docs/mp_firm_featswitch.md) |
 
 ## 命令参考
 
@@ -332,7 +330,3 @@ C3 = ["ESP32", "wifi"]
 | `pkg install` | 对包名或 URL 执行或预览 `mpremote mip install` |
 | `pkg cache` | 规划本地缓存路径并审计本地包元数据 |
 | `pkg install-offline` | 通过 `mpremote mip` 安装本地 `package.json` 或包目录 |
-
-## v0.0.3 状态
-
-`pyrcli` v0.0.3 已移除固件刷入，并加入 `remount`、`pkg`、`monitor`，同时把 flash/transport 内部结构拆成更小的包。`pkg cache` 当前是审计和规划入口；实际包安装委托 `mpremote mip install`。

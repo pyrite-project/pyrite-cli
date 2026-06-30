@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import click
 from typer.testing import CliRunner
 
 from cli.main import app, _normalize_optional_value_flags
@@ -402,12 +403,13 @@ def test_dev_session_once_test_failure_exits_for_ci(tmp_path: Path):
 
 def test_project_dev_help_exposes_lens_and_test_on_save_options():
     result = runner.invoke(app, ["project", "dev", "--help"])
+    help_text = click.utils.strip_ansi(result.stdout)
 
     assert result.exit_code == 0
-    assert "--lens" in result.stdout
-    assert "--open-editor" in result.stdout
-    assert "--test-on-save" in result.stdout
-    assert "--test-path" in result.stdout
+    assert "--lens" in help_text
+    assert "--open-editor" in help_text
+    assert "--test-on-save" in help_text
+    assert "--test-path" in help_text
 
 
 def test_project_dev_normalizes_bare_test_on_save_flag():

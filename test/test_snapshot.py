@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 from typer.testing import CliRunner
 
 from cli.main import app
@@ -162,9 +163,10 @@ def test_snapshot_cli_help_is_registered():
 
 def test_project_flash_help_exposes_snapshot_before():
     result = runner.invoke(app, ["project", "flash", "--help"])
+    help_text = click.utils.strip_ansi(result.stdout)
 
     assert result.exit_code == 0
-    assert "--snapshot-before" in result.stdout
+    assert "--snapshot-before" in help_text
 
 
 def test_save_device_snapshot_uses_temp_download_area(tmp_path: Path):

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
 from cli.main import app
-from cli.reg_commands.snapshot import save_device_snapshot
+from cli.reg_commands.snapshot import _current_index_from_device, save_device_snapshot
 from cli.utils.snapshot import (
     SnapshotEntry,
     SnapshotManifest,
@@ -14,6 +16,7 @@ from cli.utils.snapshot import (
     build_restore_plan,
     filter_device_entries,
     load_snapshot_manifest,
+    manifest_common_remote_root,
     safe_snapshot_name,
     save_snapshot_files,
     sha256_file,
@@ -128,6 +131,22 @@ def test_restore_plan_defaults_to_dry_run_until_apply_requested():
     assert [item.path for item in dry.overwrite] == ["/main.py"]
 
 
+def test_manifest_common_remote_root_uses_snapshot_parent():
+    manifest = SnapshotManifest(
+        name="before",
+        created_at="2026-06-30T00:00:00Z",
+        device="COM9",
+        include=[],
+        exclude=[],
+        files=[
+            SnapshotEntry("/app/main.py", "files/app/main.py", 1, "a"),
+            SnapshotEntry("/app/lib/a.py", "files/app/lib/a.py", 1, "b"),
+        ],
+    )
+
+    assert manifest_common_remote_root(manifest) == "/app"
+
+
 def test_snapshot_cli_help_is_registered():
     for args in [
         ["snapshot", "--help"],
@@ -168,3 +187,53 @@ def test_save_device_snapshot_uses_temp_download_area(tmp_path: Path):
     assert manifest.files[0].path == "/main.py"
     assert (tmp_path / "before" / "files" / "main.py").exists()
     assert not (tmp_path / "before" / "download").exists()
+
+
+def test_snapshot_save_cli_calls_device_snapshot_helper(tmp_path: Path):
+    mp = MagicMock()
+    manifest = SnapshotManifest(
+        name="before",
+        created_at="2026-06-30T00:00:00Z",
+        device="COM9",
+        include=[],
+        exclude=[],
+        files=[],
+    )
+
+    with patch("cli.reg_commands.snapshot._mp_factory", return_value=mp), patch(
+        "cli.reg_commands.snapshot.save_device_snapshot",
+        return_value=manifest,
+    ) as save:
+        result = runner.invoke(app, [
+            "snapshot",
+            "save",
+            "COM9",
+            "before",
+            "--remote-path",
+            "/app",
+            "--output-dir",
+            str(tmp_path),
+        ])
+
+    assert result.exit_code == 0, result.stdout
+    save.assert_called_once()
+    assert save.call_args.kwargs["name"] == "before"
+    assert save.call_args.kwargs["remote_path"] == "/app"
+    mp.connect.assert_called_once()
+    mp.disconnect.assert_called_once()
+
+
+def test_current_index_from_device_hashes_downloaded_files(tmp_path: Path):
+    class MP:
+        def fs_ls_recursive(self, _remote_path):
+            return [{"name": "/app/main.py", "type": "F", "size": "9"}]
+
+        def fs_get(self, _remote_path, local_path):
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(local_path).write_bytes(b"print(1)\n")
+            return 9
+
+    index = _current_index_from_device(MP(), "/app")
+
+    assert index["/app/main.py"]["size"] == 9
+    assert index["/app/main.py"]["sha256"] == hashlib.sha256(b"print(1)\n").hexdigest()

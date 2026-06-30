@@ -270,6 +270,18 @@ def build_restore_plan(
     )
 
 
+def manifest_common_remote_root(manifest: SnapshotManifest) -> str:
+    paths = [normalize_device_path(entry.path) for entry in manifest.files]
+    if not paths:
+        return "/"
+    dirs = []
+    for path in paths:
+        parent = posixpath.dirname(path)
+        dirs.append(parent if parent else "/")
+    common = posixpath.commonpath(dirs)
+    return normalize_device_path(common)
+
+
 def format_snapshot_plan(plan: SnapshotDiffPlan) -> str:
     lines: list[str] = []
     if isinstance(plan, SnapshotRestorePlan):

@@ -15,9 +15,11 @@ from ..utils.snapshot import (
     filter_device_entries,
     format_snapshot_plan,
     load_snapshot_manifest,
+    manifest_common_remote_root,
     normalize_device_path,
     safe_snapshot_name,
     save_snapshot_files,
+    sha256_file,
     snapshot_path,
 )
 from .common import _complete_port, _mp_factory, _norm_path, log
@@ -99,7 +101,7 @@ def snapshot_save(
         mp.connect()
         manifest = save_device_snapshot(
             mp,
-            name,
+            name=name,
             port=port,
             remote_path=remote_path,
             include=include,
@@ -159,6 +161,11 @@ def snapshot_restore(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     name: str = typer.Argument(..., help="快照名称"),
     output_dir: str = typer.Option(SNAPSHOT_DIR, "--output-dir", help="本地快照根目录"),
+    remote_path: Optional[str] = typer.Option(
+        None,
+        "--remote-path",
+        help="设备端恢复对比根路径；默认使用快照文件共同父目录",
+    ),
     apply: bool = typer.Option(False, "--apply", help="执行恢复；默认只 dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认，与 --apply 一起使用"),
     baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
@@ -172,7 +179,8 @@ def snapshot_restore(
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
-        current = _current_index_from_device(mp, "/")
+        scan_root = _norm_path(remote_path) if remote_path else manifest_common_remote_root(manifest)
+        current = _current_index_from_device(mp, scan_root)
         plan = build_restore_plan(manifest, current, apply=apply)
         typer.echo(format_snapshot_plan(plan))
         if plan.dry_run:
@@ -190,31 +198,20 @@ def snapshot_restore(
 def _current_index_from_device(mp, remote_path: str):
     entries = mp.fs_ls_recursive(remote_path)
     current = []
-    for entry in entries:
-        if entry.get("type") != "F":
-            continue
-        remote = normalize_device_path(str(entry["name"]))
-        current.append({
-            "path": remote,
-            "size": int(str(entry.get("size") or "0")),
-            "sha256": _device_sha256(mp, remote),
-        })
+    with tempfile.TemporaryDirectory(prefix="pyrite-snapshot-diff-") as temp_dir:
+        temp_root = Path(temp_dir)
+        for entry in entries:
+            if entry.get("type") != "F":
+                continue
+            remote = normalize_device_path(str(entry["name"]))
+            local_path = temp_root / remote.strip("/")
+            mp.fs_get(remote, str(local_path))
+            current.append({
+                "path": remote,
+                "size": int(str(entry.get("size") or "0")),
+                "sha256": sha256_file(local_path),
+            })
     return build_current_index(current)
-
-
-def _device_sha256(mp, remote_path: str) -> str:
-    script = (
-        "import hashlib\n"
-        f"p={remote_path!r}\n"
-        "h=hashlib.sha256()\n"
-        "with open(p,'rb') as f:\n"
-        " while True:\n"
-        "  b=f.read(512)\n"
-        "  if not b: break\n"
-        "  h.update(b)\n"
-        "print(h.hexdigest())\n"
-    )
-    return mp.run(script).strip().splitlines()[-1]
 
 
 def _apply_restore_plan(mp, snap_dir: Path, plan) -> None:

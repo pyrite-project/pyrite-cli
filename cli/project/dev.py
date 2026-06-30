@@ -13,6 +13,12 @@ from typing import Callable, Optional, Set
 
 from ..utils.ui import _GREEN, _RESET, _YELLOW
 from ..utils.config import DEFAULT_BAUDRATE, HASH_CONFIG_FILE
+from ..utils.device_tests import (
+    DeviceTestPlan,
+    DeviceTestSession,
+    discover_device_tests,
+    run_device_test_plan,
+)
 from ..utils.log import get_logger
 from .sync import ProjectSyncManager
 
@@ -56,10 +62,15 @@ class DevOptions:
     auto_run: bool = False
     no_repl: bool = False
     map_traceback: bool = False
+    lens: bool = False
+    open_editor: bool = False
     once: bool = False
     poll_interval: float = 0.3
     debounce: float = 0.5
     on_error: str = "continue"
+    test_on_save: str = "off"
+    test_path: Optional[str] = None
+    test_timeout: int = 10
     changed_paths: Optional[Set[str]] = field(default=None, repr=False)
 
 
@@ -153,6 +164,7 @@ class DevSession:
         *,
         mp_factory: Callable[..., object],
         manager_factory: Callable[[object], ProjectSyncManager] = ProjectSyncManager,
+        test_runner: Callable[..., DeviceTestSession] = run_device_test_plan,
         stderr=None,
     ) -> None:
         self.options = options
@@ -164,6 +176,7 @@ class DevSession:
             options.password,
         )
         self.manager = manager_factory(self.mp)
+        self.test_runner = test_runner
         self.stderr = stderr if stderr is not None else sys.stderr
         self._stop = threading.Event()
         self._sync_queue: queue.Queue[Optional[Set[str]]] = queue.Queue()
@@ -221,6 +234,7 @@ class DevSession:
         self._ensure_device_context()
         self._write_busy()
         success = False
+        results = []
         try:
             results = self.manager.flash(
                 self.options.local_dir,
@@ -240,6 +254,10 @@ class DevSession:
             if success and self.options.auto_run and not self.options.dry_run:
                 self.soft_reboot()
             self._write_ready()
+            if success and self._tests_enabled() and not self.options.dry_run:
+                test_ok = self._run_tests_after_sync(changed_paths)
+                if self.options.once and not test_ok:
+                    raise SystemExit(1)
 
     def process_pending_sync(self) -> None:
         changed = self._drain_sync_queue()
@@ -361,7 +379,7 @@ class DevSession:
             log.debug("return to repl skipped: %s", exc)
 
     def _traceback_output_mapper(self):
-        if not self.options.map_traceback:
+        if not (self.options.map_traceback or self.options.lens):
             return None
         from ..utils.traceback_map import create_traceback_output_mapper
 
@@ -371,7 +389,84 @@ class DevSession:
             manifest_path=self.options.manifest_path,
             active_tags=self._active_tags or set(),
             auto_compile=not self.options.no_compile,
+            lens=self.options.lens,
+            open_editor=self.options.open_editor,
         )
+
+    def _tests_enabled(self) -> bool:
+        return self.options.test_on_save != "off"
+
+    def _run_tests_after_sync(self, changed_paths: Optional[Set[str]]) -> bool:
+        try:
+            plan = self._discover_test_plan(changed_paths)
+        except FileNotFoundError as exc:
+            self.stderr.write(f"[test] {exc}; skipping\n")
+            self.stderr.flush()
+            return True
+        except ValueError as exc:
+            self.stderr.write(f"[test] {exc}; skipping\n")
+            self.stderr.flush()
+            return True
+
+        if not plan.files:
+            self.stderr.write("[test] no matching device tests; skipping\n")
+            self.stderr.flush()
+            return True
+
+        self.stderr.write(f"[test] running {len(plan.files)} device tests...\n")
+        self.stderr.flush()
+        try:
+            session = self.test_runner(
+                self.mp,
+                plan,
+                timeout=self.options.test_timeout,
+                keep_files=False,
+            )
+        except Exception as exc:
+            self.stderr.write(f"[test] ERROR device test run failed: {exc}\n")
+            self.stderr.flush()
+            return False
+
+        mapper = self._traceback_output_mapper()
+        by_path = {result.remote_path: result for result in session.results}
+        for item in session.plan.files:
+            result = by_path.get(item.remote_path)
+            if result is None:
+                self.stderr.write(f"[test] MISS {item.relative_path} (no result)\n")
+                continue
+            label = result.status.upper()
+            self.stderr.write(
+                f"[test] {label} {item.relative_path}  {result.duration_ms}ms\n"
+            )
+            if result.stdout:
+                self._write_test_block(result.stdout, mapper)
+            if result.error:
+                self._write_test_block(result.error, mapper)
+        self.stderr.flush()
+        return session.ok
+
+    def _discover_test_plan(
+        self,
+        changed_paths: Optional[Set[str]],
+    ) -> DeviceTestPlan:
+        selected_path = self.options.test_path
+        plan = discover_device_tests(
+            selected_path,
+            cwd=self.options.local_dir,
+        )
+        if self.options.test_on_save != "changed":
+            return plan
+
+        selected = _filter_changed_tests(plan, changed_paths)
+        if not selected:
+            return DeviceTestPlan(files=[], remote_dir=plan.remote_dir)
+        return DeviceTestPlan(files=selected, remote_dir=plan.remote_dir)
+
+    def _write_test_block(self, text: str, mapper) -> None:
+        if mapper is not None:
+            text = mapper(text)
+        for line in text.splitlines():
+            self.stderr.write(f"    {line}\n")
 
     def _disconnect(self) -> None:
         try:
@@ -393,12 +488,14 @@ def run_project_dev(
     *,
     mp_factory: Callable[..., object],
     manager_factory: Callable[[object], ProjectSyncManager] = ProjectSyncManager,
+    test_runner: Callable[..., DeviceTestSession] = run_device_test_plan,
     stderr=None,
 ) -> None:
     DevSession(
         options,
         mp_factory=mp_factory,
         manager_factory=manager_factory,
+        test_runner=test_runner,
         stderr=stderr,
     ).run()
 
@@ -407,3 +504,45 @@ def _split_tags(value: Optional[str]) -> Set[str]:
     if not value:
         return set()
     return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def normalize_test_on_save(value: Optional[str | bool]) -> str:
+    if value is None or value is False:
+        return "off"
+    if value is True:
+        return "all"
+    normalized = str(value).strip().lower()
+    if normalized == "":
+        return "all"
+    if normalized in {"1", "true", "yes", "on"}:
+        return "all"
+    if normalized in {"0", "false", "no", "off"}:
+        return "off"
+    if normalized in {"all", "changed"}:
+        return normalized
+    raise ValueError("--test-on-save must be one of all, changed, or off")
+
+
+def _filter_changed_tests(
+    plan: DeviceTestPlan,
+    changed_paths: Optional[Set[str]],
+) -> list:
+    if not changed_paths:
+        return plan.files
+
+    changed_names = {
+        Path(raw).stem.removeprefix("test_")
+        for raw in changed_paths
+        if str(raw).endswith(".py")
+    }
+    if not changed_names:
+        return plan.files
+
+    selected = []
+    for item in plan.files:
+        test_stem = item.local_path.stem.removeprefix("test_")
+        if test_stem in changed_names or any(
+            name and name in test_stem for name in changed_names
+        ):
+            selected.append(item)
+    return selected

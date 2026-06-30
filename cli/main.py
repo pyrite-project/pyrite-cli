@@ -1018,6 +1018,7 @@ register_command_groups(app)
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    _normalize_optional_value_flags(sys.argv)
     try:
         app()
     except BrokenPipeError:
@@ -1025,6 +1026,26 @@ def main() -> None:
     except Exception as exc:
         log.error("%s", humanize_exception(exc))
         sys.exit(1)
+
+
+def _normalize_optional_value_flags(argv: List[str]) -> None:
+    """Normalize flags that support both bare and explicit value forms."""
+    if len(argv) < 5:
+        return
+    if argv[1:3] != ["project", "dev"]:
+        return
+    normalized: list[str] = [argv[0]]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--test-on-save":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                normalized.append("--test-on-save=all")
+                i += 1
+                continue
+        normalized.append(arg)
+        i += 1
+    argv[:] = normalized
 
 
 if __name__ == "__main__":

@@ -251,6 +251,11 @@ def project_flash(
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    snapshot_before: Optional[str] = typer.Option(
+        None,
+        "--snapshot-before",
+        help="刷入前保存设备文件系统快照到 .pyrite_snapshots/<name>/",
+    ),
     no_check: bool = typer.Option(False, "--no-check", help="跳过刷入前预检查"),
 ) -> None:
     """连接设备并根据哈希配置增量刷入新增或变更的文件。
@@ -279,6 +284,20 @@ def project_flash(
     try:
         mp.connect()
         mp._enter_raw_repl()
+        if snapshot_before:
+            from .snapshot import save_device_snapshot
+
+            manifest_snapshot = save_device_snapshot(
+                mp,
+                name=snapshot_before,
+                port=port,
+                remote_path="/",
+            )
+            log.info(
+                "刷入前快照已保存: %s (%d files)",
+                manifest_snapshot.name,
+                len(manifest_snapshot.files),
+            )
         active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
         if not no_check:
             from ..utils.precheck import collect_project_precheck_entries
@@ -467,8 +486,9 @@ def project_run(
         mp.disconnect()
 
 
-@project_app.command("dev")
+@project_app.command("dev", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def project_dev(
+    ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
@@ -487,22 +507,42 @@ def project_dev(
     auto_run: Optional[bool] = typer.Option(None, "--run/--no-run", help="每次成功刷入后软重启，按 boot.py/main.py 正常启动"),
     no_repl: bool = typer.Option(False, "--no-repl", help="只监听和刷入，不进入交互 REPL"),
     map_traceback: Optional[bool] = typer.Option(None, "--map-traceback/--no-map-traceback", help="将设备 traceback 路径映射到本地源码"),
+    lens: bool = typer.Option(False, "--lens", help="展开 traceback 对应的本地源码上下文"),
+    open_editor: bool = typer.Option(False, "--open-editor", help="与 --lens 配合，尝试打开首个匹配源码位置"),
     once: bool = typer.Option(False, "--once", help="执行一轮同步后退出（适合测试/CI）"),
     poll_interval: float = typer.Option(0.3, "--poll-interval", help="文件轮询间隔秒数"),
     debounce: float = typer.Option(0.5, "--debounce", help="文件变化稳定等待秒数"),
     on_error: str = typer.Option("continue", "--on-error", help="错误策略: continue | stop | keep-repl"),
+    test_on_save_option: str = typer.Option(
+        "off",
+        "--test-on-save",
+        help="保存并成功刷入后运行设备端测试: all | changed | off",
+    ),
+    test_path: Optional[str] = typer.Option(None, "--test-path", help="设备端测试目录或单个 .py 文件，默认 test_device/"),
+    test_timeout: int = typer.Option(10, "--test-timeout", min=1, help="设备端测试执行超时秒数"),
 ) -> None:
     """持续监听项目变化，增量刷入，并打开调试 REPL。"""
     if on_error not in {"continue", "stop", "keep-repl"}:
         log.error("--on-error 必须是 continue、stop 或 keep-repl")
         raise typer.Exit(2)
-    from ..project.dev import DevOptions, run_project_dev
+    if ctx.args:
+        log.error("unknown option(s): %s", " ".join(ctx.args))
+        raise typer.Exit(2)
+    from ..project.dev import DevOptions, normalize_test_on_save, run_project_dev
+
+    try:
+        test_on_save = normalize_test_on_save(test_on_save_option)
+    except ValueError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(2) from None
 
     resolved_auto_run, resolved_map_traceback = _resolve_dev_deep_options(
         deep=deep,
         auto_run=auto_run,
         map_traceback=map_traceback,
     )
+    if lens:
+        resolved_map_traceback = True
     run_project_dev(
         DevOptions(
             port=port,
@@ -522,10 +562,15 @@ def project_dev(
             auto_run=resolved_auto_run,
             no_repl=no_repl,
             map_traceback=resolved_map_traceback,
+            lens=lens,
+            open_editor=open_editor,
             once=once,
             poll_interval=poll_interval,
             debounce=debounce,
             on_error=on_error,
+            test_on_save=test_on_save,
+            test_path=test_path,
+            test_timeout=test_timeout,
         ),
         mp_factory=_mp_factory,
     )

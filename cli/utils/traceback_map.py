@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shlex
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Set, Tuple
@@ -46,6 +49,7 @@ class RemoteSourceMapping:
     remote_path: str
     local_path: str
     is_bytecode: bool = False
+    source_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,7 @@ class TracebackPathMatch:
     local_path: str
     local_line: Optional[int]
     is_bytecode: bool = False
+    source_path: Optional[str] = None
 
     def format(self) -> str:
         remote_ref = f"{self.remote_path}:{self.remote_line}"
@@ -110,8 +115,15 @@ class TracebackMapper:
                 continue
             normalised = RemoteSourceMapping(
                 remote_path=remote_key,
-                local_path=_local_display_path(mapping.local_path, self.local_base),
+                local_path=_local_display_path(
+                    mapping.source_path or mapping.local_path,
+                    self.local_base,
+                ),
                 is_bytecode=mapping.is_bytecode,
+                source_path=_local_source_path(
+                    mapping.source_path or mapping.local_path,
+                    self.local_base,
+                ),
             )
             self._mappings.append(normalised)
             self._exact.setdefault(remote_key, normalised)
@@ -154,6 +166,7 @@ class TracebackMapper:
             local_path=mapping.local_path,
             local_line=None if is_bytecode else frame.line,
             is_bytecode=is_bytecode,
+            source_path=mapping.source_path,
         )
 
     def map_text(self, text: str) -> str:
@@ -169,6 +182,26 @@ class TracebackMapper:
             if match is None:
                 continue
             out.append(match.format() + _line_ending(line))
+            changed = True
+        return "".join(out) if changed else text
+
+    def map_text_with_lens(self, text: str, *, context_lines: int = 3) -> str:
+        """Insert path mappings and local source context below matched frames."""
+        out: list[str] = []
+        changed = False
+        for line in text.splitlines(keepends=True):
+            out.append(line)
+            frame = parse_traceback_frame(line)
+            if frame is None:
+                continue
+            match = self.map_frame(frame)
+            if match is None:
+                continue
+            ending = _line_ending(line)
+            out.append(match.format() + ending)
+            lens = _format_source_lens(match, context_lines=context_lines)
+            if lens:
+                out.append(ending + lens + ending)
             changed = True
         return "".join(out) if changed else text
 
@@ -233,6 +266,9 @@ def create_traceback_output_mapper(
     active_tags: Optional[Set[str]] = None,
     auto_compile: bool = True,
     auto_manifest: bool = False,
+    lens: bool = False,
+    context_lines: int = 3,
+    open_editor: bool = False,
 ):
     mapper = build_project_traceback_mapper(
         local_dir,
@@ -242,6 +278,21 @@ def create_traceback_output_mapper(
         auto_compile=auto_compile,
         auto_manifest=auto_manifest,
     )
+    if lens:
+        opened: set[tuple[str, int]] = set()
+
+        def map_with_lens(text: str) -> str:
+            mapped = mapper.map_text_with_lens(
+                text,
+                context_lines=context_lines,
+            )
+            if open_editor:
+                notice = _open_editor_for_first_match(mapper, text, opened)
+                if notice:
+                    mapped += _line_ending(mapped) + notice + _line_ending(mapped)
+            return mapped
+
+        return map_with_lens
     return mapper.map_text
 
 
@@ -305,6 +356,93 @@ def _local_display_path(local_path: str, base: Optional[Path]) -> str:
         except ValueError:
             pass
     return str(local_path).replace("\\", "/")
+
+
+def _local_source_path(local_path: str, base: Optional[Path]) -> str:
+    path = Path(local_path)
+    if not path.is_absolute() and base is not None:
+        path = base / path
+    return str(path.resolve())
+
+
+def _format_source_lens(
+    match: TracebackPathMatch,
+    *,
+    context_lines: int = 3,
+) -> str:
+    if match.is_bytecode or match.local_line is None or not match.source_path:
+        return ""
+
+    try:
+        lines = Path(match.source_path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ""
+    if not lines:
+        return ""
+
+    line_no = max(1, match.local_line)
+    if line_no > len(lines):
+        return ""
+    radius = max(0, int(context_lines))
+    start = max(1, line_no - radius)
+    end = min(len(lines), line_no + radius)
+    width = len(str(end))
+    out = [match.local_path]
+    for current in range(start, end + 1):
+        marker = ">" if current == line_no else " "
+        out.append(f"{marker} {current:>{width}} | {lines[current - 1]}")
+    return "\n".join(out)
+
+
+def _open_editor_for_first_match(
+    mapper: TracebackMapper,
+    text: str,
+    opened: set[tuple[str, int]],
+) -> str:
+    for frame in parse_traceback_frames(text):
+        match = mapper.map_frame(frame)
+        if (
+            match is None
+            or match.is_bytecode
+            or match.local_line is None
+            or not match.source_path
+        ):
+            continue
+        key = (match.source_path, match.local_line)
+        if key in opened:
+            continue
+        opened.add(key)
+        error = _open_editor(match.source_path, match.local_line)
+        if error:
+            return f"[lens] open-editor failed: {error}"
+        return ""
+    return ""
+
+
+def _open_editor(path: str, line: int) -> str:
+    try:
+        code = shutil.which("code")
+        if code:
+            subprocess.Popen(
+                [code, "-g", f"{path}:{line}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return ""
+        editor = os.environ.get("EDITOR")
+        if not editor:
+            return "$EDITOR is not set and VS Code 'code' was not found"
+        command = shlex.split(editor)
+        if not command:
+            return "$EDITOR is empty"
+        subprocess.Popen(
+            command + [path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return ""
+    except Exception as exc:
+        return str(exc)
 
 
 def _compiles_to_mpy(local_path: str, remote_path: str) -> bool:

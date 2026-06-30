@@ -93,3 +93,66 @@ def test_suffix_rule_maps_common_src_prefix_without_manifest(tmp_path: Path):
     mapped = mapper.map_text('  File "/lib/sensor.py", line 11, in read\n')
 
     assert "/lib/sensor.py:11 -> src/lib/sensor.py:11" in mapped
+
+
+def test_lens_expands_source_context_and_marks_error_line(tmp_path: Path):
+    source = tmp_path / "lib" / "sensor.py"
+    _write(
+        source,
+        "\n".join(
+            [
+                "class Sensor:",
+                "    def read(self):",
+                "        raw = self.bus.readfrom_mem(self.addr, 0x00, 2)",
+                "        value = raw[0] << 8 | raw[1]",
+                "        return scale(value, self.range)",
+                "",
+                "def scale(value, rng):",
+                "    return value / rng",
+            ]
+        )
+        + "\n",
+    )
+    mapper = TracebackMapper.from_entries(
+        [(str(source), "/app/lib/sensor.py")],
+        local_base=tmp_path,
+    )
+
+    mapped = mapper.map_text_with_lens(
+        '  File "/app/lib/sensor.py", line 5, in read\n',
+        context_lines=2,
+    )
+
+    assert "/app/lib/sensor.py:5 -> lib/sensor.py:5" in mapped
+    assert "\nlib/sensor.py\n" in mapped
+    assert "  3 |         raw = self.bus.readfrom_mem" in mapped
+    assert "> 5 |         return scale(value, self.range)" in mapped
+    assert "  7 | def scale(value, rng):" in mapped
+
+
+def test_lens_respects_file_start_and_end_boundaries(tmp_path: Path):
+    source = tmp_path / "main.py"
+    _write(source, "print('one')\nprint('two')\n")
+    mapper = TracebackMapper.from_entries(
+        [(str(source), "/main.py")],
+        local_base=tmp_path,
+    )
+
+    start = mapper.map_text_with_lens('  File "/main.py", line 1\n')
+    end = mapper.map_text_with_lens('  File "/main.py", line 2\n')
+
+    assert "> 1 | print('one')" in start
+    assert "  0 |" not in start
+    assert "> 2 | print('two')" in end
+    assert "  3 |" not in end
+
+
+def test_lens_leaves_ambiguous_suffix_matches_unchanged(tmp_path: Path):
+    first = tmp_path / "a" / "sensor.py"
+    second = tmp_path / "b" / "sensor.py"
+    _write(first)
+    _write(second)
+    mapper = build_project_traceback_mapper(str(tmp_path), "/")
+    text = '  File "/sensor.py", line 1\n'
+
+    assert mapper.map_text_with_lens(text) == text

@@ -245,7 +245,9 @@ def validate_network_request(
         raise TunnelSecurityError("URL must include a host")
 
     hostname = parsed.hostname.lower()
-    if policy.allow_hosts and not _host_allowed(hostname, policy.allow_hosts):
+    if not policy.allow_hosts:
+        raise TunnelSecurityError("host allowlist is required")
+    if not _host_allowed(hostname, policy.allow_hosts):
         raise TunnelSecurityError(f"host {hostname!r} is not in allowlist")
     if not policy.allow_private and _is_private_host(hostname):
         raise TunnelSecurityError(f"private host {hostname!r} is not allowed")

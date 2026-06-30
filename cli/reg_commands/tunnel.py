@@ -65,7 +65,7 @@ def tunnel_network(
         None,
         "--allow",
         "-a",
-        help="允许访问的域名，可重复；example.com 同时允许其子域名",
+        help="必填：允许访问的域名或主机，可重复；example.com 同时允许其子域名",
     ),
     host: str = typer.Option(
         "127.0.0.1",

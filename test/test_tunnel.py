@@ -1,6 +1,9 @@
 import base64
 import json
+import sys
+import threading
 from types import SimpleNamespace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +12,7 @@ from typer.testing import CliRunner
 from cli.main import app
 from cli.utils.tunnel import (
     FrameDecoder,
+    HostKeyboard,
     NetworkPolicy,
     NetworkRequest,
     TunnelFrame,
@@ -19,7 +23,9 @@ from cli.utils.tunnel import (
     encode_key_event,
     is_exit_key,
     load_device_script,
+    perform_network_request,
     run_tunnel_session,
+    sanitize_request_headers,
     validate_network_request,
 )
 
@@ -66,6 +72,61 @@ def test_keyboard_event_encoding_common_keys_and_reserved_exit_keys():
     assert encode_key_event(b"\x03") is None
 
 
+def test_host_keyboard_unix_raw_mode_restores_terminal(monkeypatch):
+    calls = []
+    monkeypatch.setattr("cli.utils.tunnel.tunnel.os.name", "posix")
+    monkeypatch.setattr(sys.stdin, "fileno", lambda: 7)
+
+    class Termios:
+        TCSADRAIN = object()
+
+        @staticmethod
+        def tcgetattr(fd):
+            calls.append(("get", fd))
+            return ["old"]
+
+        @staticmethod
+        def tcsetattr(fd, mode, value):
+            calls.append(("set", fd, mode, value))
+
+    class Tty:
+        @staticmethod
+        def setraw(fd):
+            calls.append(("raw", fd))
+
+    monkeypatch.setitem(sys.modules, "termios", Termios)
+    monkeypatch.setitem(sys.modules, "tty", Tty)
+
+    with HostKeyboard():
+        pass
+
+    assert calls[0] == ("get", 7)
+    assert calls[1] == ("raw", 7)
+    assert calls[2][0:2] == ("set", 7)
+    assert calls[2][3] == ["old"]
+
+
+def test_host_keyboard_windows_reads_msvcrt(monkeypatch):
+    monkeypatch.setattr("cli.utils.tunnel.tunnel.os.name", "nt")
+
+    class Msvcrt:
+        @staticmethod
+        def kbhit():
+            return True
+
+        @staticmethod
+        def getwch():
+            return "a"
+
+    monkeypatch.setitem(sys.modules, "msvcrt", Msvcrt)
+
+    assert HostKeyboard().read(blocking=False) == {
+        "kind": "char",
+        "key": "a",
+        "text": "a",
+    }
+
+
 def test_network_policy_validates_method_allowlist_and_private_targets():
     policy = NetworkPolicy(allow_hosts=("example.com",))
     request = NetworkRequest(
@@ -87,10 +148,16 @@ def test_network_policy_validates_method_allowlist_and_private_targets():
             policy,
         )
 
+    with pytest.raises(TunnelSecurityError, match="allowlist"):
+        validate_network_request(
+            NetworkRequest(method="GET", url="https://example.com/"),
+            NetworkPolicy(allow_hosts=(), allow_private=False),
+        )
+
     with pytest.raises(TunnelSecurityError, match="private"):
         validate_network_request(
             NetworkRequest(method="GET", url="http://127.0.0.1:8080/"),
-            NetworkPolicy(allow_hosts=(), allow_private=False),
+            NetworkPolicy(allow_hosts=("127.0.0.1",), allow_private=False),
         )
 
     with pytest.raises(TunnelSecurityError, match="method"):
@@ -172,6 +239,77 @@ def test_network_response_caps_body_and_header_summary():
         "truncated": True,
         "size": 6,
     }
+
+
+def test_network_sanitizes_sensitive_request_headers():
+    assert sanitize_request_headers({
+        "Authorization": "Bearer secret",
+        "Cookie": "sid=secret",
+        "X-Api-Key": "secret",
+        "User-Agent": "pyrite-test",
+    }) == {"User-Agent": "pyrite-test"}
+
+
+def test_network_request_get_and_post_against_local_server():
+    seen: list[tuple[str, bytes, str | None]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(("GET", b"", self.headers.get("Authorization")))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(size)
+            seen.append(("POST", body, self.headers.get("Authorization")))
+            self.send_response(201)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"created")
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        policy = NetworkPolicy(
+            allow_hosts=("127.0.0.1",),
+            allow_private=True,
+            max_response_bytes=1024,
+        )
+
+        get_payload = perform_network_request(
+            NetworkRequest(
+                method="GET",
+                url=base + "/status",
+                headers={"Authorization": "Bearer secret"},
+            ),
+            policy,
+        )
+        post_payload = perform_network_request(
+            NetworkRequest(
+                method="POST",
+                url=base + "/submit",
+                headers={"Authorization": "Bearer secret"},
+                body_b64=base64.b64encode(b"payload").decode("ascii"),
+            ),
+            policy,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    assert get_payload["status"] == 200
+    assert base64.b64decode(get_payload["body_b64"]) == b"ok"
+    assert post_payload["status"] == 201
+    assert base64.b64decode(post_payload["body_b64"]) == b"created"
+    assert seen == [("GET", b"", None), ("POST", b"payload", None)]
 
 
 def test_cli_exposes_tunnel_help():

@@ -48,6 +48,38 @@ class InterruptHungryTransport(Transport):
 
 
 class TestSerialTransportDtrRts:
+    def test_connect_retries_after_port_unlock(self):
+        transport = SerialTransport(port="COM99")
+        ser = MagicMock()
+        ser.is_open = True
+        with patch(
+            "cli.utils.transport.serial.serial.Serial",
+            side_effect=[PermissionError("Access is denied"), ser],
+        ) as mock_serial:
+            with patch(
+                "cli.utils.transport.serial.maybe_unlock_occupied_port",
+                return_value=True,
+            ) as mock_unlock:
+                with patch("cli.utils.transport.serial.time.sleep"):
+                    transport.connect()
+
+        assert transport._ser is ser
+        assert mock_serial.call_count == 2
+        mock_unlock.assert_called_once()
+
+    def test_connect_keeps_original_error_when_unlock_declined(self):
+        transport = SerialTransport(port="COM99")
+        with patch(
+            "cli.utils.transport.serial.serial.Serial",
+            side_effect=PermissionError("Access is denied"),
+        ):
+            with patch(
+                "cli.utils.transport.serial.maybe_unlock_occupied_port",
+                return_value=False,
+            ):
+                with pytest.raises(PermissionError):
+                    transport.connect()
+
     def test_set_dtr_exposes_property(self):
         """set_dtr() 通过 pyserial 的 dtr property 控制信号线。"""
         transport = SerialTransport(port="COM99")

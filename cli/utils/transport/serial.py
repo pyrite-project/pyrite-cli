@@ -15,6 +15,7 @@ import serial
 from ..config import DEFAULT_BAUDRATE
 from ..log import get_logger
 from .base import Transport
+from .port_unlock import maybe_unlock_occupied_port
 
 log = get_logger(__name__)
 
@@ -39,15 +40,24 @@ class SerialTransport(Transport):
         if not self.port:
             raise ValueError("未提供串口号")
         log.debug("打开串口 %s (波特率=%d, 超时=%ds)", self.port, self.baudrate, self.timeout)
+        try:
+            self._open_serial()
+        except Exception as exc:
+            if not maybe_unlock_occupied_port(self.port, exc):
+                raise
+            log.info("重新尝试打开串口 %s", self.port)
+            self._open_serial()
+        time.sleep(0.3)
+        self.reset_input_buffer()
+        self.reset_output_buffer()
+
+    def _open_serial(self) -> None:
         self._ser = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
             timeout=self.timeout,
             write_timeout=self.timeout,
         )
-        time.sleep(0.3)
-        self.reset_input_buffer()
-        self.reset_output_buffer()
 
     def disconnect(self) -> None:
         if self._ser and self._ser.is_open:

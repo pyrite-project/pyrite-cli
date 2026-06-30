@@ -58,6 +58,7 @@ testpaths = [
     "test/test_traceback_map.py",
     "test/test_trace.py",
     "test/test_tunnel.py",
+    "test/test_snapshot.py",
 ]
 
 [tool.ruff]

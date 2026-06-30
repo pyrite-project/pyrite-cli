@@ -329,3 +329,11 @@ def test_packaged_network_helper_dispatches_stdin_commands():
     assert "cmd = line.split(None, 2)" in script
     assert 'request(method, url)' in script
     assert 'request(method, url, body_b64=body_b64)' in script
+
+
+def test_packaged_tunnel_helpers_tolerate_stdout_without_flush():
+    for name in ("network.py", "kb.py"):
+        script = load_device_script(name)
+        assert "def _flush()" in script
+        assert 'getattr(sys.stdout, "flush", None)' in script
+        assert "sys.stdout.flush()" not in script

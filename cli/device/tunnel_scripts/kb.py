@@ -10,9 +10,15 @@ _PREFIX = "PYRITE_TUNNEL "
 _NEXT_ID = 0
 
 
+def _flush():
+    flush = getattr(sys.stdout, "flush", None)
+    if flush:
+        flush()
+
+
 def _send(frame):
     sys.stdout.write(_PREFIX + json.dumps(frame) + "\n")
-    sys.stdout.flush()
+    _flush()
 
 
 def _recv():
@@ -51,4 +57,4 @@ while True:
     event = read_key()
     if event:
         sys.stdout.write("PYRITE_KEY:" + json.dumps(event) + "\n")
-        sys.stdout.flush()
+        _flush()

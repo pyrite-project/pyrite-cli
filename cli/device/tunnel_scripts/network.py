@@ -10,9 +10,15 @@ _PREFIX = "PYRITE_TUNNEL "
 _NEXT_ID = 0
 
 
+def _flush():
+    flush = getattr(sys.stdout, "flush", None)
+    if flush:
+        flush()
+
+
 def _send(frame):
     sys.stdout.write(_PREFIX + json.dumps(frame) + "\n")
-    sys.stdout.flush()
+    _flush()
 
 
 def _recv():
@@ -55,7 +61,7 @@ def post(url, headers=None, body_b64=None):
 
 def _emit_result(payload):
     sys.stdout.write("PYRITE_TUNNEL_RESULT " + json.dumps(payload) + "\n")
-    sys.stdout.flush()
+    _flush()
 
 
 def _emit_error(message):

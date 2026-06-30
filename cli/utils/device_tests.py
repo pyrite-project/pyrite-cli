@@ -205,11 +205,9 @@ _total_start=_ticks_ms()
 for _idx,_path in enumerate(_TESTS):
  _cap=_Capture()
  _err=_Capture()
- _old_stdout=sys.stdout
  _start=_ticks_ms()
  _status='pass'
  try:
-  sys.stdout=_cap
   _ns={{'__name__':'__main__','__file__':_path}}
   with open(_path,'r') as _file:
    _code=_file.read()
@@ -223,8 +221,6 @@ for _idx,_path in enumerate(_TESTS):
  except BaseException as _exc:
   _status='error'
   _print_exc(_exc,_err)
- finally:
-  sys.stdout=_old_stdout
  _duration=_elapsed_ms(_start)
  if _status=='pass' and _TIMEOUT_MS and _duration>_TIMEOUT_MS:
   _status='timeout'

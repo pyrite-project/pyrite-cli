@@ -65,13 +65,14 @@ def test_discovery_accepts_a_specific_file(tmp_path):
     assert plan.files[0].remote_path == "/tmp/tests/custom_case.py"
 
 
-def test_runner_script_captures_stdout_asserts_and_timeout():
+def test_runner_script_emits_result_frames_asserts_and_timeout():
     script = build_device_test_runner_script(
         ["/.pyrite_tests/test_gpio.py"],
         timeout=7,
     )
 
     assert "class _Capture" in script
+    assert "sys.stdout=_cap" not in script
     assert "AssertionError" in script
     assert "PYRITE_TEST" in script
     assert "_TIMEOUT_MS=7000" in script

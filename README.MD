@@ -18,6 +18,10 @@ It talks to boards through UART raw REPL by default, and can use WebREPL over We
 | Find boards | `pyrcli scan` | Serial scan, optional board probing, JSON output |
 | Flash one file | `pyrcli flash COM3 main.py /main.py` | Preprocess, optionally compile to `.mpy`, transfer, verify |
 | Sync a project | `pyrcli project flash COM3 . /app` | Upload only added or changed files |
+| Develop live | `pyrcli project dev COM3 . /app --lens` | Watch, sync, map tracebacks, and run device tests |
+| Run device tests | `pyrcli test COM3 test_device/` | Upload tests to the board and parse result frames |
+| Snapshot files | `pyrcli snapshot save COM3 before-change` | Save, diff, and restore device filesystem snapshots |
+| Tunnel host features | `pyrcli tunnel network COM3 --allow example.com` | Keyboard input and restricted HTTP(S) forwarding |
 | Browse files | `pyrcli fs ls COM3 /` | List, upload, download, remove, move, and copy files |
 | Install packages | `pyrcli pkg install COM3 aioble` | Delegate host-side package install to `mpremote mip install` |
 | Monitor GPIO | `pyrcli monitor COM3 --pins 0,2,4 --count 10` | Read GPIO inputs without changing pulls or output mode |
@@ -59,6 +63,10 @@ pyrcli flash COM3 main.py /main.py
 pyrcli repl COM3
 # In the REPL: import machine; print(machine.freq())
 
+# Watch the project and expand tracebacks to local source context
+pyrcli project dev COM3 . /app --lens
+pyrcli project dev COM3 . /app --test-on-save=all --test-path test_device/
+
 # Work with files
 pyrcli fs ls COM3 /
 pyrcli fs put COM3 local.py /remote.py
@@ -91,6 +99,22 @@ pyrcli monitor COM3 --pins 0,2,4,5 --interval 0.2 --count 20
 pyrcli monitor COM3 --pins 0,2 --format json --count 5
 ```
 
+Save and restore a device filesystem snapshot:
+
+```bash
+pyrcli snapshot save COM3 before-change --remote-path /app
+pyrcli snapshot diff COM3 before-change --remote-path /app
+pyrcli snapshot restore COM3 before-change
+pyrcli snapshot restore COM3 before-change --apply --yes
+```
+
+Forward host-side capabilities to a device helper:
+
+```bash
+pyrcli tunnel kb COM3
+pyrcli tunnel network COM3 --allow example.com
+```
+
 Use WebREPL instead of serial by adding `--ws`. The positional `PORT` stays in place for a consistent CLI shape; the WebSocket URL is the actual transport target.
 
 ```bash
@@ -110,6 +134,14 @@ Pyrite CLI connects your device, transfers code in chunks, verifies the result, 
 ### Incremental Project Sync
 
 `pyrcli project hash` records local SHA256 hashes. `pyrcli project flash` compares that state and uploads only added or changed files.
+
+### Live Development and Device Tests
+
+`pyrcli project dev` watches a project and incrementally flashes changes. `--lens` expands MicroPython tracebacks into local source context, and `--test-on-save=all|changed|off` can run device-side tests after a successful sync. `pyrcli test` can upload and run `test_device/` independently.
+
+### Snapshots and Restore
+
+`pyrcli snapshot save/list/diff/restore` saves device filesystem state, previews differences, and restores files. `restore` is dry-run by default and only writes to the device with `--apply`; diffing computes SHA256 on the host side for older firmware compatibility.
 
 ### Conditional Builds
 
@@ -134,6 +166,14 @@ Use `@feature("wifi")`, `@target("esp32")`, `with feature(...)`, and `with targe
 ### GPIO Monitor
 
 `pyrcli monitor` samples GPIO pins as `machine.Pin(pin, machine.Pin.IN)` only. You can pass `--pins`, `--count`, `--duration`, `--edge changed`, and `--format json` for scriptable runs.
+
+### Host Capability Tunnel
+
+`pyrcli tunnel kb` forwards host keyboard events to a device helper. `pyrcli tunnel network` lets the device request restricted HTTP(S) through the host; it requires explicit `--allow`, and private addresses require `--allow-private`.
+
+### Serial Port Unlock
+
+When opening a serial port fails like it is occupied, an interactive terminal can ask whether to scan and terminate the holding process. Windows prefers Sysinternals `handle.exe`; Linux and macOS use `lsof` or `fuser`. Non-interactive runs skip this flow.
 
 ### Shared Transport Layer
 
@@ -161,7 +201,9 @@ Sync a project incrementally:
 pyrcli project hash .
 pyrcli project status COM3 . /app
 pyrcli project flash COM3 . /app
+pyrcli project flash COM3 . /app --snapshot-before before-flash
 pyrcli project pull COM3 . /app
+pyrcli project dev COM3 . /app --lens --test-on-save=all
 ```
 
 Browse and mount files:
@@ -191,7 +233,12 @@ Pyrite CLI looks for `.pyrite_config.json` from the current directory upward.
   "download_threads": 4,
   "auto_compile": true,
   "verify": "crc32",
-  "max_retries": 2
+  "delta_flash": "auto",
+  "precheck": "basic",
+  "precheck_compat": "warn",
+  "precheck_mp_version": "",
+  "max_retries": 2,
+  "baudrate": 921600
 }
 ```
 
@@ -201,7 +248,12 @@ Pyrite CLI looks for `.pyrite_config.json` from the current directory upward.
 | `download_threads` | `4` | Stub download concurrency, clamped to 1-12 |
 | `auto_compile` | `true` | Compile `.py` to `.mpy` automatically |
 | `verify` | `"size"` | `off`, `size`, or `crc32` verification |
+| `delta_flash` | `"auto"` | Single-file delta flashing policy: `off`, `auto`, or `on` |
+| `precheck` | `"basic"` | Pre-flash code check: `off`, `basic`, or `strict` |
+| `precheck_compat` | `"warn"` | Strict compatibility handling: `warn`, `error`, or `off` |
+| `precheck_mp_version` | `""` | Optional target MicroPython firmware version |
 | `max_retries` | `2` | Retry count after verification or connection failure |
+| `baudrate` | `921600` | Default serial baudrate |
 
 Board tags can be extended in `pyproject.toml`:
 
@@ -234,11 +286,14 @@ C3 = ["ESP32", "wifi"]
 | `flash-program` | Recursively flash a local directory |
 | `repl` | Open an interactive REPL |
 | `reset` | Soft-reset the device through raw REPL |
+| `test` | Upload and run MicroPython tests on the device |
 | `debug board-info` | Print firmware, CPU, memory, flash, and filesystem info |
 | `debug doctor` | Run serial, raw REPL, filesystem, memory, and runtime feature diagnostics |
 | `monitor` | Monitor GPIO input state |
 | `mount` | Mount the device filesystem through local WebDAV |
 | `remount` | Reverse-mount a host directory to device `/remote` through `mpremote` |
+| `snapshot` | Save, diff, and restore device filesystem snapshots |
+| `tunnel` | Forward keyboard input and restricted HTTP(S) requests |
 | `pkg` | Install MicroPython packages via `mpremote mip` |
 | `config` | Create a default `.pyrite_config.json` |
 
@@ -253,6 +308,7 @@ C3 = ["ESP32", "wifi"]
 | `project status` | Show local/device differences |
 | `project pull` | Pull files from the device |
 | `project run` | Sync, then enter REPL monitoring |
+| `project dev` | Watch, incrementally sync, open REPL, map tracebacks, and run tests |
 
 ### `pyrcli fs`
 

@@ -161,7 +161,8 @@ def download_stubs(
     resp = _request_with_retry(url)
     items = resp.json()
 
-    out_path = Path(output_dir) / stub_dir
+    output_root = Path(output_dir) if output_dir else Path(".stubs")
+    out_path = output_root / stub_dir
     out_path.mkdir(parents=True, exist_ok=True)
 
     pyi_files = [
@@ -210,7 +211,6 @@ def download_stubs(
             total_str += f" ({failed} 失败)"
         log.info("下载完成: %s", total_str)
 
-    out_path = Path(f"./.stubs/{out_path}")
     log.debug("存根保存到: %s", out_path)
     return downloaded, out_path
 

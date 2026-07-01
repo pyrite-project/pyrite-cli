@@ -47,6 +47,7 @@ testpaths = [
     "test/test_manifest_lock.py",
     "test/test_preprocessor.py",
     "test/test_precheck.py",
+    "test/test_project_stubs.py",
     "test/test_port_unlock.py",
     "test/test_transport_serial.py",
     "test/test_output.py",

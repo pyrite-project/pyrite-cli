@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -14,10 +13,13 @@ from typing import Optional
 from .stubs import (
     create_vscode_config,
     download_stubs,
+    ensure_feature_stub,
     find_stub_dir,
     get_hardware_types,
     list_available,
     list_stub_dirs,
+    warn_legacy_project_stubs,
+    write_project_stub_config,
     version_to_dir,
 )
 from ..utils.config import DEFAULT_BAUDRATE
@@ -68,9 +70,35 @@ _MANIFEST_TEMPLATE = """\
 
 def init_project(proj_name: str) -> None:
     os.mkdir(proj_name)
-    stub_src = Path(__file__).parent / "feature_stub.pyi"
-    shutil.copy(stub_src, Path(proj_name) / "feature_stub.pyi")
     (Path(proj_name) / "manifest.py").write_text(_MANIFEST_TEMPLATE, encoding="utf-8")
+
+
+def _configure_project_stubs(
+    *,
+    stub_dir: str,
+    hardware: str,
+    version: str,
+    variant: Optional[str],
+) -> None:
+    count, out_path = download_stubs(stub_dir, "")
+    log.info("已准备 %d 个 .pyi 文件到 %s", count, out_path)
+    pyrite_stub_path = ensure_feature_stub()
+    settings_file = create_vscode_config(
+        out_path,
+        hardware,
+        version,
+        extra_paths=[pyrite_stub_path],
+    )
+    config_file = write_project_stub_config(
+        hardware=hardware,
+        version=version,
+        variant=variant,
+        stub_dir=stub_dir,
+        stub_path=out_path,
+    )
+    warn_legacy_project_stubs()
+    log.info("VS Code 配置: %s", settings_file)
+    log.info("Pyrite stubs 配置: %s", config_file)
 
 
 def new_project_interactive(
@@ -111,10 +139,12 @@ def new_project_interactive(
                     version = nearest
                     stub_dir = find_stub_dir(dirs, hardware, version, None)
             if stub_dir:
-                count, out_path = download_stubs(stub_dir, "")
-                log.info("已下载 %d 个 .pyi 文件到 %s", count, out_path)
-                settings_file = create_vscode_config(out_path, hardware, version)
-                log.info("VS Code 配置: %s", settings_file)
+                _configure_project_stubs(
+                    stub_dir=stub_dir,
+                    hardware=hardware,
+                    version=version,
+                    variant=None,
+                )
             else:
                 log.warning("未找到 %s v%s 的匹配存根，可稍后运行 'pyrcli init %s %s' 配置", hardware, version, hardware, version)
         finally:
@@ -154,10 +184,12 @@ def new_project_interactive(
         os.chdir(proj_name)
         stub_dir = find_stub_dir(dirs, selected_hw, selected_ver, variant)
         if stub_dir:
-            count, out_path = download_stubs(stub_dir, "")
-            log.info("已下载 %d 个 .pyi 文件到 %s", count, out_path)
-            settings_file = create_vscode_config(out_path, selected_hw, selected_ver)
-            log.info("VS Code 配置: %s", settings_file)
+            _configure_project_stubs(
+                stub_dir=stub_dir,
+                hardware=selected_hw,
+                version=selected_ver,
+                variant=variant,
+            )
         else:
             log.warning("未找到 %s v%s 的匹配存根，可稍后运行 'pyrcli init' 配置", selected_hw, selected_ver)
     finally:
@@ -301,8 +333,9 @@ def init_stubs(
         sys.exit(1)
 
     log.info("找到存根目录：%s", stub_dir)
-    count, out_path = download_stubs(stub_dir, "")
-    log.info("已下载 %d 个 .pyi 文件到 %s", count, out_path)
-
-    settings_file = create_vscode_config(out_path, hardware, version)
-    log.info("已更新 VS Code 配置：%s", settings_file)
+    _configure_project_stubs(
+        stub_dir=stub_dir,
+        hardware=hardware,
+        version=version,
+        variant=variant,
+    )

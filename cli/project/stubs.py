@@ -28,6 +28,9 @@ except ImportError:
 SOURCE = "https://api.github.com/repos/josverl/micropython-stubs"
 VSCODE_DIR = ".vscode"
 VSCODE_SETTINGS = "settings.json"
+PROJECT_CONFIG = ".pyrite_config.json"
+STUB_CACHE_ROOT = Path("~/.pyrcli/stubs")
+PYRITE_STUB_DIR = "pyrite"
 
 _DEFAULT_THREADS = 4
 _MAX_THREADS = 12
@@ -51,6 +54,74 @@ def _get_download_threads() -> int:
 def version_to_dir(v: str) -> str:
     """将 '1.20.0' 转换为 'v1_20_0'。"""
     return "v" + v.replace(".", "_")
+
+
+def get_stub_cache_root() -> Path:
+    """返回 CLI 统一管理的 MicroPython stubs 缓存根目录。"""
+    return STUB_CACHE_ROOT.expanduser().resolve()
+
+
+def ensure_feature_stub(cache_root: Optional[Path] = None) -> Path:
+    """将 Pyrite 条件编译辅助 .pyi 放入 CLI 管理的 stubs 目录。"""
+    root = get_stub_cache_root() if cache_root is None else cache_root.expanduser().resolve()
+    out_dir = root / PYRITE_STUB_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    src = Path(__file__).with_name("feature_stub.pyi")
+    dst = out_dir / "feature_stub.pyi"
+    content = src.read_text(encoding="utf-8")
+    if not dst.exists() or dst.read_text(encoding="utf-8") != content:
+        dst.write_text(content, encoding="utf-8")
+    return out_dir
+
+
+def warn_legacy_project_stubs(project_root: Path = Path(".")) -> None:
+    """提示旧项目内 .stubs 已不再由新流程使用。"""
+    legacy = project_root / ".stubs"
+    if legacy.exists():
+        log.warning(
+            "检测到项目内旧 stubs 目录 %s；新版本使用 %s，可确认无自定义内容后手动删除",
+            legacy,
+            get_stub_cache_root(),
+        )
+
+
+def write_project_stub_config(
+    *,
+    hardware: str,
+    version: str,
+    variant: Optional[str],
+    stub_dir: str,
+    stub_path: Path,
+    project_root: Path = Path("."),
+) -> Path:
+    """在项目配置中记录当前 stubs 选择结果，保留已有配置项。"""
+    config_file = project_root / PROJECT_CONFIG
+    data: dict = {}
+    if config_file.exists():
+        try:
+            loaded = json.loads(config_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                log.warning("%s 不是 JSON 对象，将覆盖", config_file)
+        except json.JSONDecodeError:
+            log.warning("%s 格式错误，将覆盖", config_file)
+        except OSError as e:
+            log.warning("读取 %s 失败: %s，将覆盖", config_file, e)
+
+    data["stubs"] = {
+        "hardware": hardware,
+        "version": version,
+        "variant": variant,
+        "stub_dir": stub_dir,
+        "path": stub_path.expanduser().resolve().as_posix(),
+    }
+    config_file.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return config_file
 
 
 def _request_with_retry(
@@ -157,12 +228,17 @@ def download_stubs(
     if max_workers is None:
         max_workers = _get_download_threads()
 
+    output_root = Path(output_dir).expanduser() if output_dir else get_stub_cache_root()
+    out_path = output_root / stub_dir
+    cached_files = list(out_path.glob("*.pyi")) if out_path.exists() else []
+    if cached_files:
+        log.info("使用已缓存存根: %s (%d 个 .pyi 文件)", out_path, len(cached_files))
+        return len(cached_files), out_path
+
     url = f"{SOURCE}/contents/stubs/{stub_dir}"
     resp = _request_with_retry(url)
     items = resp.json()
 
-    output_root = Path(output_dir) if output_dir else Path(".stubs")
-    out_path = output_root / stub_dir
     out_path.mkdir(parents=True, exist_ok=True)
 
     pyi_files = [
@@ -216,7 +292,10 @@ def download_stubs(
 
 
 def create_vscode_config(
-    stub_path: Path, hardware: str, version: str,
+    stub_path: Path,
+    hardware: str,
+    version: str,
+    extra_paths: Optional[list[Path]] = None,
 ) -> Path:
     """创建 .vscode/settings.json，配置 Pylance 指向下载的存根。"""
     vscode_dir = Path(VSCODE_DIR)
@@ -232,16 +311,22 @@ def create_vscode_config(
             log.warning("现有 .vscode/settings.json 格式错误，将覆盖")
             config = {}
 
-    rel_stub_path = stub_path.as_posix()
+    abs_stub_path = stub_path.expanduser().resolve()
+    configured_paths = [abs_stub_path.as_posix()]
+    if extra_paths:
+        configured_paths.extend(p.expanduser().resolve().as_posix() for p in extra_paths)
 
     existing_paths = config.get("python.analysis.extraPaths", [])
-    if rel_stub_path not in existing_paths:
-        existing_paths.append(rel_stub_path)
+    if not isinstance(existing_paths, list):
+        existing_paths = []
+    for path in configured_paths:
+        if path not in existing_paths:
+            existing_paths.append(path)
     config["python.analysis.extraPaths"] = existing_paths
 
     config.setdefault("python.languageServer", "Pylance")
     config.setdefault("python.analysis.typeCheckingMode", "basic")
-    config.setdefault("python.analysis.stubPath", stub_path.parent.as_posix())
+    config.setdefault("python.analysis.stubPath", abs_stub_path.parent.as_posix())
 
     settings_file.write_text(
         json.dumps(config, indent=4, ensure_ascii=False) + "\n",

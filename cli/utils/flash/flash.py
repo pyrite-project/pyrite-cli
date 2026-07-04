@@ -901,6 +901,7 @@ class MicroPython(MicroPythonBase):
                                 )
                             return
                         except (serial.SerialException, ConnectionError, RuntimeError) as e:
+                            self.invalidate_device_context(raw_repl=True)
                             if attempt >= max_retries:
                                 log.warning("增量刷入失败，回退全量刷入: %s", e)
                                 break
@@ -929,6 +930,7 @@ class MicroPython(MicroPythonBase):
                         return
 
                     except (serial.SerialException, ConnectionError, RuntimeError) as e:
+                        self.invalidate_device_context(raw_repl=True)
                         if attempt >= max_retries:
                             raise
                         log.warning(
@@ -1180,6 +1182,7 @@ class MicroPython(MicroPythonBase):
                         ]
 
                     except (serial.SerialException, ConnectionError, RuntimeError) as e:
+                        self.invalidate_device_context(raw_repl=True)
                         if attempt >= max_retries:
                             log.error("Batch flash failed: %s", e)
                             return [
@@ -1249,6 +1252,9 @@ class MicroPython(MicroPythonBase):
                 self.runtime_info.arch,
             )
             return self.runtime_info.mpy_version, self.runtime_info.arch
+        context = self.ensure_device_context()
+        if context.mpy_version is not None:
+            return context.mpy_version, context.arch
         try:
             out = self.run(
                 "import sys\n"
@@ -1278,6 +1284,13 @@ class MicroPython(MicroPythonBase):
             )
             if item
         ]
+        if not lines:
+            context = self.ensure_device_context()
+            lines = [
+                item
+                for item in (context.machine, context.platform, context.sysname)
+                if item
+            ]
         if not lines:
             try:
                 out = self.run(

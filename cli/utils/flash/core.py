@@ -509,6 +509,8 @@ class MicroPythonBase:
         self._suppress_traffic = False
         self.runtime_info = DeviceRuntimeInfo()
         self._runtime_info_probed = False
+        self._board_feature_cache: Dict[str, Any] = {}
+        self._raw_repl_ready = False
 
     # ── 静态/工具方法 ──
 
@@ -562,6 +564,8 @@ class MicroPythonBase:
         log.debug("连接设备 %s (波特率=%d)", self.port, self.baudrate)
         self.runtime_info = DeviceRuntimeInfo()
         self._runtime_info_probed = False
+        self._board_feature_cache = {}
+        self._raw_repl_ready = False
         self.transport.connect()
 
         # 串口传输：自动 DTR/RTS 硬件复位设备
@@ -584,6 +588,7 @@ class MicroPythonBase:
                 self.transport.disconnect()
             except Exception as e:
                 log.trace("断开连接时忽略异常: %s", e)
+        self.invalidate_device_context(raw_repl=True, runtime_info=True)
 
     @property
     def is_connected(self) -> bool:
@@ -606,19 +611,84 @@ class MicroPythonBase:
 
     # ── 原始 REPL 状态机 ──
 
-    def _enter_raw_repl(self) -> None:
+    def _enter_raw_repl(
+        self,
+        *,
+        preempt: bool = True,
+        soft_reset_fallback: bool = True,
+        boot_preempt_fallback: bool = True,
+    ) -> None:
         """确保连接并进入原始 REPL 模式。"""
         self._ensure_connected()
-        self._init_device_state()
+        if self._raw_repl_ready:
+            log.debug("复用已初始化 Raw REPL")
+            return
+        self._init_device_state(
+            preempt=preempt,
+            soft_reset_fallback=soft_reset_fallback,
+            boot_preempt_fallback=boot_preempt_fallback,
+        )
+        self._raw_repl_ready = True
 
     def _exit_raw_repl(self) -> None:
         """退出原始 REPL 回到普通 REPL。"""
+        self._raw_repl_ready = False
         try:
             self._write(EXIT_RAW_REPL)
             time.sleep(0.1)
             self.transport.reset_input_buffer()
         except Exception as e:
             log.trace("退出原始 REPL 时忽略异常: %s", e)
+
+    def invalidate_device_context(
+        self,
+        *,
+        raw_repl: bool = True,
+        runtime_info: bool = False,
+    ) -> None:
+        """Invalidate cached device state after reconnects or failed transfers."""
+        if raw_repl:
+            self._raw_repl_ready = False
+        if runtime_info:
+            self.runtime_info = DeviceRuntimeInfo()
+            self._runtime_info_probed = False
+            self._board_feature_cache = {}
+
+    def ensure_device_context(self):
+        """Return shared board/runtime context, probing at most once per connection."""
+        from ..device_context import DeviceContext
+
+        if self._runtime_info_probed:
+            log.debug("复用已有设备上下文")
+        else:
+            log.debug("正在探测设备上下文")
+            self._enter_raw_repl()
+        return DeviceContext.from_runtime_info(self.runtime_info)
+
+    def ensure_board_features(self, feature_ids: Optional[Sequence[str]] = None):
+        """Return cached board feature probe results for the current connection."""
+        from ..board_features import DEFAULT_REGISTRY, probe_board_features
+
+        if feature_ids is None:
+            requested = DEFAULT_REGISTRY.default_feature_ids()
+        else:
+            requested = tuple(dict.fromkeys(feature_ids))
+        if not requested:
+            return ()
+
+        missing = [feature_id for feature_id in requested if feature_id not in self._board_feature_cache]
+        if missing:
+            log.debug("正在探测设备能力: %s", ", ".join(missing))
+            for result in probe_board_features(self, feature_ids=missing):
+                self._board_feature_cache[result.id] = result
+        else:
+            log.debug("复用已有设备能力探测结果")
+
+        return tuple(
+            self._board_feature_cache[feature_id]
+            for feature_id in requested
+            if feature_id in self._board_feature_cache
+        )
 
     def _read_until_raw_repl(self, timeout: int = 3) -> Tuple[bool, bytes]:
         """读取串口数据直到检测到原始 REPL 确认消息或超时。"""
@@ -686,14 +756,23 @@ class MicroPythonBase:
             log.trace("硬复位启动中断失败: %s", exc)
             return False
 
-    def _try_raw_repl_sequence(self) -> Tuple[bool, bytes]:
+    def _try_raw_repl_sequence(
+        self,
+        *,
+        preempt: bool,
+        soft_reset_fallback: bool,
+    ) -> Tuple[bool, bytes]:
         """Try the normal Ctrl+C → Ctrl+A Raw REPL entry sequence once."""
-        self._interrupt_running_program()
+        if preempt:
+            self._interrupt_running_program()
 
         self._write(ENTER_RAW_REPL)
         ok, data = self._read_until_raw_repl(timeout=2)
         if ok:
             return True, data
+
+        if not soft_reset_fallback:
+            return False, data
 
         log.debug("首次进入原始 REPL 失败，尝试兜底...")
         self._write(SET_EXECUTE)
@@ -709,7 +788,12 @@ class MicroPythonBase:
         log.debug("切换串口波特率并重连: %d", baudrate)
         self.connect(baudrate=baudrate)
 
-    def _try_common_baud_raw_repl(self) -> Tuple[bool, bytes]:
+    def _try_common_baud_raw_repl(
+        self,
+        *,
+        preempt: bool,
+        soft_reset_fallback: bool,
+    ) -> Tuple[bool, bytes]:
         """Try common MicroPython baud rates when the configured rate is silent."""
         if not isinstance(self.transport, SerialTransport):
             return False, b""
@@ -729,7 +813,10 @@ class MicroPythonBase:
                     baudrate,
                 )
                 self._reconnect_for_baud(baudrate)
-                ok, data = self._try_raw_repl_sequence()
+                ok, data = self._try_raw_repl_sequence(
+                    preempt=preempt,
+                    soft_reset_fallback=soft_reset_fallback,
+                )
                 last_data = data
                 if ok:
                     log.info("已自动切换到可用波特率: %d", baudrate)
@@ -835,18 +922,30 @@ class MicroPythonBase:
             log.info("检测到 MicroPython: %s", ", ".join(details))
         self._runtime_info_probed = True
 
-    def _init_device_state(self) -> None:
+    def _init_device_state(
+        self,
+        *,
+        preempt: bool = True,
+        soft_reset_fallback: bool = True,
+        boot_preempt_fallback: bool = True,
+    ) -> None:
         """初始化设备到原始 REPL 模式并设置 kbd_intr(-1)。
 
-        序列：持续 Ctrl+C → Ctrl+A → 兜底 Ctrl+D → 持续 Ctrl+C → Ctrl+A → kbd_intr(-1)
+        序列按命令需求选择是否先抢占用户程序；soft reset / 硬复位仅作为失败兜底。
         """
         log.trace("初始化设备状态 → 原始 REPL")
-        ok, data = self._try_raw_repl_sequence()
+        ok, data = self._try_raw_repl_sequence(
+            preempt=preempt,
+            soft_reset_fallback=soft_reset_fallback,
+        )
 
         if not ok:
-            ok, data = self._try_common_baud_raw_repl()
+            ok, data = self._try_common_baud_raw_repl(
+                preempt=preempt,
+                soft_reset_fallback=soft_reset_fallback,
+            )
 
-        if not ok:
+        if not ok and boot_preempt_fallback:
             # 尝试 DTR/RTS 硬件复位兜底
             if isinstance(self.transport, SerialTransport):
                 log.debug("尝试 DTR/RTS 硬件复位并抢占启动中断窗口...")
@@ -864,6 +963,7 @@ class MicroPythonBase:
                             return
                 except Exception:
                     pass
+        if not ok:
             raise RuntimeError(
                 f"无法进入原始 REPL 模式，设备响应: {data[:100]!r}"
             )

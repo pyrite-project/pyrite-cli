@@ -20,6 +20,15 @@ from .common import (
     log,
 )
 from ..utils.config import _load_config
+from ..utils.device_context import (
+    CommandNeeds,
+    command_needs,
+    needs_no_mpy,
+    needs_with_flash_verify_feature,
+    prepare_device,
+    resolve_active_tags,
+    split_tags,
+)
 
 # project 子命令组
 # ═══════════════════════════════════════════════════════════════════
@@ -27,29 +36,23 @@ from ..utils.config import _load_config
 project_app = typer.Typer(help="项目脚手架、存根、文件哈希与增量刷入", add_completion=False)
 
 
-def _device_precheck_mp_version(mp, explicit_version: Optional[str]) -> Optional[str]:
-    if explicit_version is not None:
-        return explicit_version
-    version = getattr(getattr(mp, "runtime_info", None), "version", None)
-    return version if isinstance(version, str) and version.strip() else None
+PROJECT_FLASH_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    repl_preempt=True,
+    device_context=True,
+    active_tags=True,
+    mpy_version=True,
+    precheck_version=True,
+)
 
-
-def _resolve_flash_tags(
-    mp,
-    target: Optional[str],
-    feature: Optional[str],
-    no_feature: Optional[str],
-) -> set[str]:
-    if target:
-        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-        active_tags.add(target.upper())
-    else:
-        active_tags = set(mp.detect_tags())
-        if not active_tags:
-            log.error("无法识别设备 target，请使用 --target 手动指定")
-            raise typer.Exit(1)
-    _apply_feature_options(active_tags, feature, no_feature)
-    return active_tags
+PROJECT_STATUS_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    repl_preempt=False,
+    device_context=True,
+    active_tags=True,
+)
 
 
 def register(app: typer.Typer) -> None:
@@ -61,10 +64,8 @@ def _apply_feature_options(
     feature: Optional[str],
     no_feature: Optional[str],
 ) -> None:
-    if feature:
-        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
-    if no_feature:
-        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
+    active_tags.update(split_tags(feature))
+    active_tags.difference_update(split_tags(no_feature))
 
 
 def _run_precheck_or_exit(
@@ -199,11 +200,8 @@ def project_hash(
 ) -> None:
     """离线扫描项目目录，计算 SHA256 哈希并保存到哈希配置文件。"""
     mp = MicroPython()
-    active_tags: set[str] = set()
-    if feature:
-        active_tags.update(t.strip() for t in feature.split(","))
-    if no_feature:
-        active_tags.difference_update(t.strip() for t in no_feature.split(","))
+    active_tags = split_tags(feature)
+    active_tags.difference_update(split_tags(no_feature))
     ProjectSyncManager(mp).scan(
         directory, hash_config_path=output,
         active_tags=active_tags or None, manifest_path=manifest,
@@ -220,11 +218,8 @@ def project_scan(
 ) -> None:
     """扫描项目目录，计算 SHA256 哈希并保存到哈希配置文件。"""
     mp = MicroPython()
-    active_tags = set()
-    if feature:
-        active_tags.update(t.strip() for t in feature.split(","))
-    if no_feature:
-        active_tags.difference_update(t.strip() for t in no_feature.split(","))
+    active_tags = split_tags(feature)
+    active_tags.difference_update(split_tags(no_feature))
     ProjectSyncManager(mp).scan(
         directory, hash_config_path=output,
         active_tags=active_tags or None, manifest_path=manifest,
@@ -232,6 +227,7 @@ def project_scan(
 
 
 @project_app.command("flash", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@command_needs(PROJECT_FLASH_NEEDS)
 def project_flash(
     ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
@@ -269,9 +265,12 @@ def project_flash(
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     lock_checked = False
     if locked and target:
-        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-        active_tags.add(target.upper())
-        _apply_feature_options(active_tags, feature, no_feature)
+        active_tags = resolve_active_tags(
+            mp,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+        )
         _check_project_manifest_lock(
             manifest,
             directory,
@@ -282,8 +281,16 @@ def project_flash(
         )
         lock_checked = True
     try:
-        mp.connect()
-        mp._enter_raw_repl()
+        needs = PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
+        prepared = prepare_device(
+            mp,
+            needs,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+            explicit_mp_version=mp_version,
+        )
         if snapshot_before:
             from .snapshot import save_device_snapshot
 
@@ -298,7 +305,7 @@ def project_flash(
                 manifest_snapshot.name,
                 len(manifest_snapshot.files),
             )
-        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        active_tags = prepared.active_tags or set()
         if not no_check:
             from ..utils.precheck import collect_project_precheck_entries
 
@@ -313,11 +320,10 @@ def project_flash(
                 check,
                 no_check,
                 active_tags=active_tags,
-                mp_version=_device_precheck_mp_version(mp, mp_version),
+                mp_version=prepared.precheck_mp_version,
             )
         if no_compile:
             mp.config.auto_compile = False
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         if locked and not lock_checked:
             _check_project_manifest_lock(
                 manifest,
@@ -329,7 +335,7 @@ def project_flash(
             )
         ProjectSyncManager(mp).flash(
             directory, remote_path, hash_config_path=hash_config,
-            bytecode_ver=ver, arch=arch,
+            bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None,
             manifest_path=manifest, dry_run=dry_run,
         )
@@ -338,6 +344,7 @@ def project_flash(
 
 
 @project_app.command("status")
+@command_needs(PROJECT_STATUS_NEEDS)
 def project_status(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
@@ -360,18 +367,14 @@ def project_status(
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
-        mp.connect()
-        if target:
-            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-            active_tags.add(target.upper())
-        elif (feature or no_feature):
-            active_tags = mp.detect_tags() if not target else set()
-        else:
-            active_tags = mp.detect_tags()
-        if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
-        if no_feature:
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+        prepared = prepare_device(
+            mp,
+            PROJECT_STATUS_NEEDS,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+        )
+        active_tags = prepared.active_tags or set()
         has_diff = ProjectSyncManager(mp).status(
             directory, remote_path, hash_config_path=hash_config,
             active_tags=active_tags or None,
@@ -418,11 +421,11 @@ def project_pull(
         if feature:
             if active_tags is None:
                 active_tags = set()
-            active_tags.update(t.strip() for t in feature.split(","))
+            active_tags.update(split_tags(feature))
         if no_feature:
             if active_tags is None:
                 active_tags = set()
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+            active_tags.difference_update(split_tags(no_feature))
         ok = ProjectSyncManager(mp).pull(
             directory, remote_path,
             active_tags=active_tags, manifest_path=manifest,
@@ -435,6 +438,7 @@ def project_pull(
 
 
 @project_app.command("run")
+@command_needs(PROJECT_FLASH_NEEDS)
 def project_run(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
@@ -455,26 +459,22 @@ def project_run(
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
-        mp.connect()
         if no_compile:
             mp.config.auto_compile = False
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        if target:
-            active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-            active_tags.add(target.upper())
-        else:
-            active_tags = mp.detect_tags()
-            if not active_tags:
-                log.error("无法识别设备 target，请使用 --target 手动指定")
-                raise typer.Exit(1)
-        if feature:
-            active_tags.update(t.strip() for t in feature.split(","))
-        if no_feature:
-            active_tags.difference_update(t.strip() for t in no_feature.split(","))
+        needs = PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
+        prepared = prepare_device(
+            mp,
+            needs,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+        )
+        active_tags = prepared.active_tags or set()
 
         ProjectSyncManager(mp).flash(
             directory, remote_path, hash_config_path=hash_config,
-            bytecode_ver=ver, arch=arch,
+            bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None,
             manifest_path=manifest, dry_run=dry_run,
         )
@@ -487,6 +487,7 @@ def project_run(
 
 
 @project_app.command("dev", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@command_needs(PROJECT_FLASH_NEEDS)
 def project_dev(
     ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),

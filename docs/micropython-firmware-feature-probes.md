@@ -19,6 +19,10 @@ Key principle: `doctor` reports **runtime-observable capabilities**. It must not
 | hasattr-probe | Check whether an attribute, function, or class exists | `hasattr(sys, "settrace")` |
 | behaviour-probe | Use a safe behavior test | Create/read/delete a temp file, `eval("1+1")` |
 
+## Registration Model
+
+Runtime-observable board features are registered in code with a probe method and stable feature id. CLI features register their required or optional board-feature dependencies separately. Missing required dependencies fail before the command continues; missing optional dependencies emit the registered fallback label, such as `FallbackToSizeVerify`.
+
 ## Default High-Priority Probes
 
 These capabilities are the best candidates for the default `pyrcli debug doctor COM3` summary.
@@ -130,11 +134,13 @@ These modules are suitable for `import-probe`. A successful import only means th
 | `array` | `MICROPY_PY_ARRAY` | `import array` |
 | `asyncio` | `MICROPY_PY_ASYNCIO` | `import asyncio` |
 | `binascii` | `MICROPY_PY_BINASCII` | `hasattr(binascii, "crc32")` |
+| `ubinascii.crc32` | `MICROPY_PY_BINASCII` | `hasattr(ubinascii, "crc32")` |
 | `btree` | `MICROPY_PY_BTREE` | `import btree` |
 | `cmath` | `MICROPY_PY_CMATH` | `import cmath` |
 | `collections` | `MICROPY_PY_COLLECTIONS` | `hasattr(collections, "deque")` |
 | `cryptolib` | `MICROPY_PY_CRYPTOLIB` | `import cryptolib` |
 | `deflate` | `MICROPY_PY_DEFLATE` | `import deflate` |
+| `zlib` | `MICROPY_PY_DEFLATE` | `import zlib` |
 | `errno` | `MICROPY_PY_ERRNO` | `hasattr(errno, "errorcode")` |
 | `framebuf` | `MICROPY_PY_FRAMEBUF` | `import framebuf` |
 | `hashlib` | `MICROPY_PY_HASHLIB` | `hasattr(hashlib, "sha256")`, `md5`, `sha1` |

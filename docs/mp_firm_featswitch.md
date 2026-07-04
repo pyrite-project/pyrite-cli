@@ -19,6 +19,10 @@
 | hasattr-probe | 通过 `hasattr` 判断属性/函数/类是否存在 | `hasattr(sys, "settrace")` |
 | behaviour-probe | 通过安全行为测试判断能力 | 写/读/删临时文件、`eval("1+1")` |
 
+## 注册模型
+
+运行时可观察的板卡能力在代码中注册稳定 feature id 和探测方法。CLI 功能单独注册自己依赖哪些 board feature。必需依赖缺失时命令会在继续执行前报错；可选依赖缺失时输出注册的 fallback 标签，例如 `FallbackToSizeVerify`。
+
 ## 默认优先探测项
 
 这些能力最适合进入 `pyrcli debug doctor COM3` 的默认摘要。
@@ -130,11 +134,13 @@
 | `array` | `MICROPY_PY_ARRAY` | `import array` |
 | `asyncio` | `MICROPY_PY_ASYNCIO` | `import asyncio` |
 | `binascii` | `MICROPY_PY_BINASCII` | `hasattr(binascii, "crc32")` |
+| `ubinascii.crc32` | `MICROPY_PY_BINASCII` | `hasattr(ubinascii, "crc32")` |
 | `btree` | `MICROPY_PY_BTREE` | `import btree` |
 | `cmath` | `MICROPY_PY_CMATH` | `import cmath` |
 | `collections` | `MICROPY_PY_COLLECTIONS` | `hasattr(collections, "deque")` |
 | `cryptolib` | `MICROPY_PY_CRYPTOLIB` | `import cryptolib` |
 | `deflate` | `MICROPY_PY_DEFLATE` | `import deflate` |
+| `zlib` | `MICROPY_PY_DEFLATE` | `import zlib` |
 | `errno` | `MICROPY_PY_ERRNO` | `hasattr(errno, "errorcode")` |
 | `framebuf` | `MICROPY_PY_FRAMEBUF` | `import framebuf` |
 | `hashlib` | `MICROPY_PY_HASHLIB` | `hasattr(hashlib, "sha256")`、`md5`、`sha1` |

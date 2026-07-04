@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
+from .board_features import (
+    BoardFeatureStatus,
+    CapabilityNotice,
+    DEFAULT_REGISTRY,
+    evaluate_cli_feature_requirements,
+    probe_board_features,
+)
 from .config import _load_config
 from .log import get_logger
 
@@ -21,6 +28,7 @@ class DeviceContext:
     sysname: Optional[str] = None
     mpy_version: Optional[int] = None
     arch: Optional[str] = None
+    board_features: tuple[BoardFeatureStatus, ...] = ()
 
     @classmethod
     def from_runtime_info(cls, runtime_info: Any) -> "DeviceContext":
@@ -41,6 +49,15 @@ class DeviceContext:
             arch=text("arch"),
         )
 
+    def feature_status(self, feature_id: str) -> Optional[str]:
+        for feature in self.board_features:
+            if feature.id == feature_id:
+                return feature.status
+        return None
+
+    def has_feature(self, feature_id: str) -> bool:
+        return self.feature_status(feature_id) == "supported"
+
 
 @dataclass(frozen=True)
 class CommandNeeds:
@@ -55,6 +72,7 @@ class CommandNeeds:
     precheck_version: bool = False
     board_extra_info: bool = False
     capability_probe: bool = False
+    cli_features: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,7 @@ class PreparedDevice:
     bytecode_ver: Optional[int] = None
     arch: Optional[str] = None
     precheck_mp_version: Optional[str] = None
+    capability_notices: tuple[CapabilityNotice, ...] = ()
 
 
 def command_needs(needs: CommandNeeds) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -88,6 +107,20 @@ def needs_without(needs: CommandNeeds, **updates: bool) -> CommandNeeds:
 
 def needs_no_mpy(needs: CommandNeeds) -> CommandNeeds:
     return replace(needs, mpy_version=False)
+
+
+def needs_with_cli_features(needs: CommandNeeds, *cli_features: str) -> CommandNeeds:
+    merged = list(needs.cli_features)
+    for cli_feature in cli_features:
+        if cli_feature and cli_feature not in merged:
+            merged.append(cli_feature)
+    return replace(needs, cli_features=tuple(merged))
+
+
+def needs_with_flash_verify_feature(needs: CommandNeeds, config: Any) -> CommandNeeds:
+    if getattr(config, "verify", None) == "crc32":
+        return needs_with_cli_features(needs, "flash.crc32_verify")
+    return needs
 
 
 def split_tags(value: Optional[str]) -> set[str]:
@@ -141,7 +174,12 @@ def _is_connected(mp: Any) -> bool:
     return isinstance(value, bool) and value
 
 
-def _real_method(mp: Any, name: str) -> Optional[Callable[..., Any]]:
+def _real_method(
+    mp: Any,
+    name: str,
+    *,
+    return_type: type | tuple[type, ...] | None = None,
+) -> Optional[Callable[..., Any]]:
     method = getattr(mp, name, None)
     if not callable(method):
         return None
@@ -149,7 +187,7 @@ def _real_method(mp: Any, name: str) -> Optional[Callable[..., Any]]:
         return method
     if name in getattr(mp, "_mock_children", {}):
         return_value = getattr(method, "return_value", None)
-        if isinstance(return_value, DeviceContext):
+        if return_type is None or isinstance(return_value, return_type):
             return method
         return None
     if name in vars(mp):
@@ -193,7 +231,7 @@ def prepare_device(
 
     device_context: Optional[DeviceContext] = None
     if needs.device_context:
-        ensure = _real_method(mp, "ensure_device_context")
+        ensure = _real_method(mp, "ensure_device_context", return_type=DeviceContext)
         if ensure is not None:
             device_context = ensure()
         else:
@@ -206,6 +244,27 @@ def prepare_device(
                 steps.append("raw_repl")
             device_context = _context_from_mp(mp)
         steps.append("device_context")
+
+    capability_notices: tuple[CapabilityNotice, ...] = ()
+    if needs.capability_probe or needs.cli_features:
+        feature_ids = None
+        if not needs.capability_probe:
+            feature_ids = DEFAULT_REGISTRY.feature_ids_for_cli_features(needs.cli_features)
+        ensure_features = _real_method(mp, "ensure_board_features", return_type=tuple)
+        if ensure_features is not None:
+            board_features = tuple(ensure_features(feature_ids=feature_ids))
+        else:
+            board_features = probe_board_features(mp, feature_ids=feature_ids)
+        if device_context is None:
+            device_context = _context_from_mp(mp)
+        device_context = replace(device_context, board_features=board_features)
+        capability_notices = evaluate_cli_feature_requirements(
+            board_features,
+            needs.cli_features,
+        )
+        for notice in capability_notices:
+            log.warning("%s", notice.message)
+        steps.append("capability_probe")
 
     active_tags: Optional[set[str]] = None
     if needs.active_tags:
@@ -242,4 +301,5 @@ def prepare_device(
         bytecode_ver=bytecode_ver,
         arch=arch,
         precheck_mp_version=precheck_mp_version,
+        capability_notices=capability_notices,
     )

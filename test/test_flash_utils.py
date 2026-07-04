@@ -147,18 +147,21 @@ class TestDeviceRuntimeInfo:
         mp._raw_repl_ready = True
         mp._runtime_info_probed = True
         mp.runtime_info = DeviceRuntimeInfo(version="1.22.0")
+        mp._board_feature_cache["zlib"] = object()
 
         mp.invalidate_device_context(raw_repl=True, runtime_info=True)
 
         assert mp._raw_repl_ready is False
         assert mp._runtime_info_probed is False
         assert mp.runtime_info.version is None
+        assert mp._board_feature_cache == {}
 
     def test_disconnect_invalidates_cached_device_context(self, monkeypatch):
         mp = MicroPython(port="COM99")
         mp._raw_repl_ready = True
         mp._runtime_info_probed = True
         mp.runtime_info = DeviceRuntimeInfo(version="1.22.0")
+        mp._board_feature_cache["zlib"] = object()
         monkeypatch.setattr(mp, "_write", lambda _data: None)
         monkeypatch.setattr(mp.transport, "reset_input_buffer", lambda: None)
 
@@ -167,6 +170,7 @@ class TestDeviceRuntimeInfo:
         assert mp._raw_repl_ready is False
         assert mp._runtime_info_probed is False
         assert mp.runtime_info.version is None
+        assert mp._board_feature_cache == {}
 
 
 class TestColorizeReplOutput:

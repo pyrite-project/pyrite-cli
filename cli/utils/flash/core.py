@@ -509,6 +509,7 @@ class MicroPythonBase:
         self._suppress_traffic = False
         self.runtime_info = DeviceRuntimeInfo()
         self._runtime_info_probed = False
+        self._board_feature_cache: Dict[str, Any] = {}
         self._raw_repl_ready = False
 
     # ── 静态/工具方法 ──
@@ -563,6 +564,7 @@ class MicroPythonBase:
         log.debug("连接设备 %s (波特率=%d)", self.port, self.baudrate)
         self.runtime_info = DeviceRuntimeInfo()
         self._runtime_info_probed = False
+        self._board_feature_cache = {}
         self._raw_repl_ready = False
         self.transport.connect()
 
@@ -650,6 +652,7 @@ class MicroPythonBase:
         if runtime_info:
             self.runtime_info = DeviceRuntimeInfo()
             self._runtime_info_probed = False
+            self._board_feature_cache = {}
 
     def ensure_device_context(self):
         """Return shared board/runtime context, probing at most once per connection."""
@@ -661,6 +664,31 @@ class MicroPythonBase:
             log.debug("正在探测设备上下文")
             self._enter_raw_repl()
         return DeviceContext.from_runtime_info(self.runtime_info)
+
+    def ensure_board_features(self, feature_ids: Optional[Sequence[str]] = None):
+        """Return cached board feature probe results for the current connection."""
+        from ..board_features import DEFAULT_REGISTRY, probe_board_features
+
+        if feature_ids is None:
+            requested = DEFAULT_REGISTRY.default_feature_ids()
+        else:
+            requested = tuple(dict.fromkeys(feature_ids))
+        if not requested:
+            return ()
+
+        missing = [feature_id for feature_id in requested if feature_id not in self._board_feature_cache]
+        if missing:
+            log.debug("正在探测设备能力: %s", ", ".join(missing))
+            for result in probe_board_features(self, feature_ids=missing):
+                self._board_feature_cache[result.id] = result
+        else:
+            log.debug("复用已有设备能力探测结果")
+
+        return tuple(
+            self._board_feature_cache[feature_id]
+            for feature_id in requested
+            if feature_id in self._board_feature_cache
+        )
 
     def _read_until_raw_repl(self, timeout: int = 3) -> Tuple[bool, bytes]:
         """读取串口数据直到检测到原始 REPL 确认消息或超时。"""

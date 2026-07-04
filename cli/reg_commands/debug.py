@@ -34,7 +34,6 @@ DOCTOR_NEEDS = CommandNeeds(
     connection=True,
     raw_repl=True,
     device_context=True,
-    capability_probe=True,
 )
 
 

@@ -11,10 +11,12 @@ from cli.reg_commands.project import (
     project_run,
     project_status,
 )
+from cli.utils.board_features import BoardFeatureStatus, DEFAULT_REGISTRY
 from cli.utils.device_context import (
     CommandNeeds,
     DeviceContext,
     command_needs_of,
+    needs_with_flash_verify_feature,
     prepare_device,
     resolve_active_tags,
 )
@@ -29,9 +31,22 @@ class FakeMP:
         self.context_probes = 0
         self.mpy_reads = 0
         self.tag_reads = 0
+        self.board_feature_reads = 0
+        self.board_feature_ids = []
+        self.board_features = (
+            BoardFeatureStatus(
+                id="ubinascii.crc32",
+                category="filesystem",
+                status="supported",
+                confidence="hasattr-probe",
+                macro_hint="MICROPY_PY_BINASCII",
+                probe="hasattr(ubinascii, 'crc32')",
+            ),
+        )
         self.config = SimpleNamespace(
             board_tags={"ESP32": ["ESP32", "wifi"]},
             precheck_mp_version="1.19.1",
+            verify="size",
         )
         self.runtime_info = SimpleNamespace(
             implementation="micropython",
@@ -67,6 +82,14 @@ class FakeMP:
     def detect_tags(self):
         self.tag_reads += 1
         return {"ESP32"}
+
+    def ensure_board_features(self, feature_ids=None):
+        self.board_feature_reads += 1
+        self.board_feature_ids.append(feature_ids)
+        if feature_ids is None:
+            return self.board_features
+        wanted = set(feature_ids)
+        return tuple(feature for feature in self.board_features if feature.id in wanted)
 
 
 def test_command_needs_metadata_is_exposed_for_device_context_commands():
@@ -151,9 +174,100 @@ def test_prepare_device_skips_unneeded_context_and_mpy_steps():
     assert mp.context_probes == 0
     assert mp.tag_reads == 0
     assert mp.mpy_reads == 0
+    assert mp.board_feature_reads == 0
     assert prepared.device_context is None
     assert prepared.active_tags is None
     assert prepared.bytecode_ver is None
+
+
+def test_prepare_device_records_optional_cli_feature_fallback_notice():
+    mp = FakeMP()
+    mp.board_features = (
+        BoardFeatureStatus(
+            id="ubinascii.crc32",
+            category="filesystem",
+            status="unsupported",
+            confidence="hasattr-probe",
+            macro_hint="MICROPY_PY_BINASCII",
+            probe="hasattr(ubinascii, 'crc32')",
+        ),
+    )
+
+    prepared = prepare_device(
+        mp,
+        CommandNeeds(
+            connection=True,
+            raw_repl=True,
+            device_context=True,
+            cli_features=("flash.crc32_verify",),
+        ),
+    )
+
+    assert mp.board_feature_reads == 1
+    assert mp.board_feature_ids == [("ubinascii.crc32",)]
+    assert prepared.device_context.feature_status("ubinascii.crc32") == "unsupported"
+    assert len(prepared.capability_notices) == 1
+    assert prepared.capability_notices[0].fallback == "FallbackToSizeVerify"
+
+
+def test_prepare_device_errors_for_missing_required_cli_feature():
+    feature_id = "test.required_board_feature"
+    cli_feature = "test.required_cli_feature"
+    try:
+        DEFAULT_REGISTRY.register_script_probe(
+            feature_id,
+            category="test",
+            confidence="behaviour-probe",
+            macro_hint="TEST_MACRO",
+            probe="test probe",
+            script=(
+                "_pyrite_feature("
+                f"{feature_id!r},'test','unsupported','behaviour-probe','TEST_MACRO','test probe'"
+                ")"
+            ),
+            default=False,
+        )
+        DEFAULT_REGISTRY.register_cli_dependency(cli_feature, feature_id, required=True)
+    except ValueError:
+        pass
+
+    mp = FakeMP()
+    mp.board_features = (
+        BoardFeatureStatus(
+            id=feature_id,
+            category="test",
+            status="unsupported",
+            confidence="behaviour-probe",
+            macro_hint="TEST_MACRO",
+            probe="test probe",
+        ),
+    )
+
+    try:
+        prepare_device(
+            mp,
+            CommandNeeds(
+                connection=True,
+                raw_repl=True,
+                device_context=True,
+                cli_features=(cli_feature,),
+            ),
+        )
+    except RuntimeError as exc:
+        assert cli_feature in str(exc)
+        assert feature_id in str(exc)
+    else:
+        raise AssertionError("missing required board feature should fail")
+
+
+def test_needs_with_flash_verify_feature_only_enables_crc32_dependency():
+    needs = CommandNeeds(connection=True)
+
+    size_needs = needs_with_flash_verify_feature(needs, SimpleNamespace(verify="size"))
+    crc_needs = needs_with_flash_verify_feature(needs, SimpleNamespace(verify="crc32"))
+
+    assert size_needs.cli_features == ()
+    assert crc_needs.cli_features == ("flash.crc32_verify",)
 
 
 def test_resolve_active_tags_manual_target_and_feature_options_do_not_probe():

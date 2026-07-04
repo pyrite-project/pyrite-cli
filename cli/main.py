@@ -31,6 +31,7 @@ from .utils.config import DEFAULT_BAUDRATE, create_default_config, _load_config
 from .utils.device_context import (
     CommandNeeds,
     command_needs,
+    needs_with_flash_verify_feature,
     needs_no_mpy,
     prepare_device,
 )
@@ -425,9 +426,11 @@ def flash(
             mp.set_trace_recorder(recorder)
             log.info("trace 文件: %s", recorder.path)
 
+        needs = FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
             mp,
-            FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS),
+            needs,
             target=target,
             feature=feature,
             no_feature=no_feature,
@@ -542,9 +545,11 @@ def flash_program(
     check = _consume_check_option(list(ctx.args))
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
+        needs = FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
             mp,
-            FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS),
+            needs,
             target=target,
             feature=feature,
             no_feature=no_feature,

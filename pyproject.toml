@@ -38,6 +38,7 @@ include = ["cli", "cli.*", "utils", "utils.*", "project", "project.*"]
 
 [tool.pytest.ini_options]
 testpaths = [
+    "test/test_board_features.py",
     "test/test_board_profile.py",
     "test/test_protocol_helpers.py",
     "test/test_flash_utils.py",

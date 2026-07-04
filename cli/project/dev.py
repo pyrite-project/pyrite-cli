@@ -13,7 +13,12 @@ from typing import Callable, Optional, Set
 
 from ..utils.ui import _GREEN, _RESET, _YELLOW
 from ..utils.config import DEFAULT_BAUDRATE, HASH_CONFIG_FILE
-from ..utils.device_context import CommandNeeds, needs_no_mpy, prepare_device
+from ..utils.device_context import (
+    CommandNeeds,
+    needs_no_mpy,
+    needs_with_flash_verify_feature,
+    prepare_device,
+)
 from ..utils.device_tests import (
     DeviceTestPlan,
     DeviceTestSession,
@@ -364,6 +369,7 @@ class DevSession:
         needs = DEV_NEEDS
         if self.options.no_compile:
             needs = needs_no_mpy(DEV_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, self.mp.config)
         prepared = prepare_device(
             self.mp,
             needs,

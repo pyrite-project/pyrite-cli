@@ -24,6 +24,7 @@ from ..utils.device_context import (
     CommandNeeds,
     command_needs,
     needs_no_mpy,
+    needs_with_flash_verify_feature,
     prepare_device,
     resolve_active_tags,
     split_tags,
@@ -280,9 +281,11 @@ def project_flash(
         )
         lock_checked = True
     try:
+        needs = PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
             mp,
-            PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS),
+            needs,
             target=target,
             feature=feature,
             no_feature=no_feature,
@@ -458,9 +461,11 @@ def project_run(
     try:
         if no_compile:
             mp.config.auto_compile = False
+        needs = PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
             mp,
-            PROJECT_FLASH_NEEDS if not no_compile else needs_no_mpy(PROJECT_FLASH_NEEDS),
+            needs,
             target=target,
             feature=feature,
             no_feature=no_feature,

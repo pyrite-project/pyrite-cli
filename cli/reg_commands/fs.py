@@ -12,6 +12,7 @@ from ..utils.device_context import (
     CommandNeeds,
     command_needs,
     needs_no_mpy,
+    needs_with_flash_verify_feature,
     prepare_device,
 )
 from .common import (
@@ -265,9 +266,11 @@ def fs_put(
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
+        needs = FS_PUT_NEEDS if not no_compile else needs_no_mpy(FS_PUT_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
             mp,
-            FS_PUT_NEEDS if not no_compile else needs_no_mpy(FS_PUT_NEEDS),
+            needs,
             target=target,
             feature=feature,
             no_feature=no_feature,

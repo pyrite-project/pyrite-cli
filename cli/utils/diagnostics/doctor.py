@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from ..board_features import build_probe_script, parse_board_feature_output
 
 DOCTOR_SCRIPT = r"""
 import sys
@@ -25,15 +26,7 @@ def info(key, value):
 def check(name, status, confidence, message):
     print("CHECK|" + name + "|" + status + "|" + confidence + "|" + _clean(message))
 
-def feature(name, category, status, confidence, macro_hint, probe):
-    print("FEATURE|" + name + "|" + category + "|" + status + "|" + confidence + "|" + macro_hint + "|" + probe)
-
-def supported(value):
-    return "supported" if value else "unsupported"
-
 try:
-    # Kept in the capability payload for older parsers; run_doctor overwrites
-    # report["board"] from the shared DeviceContext after this script returns.
     info("firmware.name", sys.implementation.name)
     info("firmware.version", ".".join(str(x) for x in sys.implementation.version))
     info("firmware.platform", sys.platform)
@@ -52,9 +45,6 @@ try:
         st = os.statvfs("/")
         info("filesystem.total", st[0] * st[2])
         info("filesystem.free", st[0] * st[3])
-        feature("os.statvfs", "filesystem", "supported", "hasattr-probe", "MICROPY_PY_OS_STATVFS", 'hasattr(os, "statvfs")')
-    else:
-        feature("os.statvfs", "filesystem", "unsupported", "hasattr-probe", "MICROPY_PY_OS_STATVFS", 'hasattr(os, "statvfs")')
 except Exception as e:
     check("filesystem_info", "error", "direct-read", type(e).__name__)
 
@@ -66,21 +56,10 @@ try:
         info("memory.free", gc.mem_free())
     if hasattr(gc, "mem_alloc"):
         info("memory.allocated", gc.mem_alloc())
-    feature("gc.mem_free", "memory", supported(hasattr(gc, "mem_free")), "hasattr-probe", "MICROPY_PY_GC", 'hasattr(gc, "mem_free")')
 except Exception:
-    feature("gc.mem_free", "memory", "unsupported", "import-probe", "MICROPY_PY_GC", "import gc")
+    pass
 
 check("raw_repl", "ok", "behaviour-probe", "command execution succeeded")
-
-try:
-    import micropython
-    has_kbd = hasattr(micropython, "kbd_intr")
-    feature("micropython.kbd_intr", "debug", supported(has_kbd), "hasattr-probe", "MICROPY_KBD_EXCEPTION", 'hasattr(micropython, "kbd_intr")')
-    feature("micropython.mem_info", "memory", supported(hasattr(micropython, "mem_info")), "hasattr-probe", "MICROPY_PY_MICROPYTHON_MEM_INFO", 'hasattr(micropython, "mem_info")')
-    feature("micropython.stack_use", "memory", supported(hasattr(micropython, "stack_use")), "hasattr-probe", "MICROPY_PY_MICROPYTHON_STACK_USE", 'hasattr(micropython, "stack_use")')
-    feature("micropython.schedule", "runtime", supported(hasattr(micropython, "schedule")), "hasattr-probe", "MICROPY_ENABLE_SCHEDULER", 'hasattr(micropython, "schedule")')
-except Exception:
-    feature("micropython.kbd_intr", "debug", "unsupported", "import-probe", "MICROPY_PY_MICROPYTHON", "import micropython")
 
 try:
     import os
@@ -94,10 +73,8 @@ try:
         f.close()
         if data == b"pyrite":
             check("filesystem_rw", "ok", "behaviour-probe", "write/read/delete passed")
-            feature("filesystem.write", "filesystem", "supported", "behaviour-probe", "MICROPY_VFS_WRITABLE", 'open(path, "wb").write(...)')
         else:
             check("filesystem_rw", "error", "behaviour-probe", "readback mismatch")
-            feature("filesystem.write", "filesystem", "error", "behaviour-probe", "MICROPY_VFS_WRITABLE", 'open(path, "wb").write(...)')
     finally:
         try:
             os.remove(p)
@@ -105,88 +82,6 @@ try:
             pass
 except Exception as e:
     check("filesystem_rw", "error", "behaviour-probe", type(e).__name__)
-    feature("filesystem.write", "filesystem", "unsupported", "behaviour-probe", "MICROPY_VFS_WRITABLE", 'open(path, "wb").write(...)')
-
-try:
-    import os
-    mod_path = "/_pyrite_doctor_mod.py"
-    mod_name = "_pyrite_doctor_mod"
-    try:
-        f = open(mod_path, "w")
-        f.write("VALUE=7\n")
-        f.close()
-        if "/" not in sys.path:
-            sys.path.insert(0, "/")
-        mod = __import__(mod_name)
-        ok = getattr(mod, "VALUE", None) == 7
-        feature("external_import", "filesystem", supported(ok), "behaviour-probe", "MICROPY_ENABLE_EXTERNAL_IMPORT", "write temp .py then import")
-    finally:
-        try:
-            del sys.modules[mod_name]
-        except Exception:
-            pass
-        try:
-            os.remove(mod_path)
-        except Exception:
-            pass
-except Exception:
-    feature("external_import", "filesystem", "unsupported", "behaviour-probe", "MICROPY_ENABLE_EXTERNAL_IMPORT", "write temp .py then import")
-
-try:
-    ok = eval("1+1") == 2
-    feature("eval", "compiler", supported(ok), "behaviour-probe", "MICROPY_PY_BUILTINS_EVAL_EXEC", 'eval("1+1")')
-except Exception:
-    feature("eval", "compiler", "unsupported", "behaviour-probe", "MICROPY_PY_BUILTINS_EVAL_EXEC", 'eval("1+1")')
-
-try:
-    compile("1+1", "<doctor>", "eval")
-    feature("compile", "compiler", "supported", "behaviour-probe", "MICROPY_PY_BUILTINS_COMPILE", 'compile("1+1", "<doctor>", "eval")')
-except Exception:
-    feature("compile", "compiler", "unsupported", "behaviour-probe", "MICROPY_PY_BUILTINS_COMPILE", 'compile("1+1", "<doctor>", "eval")')
-
-try:
-    compile("async def f():\n return 1", "<doctor>", "exec")
-    feature("async_await", "compiler", "supported", "behaviour-probe", "MICROPY_PY_ASYNC_AWAIT", "compile async def")
-except Exception:
-    feature("async_await", "compiler", "unsupported", "behaviour-probe", "MICROPY_PY_ASYNC_AWAIT", "compile async def")
-
-feature("sys.settrace", "debug", supported(hasattr(sys, "settrace")), "hasattr-probe", "MICROPY_PY_SYS_SETTRACE", 'hasattr(sys, "settrace")')
-feature("sys.tracebacklimit", "debug", supported(hasattr(sys, "tracebacklimit")), "hasattr-probe", "MICROPY_PY_SYS_TRACEBACKLIMIT", 'hasattr(sys, "tracebacklimit")')
-feature("sys.stdin.buffer", "runtime", supported(hasattr(getattr(sys, "stdin", None), "buffer")), "hasattr-probe", "MICROPY_PY_SYS_STDIO_BUFFER", 'hasattr(sys.stdin, "buffer")')
-
-def import_probe(name, category, macro_hint):
-    try:
-        __import__(name)
-        feature(name, category, "supported", "import-probe", macro_hint, "import " + name)
-    except Exception:
-        feature(name, category, "unsupported", "import-probe", macro_hint, "import " + name)
-
-for item in (
-    ("asyncio", "runtime", "MICROPY_PY_ASYNCIO"),
-    ("machine", "hardware", "MICROPY_PY_MACHINE"),
-    ("network", "network", "MICROPY_PY_NETWORK"),
-    ("socket", "network", "MICROPY_PY_SOCKET"),
-    ("ssl", "network", "MICROPY_PY_SSL"),
-    ("bluetooth", "network", "MICROPY_PY_BLUETOOTH"),
-    ("webrepl", "network", "MICROPY_PY_WEBREPL"),
-    ("websocket", "network", "MICROPY_PY_WEBSOCKET"),
-):
-    import_probe(item[0], item[1], item[2])
-
-try:
-    import machine
-    for name, macro in (
-        ("reset", "MICROPY_PY_MACHINE_RESET"),
-        ("freq", "MICROPY_PY_MACHINE"),
-        ("Pin", "MICROPY_PY_MACHINE_PIN"),
-        ("I2C", "MICROPY_PY_MACHINE_I2C"),
-        ("SPI", "MICROPY_PY_MACHINE_SPI"),
-        ("UART", "MICROPY_PY_MACHINE_UART"),
-        ("WDT", "MICROPY_PY_MACHINE_WDT"),
-    ):
-        feature("machine." + name, "hardware", supported(hasattr(machine, name)), "hasattr-probe", macro, 'hasattr(machine, "' + name + '")')
-except Exception:
-    pass
 
 print("PYRITE_DOCTOR_END")
 """
@@ -195,7 +90,6 @@ print("PYRITE_DOCTOR_END")
 def parse_doctor_output(output: str) -> dict[str, Any]:
     info: dict[str, Any] = {}
     checks: list[dict[str, Any]] = []
-    features: list[dict[str, str]] = []
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -212,15 +106,11 @@ def parse_doctor_output(output: str) -> dict[str, Any]:
                 "confidence": parts[3],
                 "message": "|".join(parts[4:]),
             })
-        elif kind == "FEATURE" and len(parts) >= 7:
-            features.append({
-                "id": parts[1],
-                "category": parts[2],
-                "status": parts[3],
-                "confidence": parts[4],
-                "macro_hint": parts[5],
-                "probe": "|".join(parts[6:]),
-            })
+
+    features = [
+        feature.to_dict()
+        for feature in parse_board_feature_output(output)
+    ]
 
     board = {
         "implementation": info.get("firmware.name"),
@@ -258,7 +148,7 @@ def parse_doctor_output(output: str) -> dict[str, Any]:
 
 def run_doctor(mp: Any, connect_ms: int | None = None) -> dict[str, Any]:
     start = time.perf_counter()
-    output = mp.run(DOCTOR_SCRIPT, timeout=30)
+    output = mp.run(DOCTOR_SCRIPT + "\n" + build_probe_script(), timeout=30)
     raw_repl_ms = int((time.perf_counter() - start) * 1000)
     report = parse_doctor_output(output)
     _apply_shared_board_context(report, mp)

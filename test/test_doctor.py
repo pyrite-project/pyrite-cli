@@ -54,6 +54,9 @@ def test_run_doctor_reports_observable_firmware_features():
     report = run_doctor(mp, connect_ms=12)
 
     assert report["connection"]["connect_ms"] == 12
+    script = mp.run.call_args.args[0]
+    assert "PYRITE_FEATURES_BEGIN" in script
+    assert "import zlib" in script
     assert report["board"]["platform"] == "esp32"
     assert report["memory"]["total"] == 238800
     assert report["filesystem"]["used"] == 1048576

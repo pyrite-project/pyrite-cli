@@ -276,7 +276,12 @@ def load_manifest_plan(
                 features=tuple(features or ()),
             ))
         elif func_name == "package":
-            for f in sorted(local_path.rglob("*.py")):
+            for f in sorted(
+                path for path in local_path.rglob("*")
+                if path.is_file()
+                and "__pycache__" not in path.parts
+                and path.suffix not in {".pyi", ".pyc"}
+            ):
                 _ensure_inside_base(f.resolve(), base, node.value.lineno, str(f))
                 rel = str(f.relative_to(base)).replace("\\", "/")
                 if remote:

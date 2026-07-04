@@ -13,6 +13,11 @@ from typing import Callable, Optional, Set
 
 from ..utils.ui import _GREEN, _RESET, _YELLOW
 from ..utils.config import DEFAULT_BAUDRATE, HASH_CONFIG_FILE
+from ..utils.project_files import (
+    PROJECT_IGNORED_DIRS,
+    PROJECT_IGNORED_FILENAMES,
+    is_project_upload_filename,
+)
 from ..utils.device_tests import (
     DeviceTestPlan,
     DeviceTestSession,
@@ -26,21 +31,8 @@ log = get_logger(__name__)
 _SOFT_REBOOT = b"\x04"
 
 _WATCH_FILE_NAMES = {"manifest.py", ".pyrite_config.json", "pyproject.toml"}
-_IGNORED_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".pyrite_cache",
-    ".venv",
-    "venv",
-    "env",
-    "build",
-    "dist",
-}
-_IGNORED_FILES = {HASH_CONFIG_FILE}
+_IGNORED_DIRS = set(PROJECT_IGNORED_DIRS)
+_IGNORED_FILES = set(PROJECT_IGNORED_FILENAMES) | {HASH_CONFIG_FILE}
 
 
 @dataclass
@@ -144,9 +136,11 @@ class ProjectWatcher:
 
     @staticmethod
     def _should_watch_name(name: str) -> bool:
+        if name in _WATCH_FILE_NAMES:
+            return True
         if name in _IGNORED_FILES:
             return False
-        return name.endswith(".py") or name in _WATCH_FILE_NAMES
+        return is_project_upload_filename(name)
 
     @staticmethod
     def _add_stat(result: dict[str, tuple[int, int]], path: Path) -> None:
@@ -333,7 +327,7 @@ class DevSession:
             path = Path(raw)
             if not path.exists() or path.name in _WATCH_FILE_NAMES:
                 return None
-            if path.name in _IGNORED_FILES or not path.name.endswith(".py"):
+            if path.name in _IGNORED_FILES or not is_project_upload_filename(path.name):
                 return None
             try:
                 path.resolve().relative_to(root)

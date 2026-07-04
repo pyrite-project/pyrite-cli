@@ -12,6 +12,7 @@ def _write(path: Path, text: str):
 
 def test_package_remote_prefix_is_applied(tmp_path: Path):
     _write(tmp_path / "pkg" / "a.py", "print('a')\n")
+    _write(tmp_path / "pkg" / "config.json", "{}\n")
     _write(tmp_path / "pkg" / "sub" / "b.py", "print('b')\n")
     manifest = tmp_path / "manifest.py"
     _write(manifest, 'package("pkg", remote="/lib")\n')
@@ -20,6 +21,7 @@ def test_package_remote_prefix_is_applied(tmp_path: Path):
     remotes = {rp for _, rp in entries}
 
     assert "/lib/pkg/a.py" in remotes
+    assert "/lib/pkg/config.json" in remotes
     assert "/lib/pkg/sub/b.py" in remotes
 
 

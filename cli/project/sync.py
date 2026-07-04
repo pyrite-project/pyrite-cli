@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from ..utils.config import HASH_CONFIG_FILE, _HASH_VERSION
 from ..utils.flash import SET_EXECUTE, _strip_repl_trailer
 from ..utils.log import get_logger
-from ..utils.build import load_manifest
+from ..utils.project_files import collect_project_files
 from ..utils.ui import log as output_log, print_json, safe_text
 
 if TYPE_CHECKING:
@@ -172,25 +172,16 @@ class ProjectSyncManager:
         local_dir: str,
         active_tags: Optional[Set[str]] = None,
         manifest_path: Optional[str] = None,
+        exclude_paths: Optional[Set[str]] = None,
     ) -> List[Tuple[str, str]]:
         """收集项目中可刷入的文件列表。"""
-        if manifest_path:
-            entries = load_manifest(
-                manifest_path, active_tags or set(), base_dir=local_dir,
-            )
-        else:
-            entries = []
-            for root, _dirs, files in os.walk(local_dir):
-                for fn in files:
-                    if not fn.endswith(".py"):
-                        continue
-                    lp = os.path.join(root, fn)
-                    rp = os.path.relpath(lp, local_dir).replace("\\", "/")
-                    entries.append((lp, rp))
-        return [
-            (lp, rp) for lp, rp in entries
-            if Path(rp).name != "manifest.py" and not lp.endswith(".pyi")
-        ]
+        manifest_tags = (active_tags or set()) if manifest_path else active_tags
+        return collect_project_files(
+            local_dir,
+            active_tags=manifest_tags,
+            manifest_path=manifest_path,
+            exclude_paths=exclude_paths,
+        )
 
     # ── project scan ────────────────────────────────
 
@@ -205,7 +196,12 @@ class ProjectSyncManager:
         if hash_config_path is None:
             hash_config_path = os.path.join(local_dir, HASH_CONFIG_FILE)
 
-        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        entries = self._collect_project_files(
+            local_dir,
+            active_tags,
+            manifest_path,
+            exclude_paths={hash_config_path},
+        )
 
         file_hashes: Dict[str, str] = {}
         for lp, _rp in entries:
@@ -252,7 +248,12 @@ class ProjectSyncManager:
             log.warning("未找到哈希配置文件，将全量刷入")
             stored_hashes = {}
 
-        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        entries = self._collect_project_files(
+            local_dir,
+            active_tags,
+            manifest_path,
+            exclude_paths={hash_config_path},
+        )
         if not entries:
             log.info("没有需要刷入的文件")
             return []
@@ -468,7 +469,12 @@ class ProjectSyncManager:
         else:
             stored = {}
 
-        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        entries = self._collect_project_files(
+            local_dir,
+            active_tags,
+            manifest_path,
+            exclude_paths={hash_config_path},
+        )
         if not entries:
             if fmt == "json":
                 print_json({
@@ -596,7 +602,12 @@ class ProjectSyncManager:
         fmt: str = "text",
     ) -> bool:
         """从设备下载文件到本地（批量传输）。"""
-        entries = self._collect_project_files(local_dir, active_tags, manifest_path)
+        entries = self._collect_project_files(
+            local_dir,
+            active_tags,
+            manifest_path,
+            exclude_paths={hash_config_path} if hash_config_path else None,
+        )
         pre_skipped: List[Dict[str, str]] = []
         if not entries:
             if fmt != "json":

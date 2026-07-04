@@ -8,7 +8,7 @@
 
 pyrite-cli 是一个 MicroPython 设备串口工具，通过 UART 原始 REPL 协议与设备通信，提供文件刷入、交互式 REPL、自动编译、条件编译、增量刷入、项目脚手架等功能。CLI 入口为 `pyrcli`（定义在 `pyproject.toml` 中 `cli.main:main`）。
 
-## 架构
+## 架
 
 ```
 cli/

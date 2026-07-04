@@ -86,6 +86,13 @@ def test_project_watcher_ignores_hash_config_updates(tmp_path: Path):
         str(tmp_path / "main.py")
     }
 
+    (tmp_path / "config.json").write_text('{"mode":"dev"}\n', encoding="utf-8")
+    after_data = watcher.snapshot()
+
+    assert watcher.changed_paths(after_source, after_data) == {
+        str(tmp_path / "config.json")
+    }
+
 
 def test_project_flash_can_limit_work_to_changed_local_paths(tmp_path: Path):
     changed = tmp_path / "main.py"

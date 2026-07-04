@@ -1,6 +1,7 @@
 import os
 import binascii
 import io
+import json
 import queue
 import sys
 import threading
@@ -1180,6 +1181,21 @@ class TestCompilerCache:
 
 
 class TestProjectFlashBatching:
+    def test_project_scan_hashes_non_python_files(self, tmp_path: Path):
+        (tmp_path / "main.py").write_text("print('same')\n", encoding="utf-8")
+        (tmp_path / "config.json").write_text('{"mode":"new"}\n', encoding="utf-8")
+        (tmp_path / "manifest.py").write_text("module('main.py')\n", encoding="utf-8")
+        (tmp_path / "feature_stub.pyi").write_text("def pin() -> None: ...\n", encoding="utf-8")
+        (tmp_path / ".pyrite_config.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "pyrite_file_config.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "__pycache__" / "cached.py").write_text("print('skip')\n", encoding="utf-8")
+
+        hash_config = ProjectSyncManager(MagicMock()).scan(str(tmp_path))
+        files = json.loads(Path(hash_config).read_text(encoding="utf-8"))["files"]
+
+        assert sorted(files) == ["config.json", "main.py"]
+
     def test_project_flash_batches_changed_files(self, tmp_path: Path):
         (tmp_path / "main.py").write_text("print('new')\n", encoding="utf-8")
         (tmp_path / "lib").mkdir()
@@ -1215,6 +1231,67 @@ class TestProjectFlashBatching:
         assert mp.flash_entries.call_args.kwargs["bytecode_ver"] == 6
         assert mp.flash_entries.call_args.kwargs["arch"] == "xtensa"
         mp.flash_file.assert_not_called()
+
+    def test_project_flash_batches_changed_non_python_files(self, tmp_path: Path):
+        main = tmp_path / "main.py"
+        data = tmp_path / "config.json"
+        main.write_text("print('same')\n", encoding="utf-8")
+        data.write_text('{"mode":"new"}\n', encoding="utf-8")
+
+        hash_config = tmp_path / "pyrite_file_config.json"
+        hash_config.write_text(
+            json.dumps({
+                "version": 1,
+                "hash_algorithm": "sha256",
+                "files": {
+                    "main.py": compute_file_hash(str(main)),
+                    "config.json": "old",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        mp = MagicMock()
+        mp.flash_entries.return_value = [(str(data), "/app/config.json", True)]
+
+        results = ProjectSyncManager(mp).flash(
+            str(tmp_path),
+            "/app",
+            hash_config_path=str(hash_config),
+        )
+
+        assert results == mp.flash_entries.return_value
+        mp.flash_entries.assert_called_once()
+        assert mp.flash_entries.call_args.args[0] == [
+            (str(data), "/app/config.json"),
+        ]
+
+    def test_flash_entries_does_not_compile_non_python_files(self, tmp_path: Path, monkeypatch):
+        data = tmp_path / "config.json"
+        data.write_text('{"mode":"new"}\n', encoding="utf-8")
+        compile_jobs = []
+
+        def fake_compile_files_parallel(files, bytecode_ver=None, arch=None):
+            compile_jobs.extend(files)
+            return {}
+
+        monkeypatch.setattr(
+            "cli.utils.flash.flash._compile_files_parallel",
+            fake_compile_files_parallel,
+        )
+
+        mp = MicroPython(transport=MagicMock())
+        mp.config.auto_compile = True
+
+        result = mp.flash_entries(
+            [(str(data), "/app/config.json")],
+            bytecode_ver=6,
+            arch="xtensa",
+            dry_run=True,
+        )
+
+        assert result == []
+        assert compile_jobs == []
 
 
 # ── _compute_file_hash ──────────────────────────────────────────────

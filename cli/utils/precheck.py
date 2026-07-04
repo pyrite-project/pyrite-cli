@@ -1179,20 +1179,16 @@ def collect_directory_entries(
     remote_prefix: str,
     active_tags: Optional[Set[str]] = None,
     manifest_path: Optional[str] = None,
+    exclude_paths: Optional[Iterable[str]] = None,
 ) -> list[PrecheckEntry]:
-    from .build import load_manifest
+    from .project_files import collect_project_files
 
-    if manifest_path:
-        raw_entries = load_manifest(manifest_path, active_tags, base_dir=directory)
-    else:
-        raw_entries = []
-        for root, _dirs, files in os.walk(directory):
-            for filename in files:
-                if not filename.endswith(".py"):
-                    continue
-                local_path = os.path.join(root, filename)
-                rel = os.path.relpath(local_path, directory).replace("\\", "/")
-                raw_entries.append((local_path, rel))
+    raw_entries = collect_project_files(
+        directory,
+        active_tags=active_tags,
+        manifest_path=manifest_path,
+        exclude_paths=exclude_paths,
+    )
 
     entries: list[PrecheckEntry] = []
     for local_path, remote_part in raw_entries:
@@ -1246,5 +1242,6 @@ def collect_project_precheck_entries(
         remote_prefix,
         active_tags=active_tags,
         manifest_path=manifest_path,
+        exclude_paths={hash_config_path} if hash_config_path else None,
     )
     return filter_entries_to_changed(entries, directory, hash_config_path)

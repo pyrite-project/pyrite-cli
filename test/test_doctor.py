@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from cli.main import app
 from cli.utils.diagnostics import run_doctor
+from cli.utils.device_context import DeviceContext
 
 
 runner = CliRunner()
@@ -36,6 +37,13 @@ PYRITE_DOCTOR_END
 def _fake_mp():
     mp = MagicMock()
     mp.config = SimpleNamespace(chunk_size=4096, verify="size", max_retries=2)
+    mp.ensure_device_context.return_value = DeviceContext(
+        implementation="micropython",
+        version="1.22.0",
+        platform="esp32",
+        machine="ESP32-S3 module",
+        release="1.22.0",
+    )
     mp.run.return_value = DOCTOR_OUTPUT
     return mp
 
@@ -108,3 +116,29 @@ def test_debug_doctor_text_uses_board_info_section_style():
     assert "host-assisted tunnel" in result.stdout
     assert "Board:" not in result.stdout
     assert "Firmware:" not in result.stdout
+
+
+def test_debug_board_info_uses_shared_context_for_identity_fields():
+    mp = _fake_mp()
+    mp.run.return_value = "\n".join([
+        "CPU:240000000",
+        "UID:abcdef",
+        "RST:PWRON_RESET",
+        "MF:10",
+        "MA:5",
+        "FS:100/40",
+    ])
+
+    with patch("cli.reg_commands.debug._mp_factory", return_value=mp):
+        result = runner.invoke(app, ["debug", "board-info", "COM3", "--format", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["firmware"] == {
+        "name": "micropython 1.22.0",
+        "platform": "esp32",
+        "machine": "ESP32-S3 module",
+        "release": "1.22.0",
+    }
+    mp.ensure_device_context.assert_called_once()
+    assert "sys.implementation" not in mp.run.call_args.args[0]

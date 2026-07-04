@@ -32,6 +32,8 @@ def supported(value):
     return "supported" if value else "unsupported"
 
 try:
+    # Kept in the capability payload for older parsers; run_doctor overwrites
+    # report["board"] from the shared DeviceContext after this script returns.
     info("firmware.name", sys.implementation.name)
     info("firmware.version", ".".join(str(x) for x in sys.implementation.version))
     info("firmware.platform", sys.platform)
@@ -259,6 +261,7 @@ def run_doctor(mp: Any, connect_ms: int | None = None) -> dict[str, Any]:
     output = mp.run(DOCTOR_SCRIPT, timeout=30)
     raw_repl_ms = int((time.perf_counter() - start) * 1000)
     report = parse_doctor_output(output)
+    _apply_shared_board_context(report, mp)
 
     checks = report["checks"]
     if connect_ms is not None:
@@ -289,6 +292,28 @@ def run_doctor(mp: Any, connect_ms: int | None = None) -> dict[str, Any]:
     report["recommendations"] = _doctor_recommendations(report)
     report["summary"] = _summary(report)
     return report
+
+
+def _apply_shared_board_context(report: dict[str, Any], mp: Any) -> None:
+    ensure_context = getattr(mp, "ensure_device_context", None)
+    if not callable(ensure_context):
+        return
+    try:
+        context = ensure_context()
+    except Exception:
+        return
+    board = report.setdefault("board", {})
+    for key, attr in (
+        ("implementation", "implementation"),
+        ("version", "version"),
+        ("platform", "platform"),
+        ("machine", "machine"),
+        ("release", "release"),
+        ("sysname", "sysname"),
+    ):
+        value = getattr(context, attr, None)
+        if isinstance(value, str) and value.strip():
+            board[key] = value
 
 
 def _coerce_scalar(value: str) -> Any:

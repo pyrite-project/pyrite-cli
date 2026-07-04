@@ -13,6 +13,7 @@ from typing import Callable, Optional, Set
 
 from ..utils.ui import _GREEN, _RESET, _YELLOW
 from ..utils.config import DEFAULT_BAUDRATE, HASH_CONFIG_FILE
+from ..utils.device_context import CommandNeeds, needs_no_mpy, prepare_device
 from ..utils.device_tests import (
     DeviceTestPlan,
     DeviceTestSession,
@@ -24,6 +25,14 @@ from .sync import ProjectSyncManager
 
 log = get_logger(__name__)
 _SOFT_REBOOT = b"\x04"
+DEV_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    repl_preempt=True,
+    device_context=True,
+    active_tags=True,
+    mpy_version=True,
+)
 
 _WATCH_FILE_NAMES = {"manifest.py", ".pyrite_config.json", "pyproject.toml"}
 _IGNORED_DIRS = {
@@ -352,25 +361,19 @@ class DevSession:
             self.mp.config.auto_compile = False
         if self._device_context_ready:
             return
+        needs = DEV_NEEDS
         if self.options.no_compile:
-            self._bytecode_ver, self._arch = None, None
-        else:
-            self._bytecode_ver, self._arch = self.mp.get_mpy_version()
-        self._active_tags = self._resolve_active_tags()
+            needs = needs_no_mpy(DEV_NEEDS)
+        prepared = prepare_device(
+            self.mp,
+            needs,
+            target=self.options.target,
+            feature=self.options.feature,
+            no_feature=self.options.no_feature,
+        )
+        self._bytecode_ver, self._arch = prepared.bytecode_ver, prepared.arch
+        self._active_tags = prepared.active_tags or set()
         self._device_context_ready = True
-
-    def _resolve_active_tags(self) -> Set[str]:
-        if self.options.target:
-            target = self.options.target.upper()
-            tags = set(self.mp.config.board_tags.get(target, [target]))
-            tags.add(target)
-        else:
-            tags = set(self.mp.detect_tags())
-            if not tags:
-                raise RuntimeError("无法识别设备 target，请使用 --target 手动指定")
-        tags.update(_split_tags(self.options.feature))
-        tags.difference_update(_split_tags(self.options.no_feature))
-        return tags
 
     def _return_to_repl(self) -> None:
         try:

@@ -108,6 +108,66 @@ class TestDeviceRuntimeInfo:
 
         assert mp.detect_tags() == {"ESP32", "wifi", "ESP32"}
 
+    def test_enter_raw_repl_is_idempotent_until_invalidated(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        calls = []
+
+        monkeypatch.setattr(mp, "_ensure_connected", lambda: None)
+        monkeypatch.setattr(
+            mp,
+            "_init_device_state",
+            lambda **kwargs: calls.append(kwargs),
+        )
+
+        mp._enter_raw_repl(preempt=False)
+        mp._enter_raw_repl(preempt=True)
+
+        assert calls == [{
+            "preempt": False,
+            "soft_reset_fallback": True,
+            "boot_preempt_fallback": True,
+        }]
+
+        mp.invalidate_device_context(raw_repl=True)
+        mp._enter_raw_repl(
+            preempt=True,
+            soft_reset_fallback=False,
+            boot_preempt_fallback=False,
+        )
+
+        assert calls[-1] == {
+            "preempt": True,
+            "soft_reset_fallback": False,
+            "boot_preempt_fallback": False,
+        }
+        assert len(calls) == 2
+
+    def test_invalidate_device_context_can_drop_runtime_info(self):
+        mp = MicroPython(port="COM99")
+        mp._raw_repl_ready = True
+        mp._runtime_info_probed = True
+        mp.runtime_info = DeviceRuntimeInfo(version="1.22.0")
+
+        mp.invalidate_device_context(raw_repl=True, runtime_info=True)
+
+        assert mp._raw_repl_ready is False
+        assert mp._runtime_info_probed is False
+        assert mp.runtime_info.version is None
+
+    def test_disconnect_invalidates_cached_device_context(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        mp._raw_repl_ready = True
+        mp._runtime_info_probed = True
+        mp.runtime_info = DeviceRuntimeInfo(version="1.22.0")
+        monkeypatch.setattr(mp, "_write", lambda _data: None)
+        monkeypatch.setattr(mp.transport, "reset_input_buffer", lambda: None)
+
+        mp.disconnect()
+
+        assert mp._raw_repl_ready is False
+        assert mp._runtime_info_probed is False
+        assert mp.runtime_info.version is None
+
 
 class TestColorizeReplOutput:
     def test_normal_text_no_change(self):
@@ -987,8 +1047,12 @@ class TestRawReplBaudFallback:
         mp.config.max_retries = 0
         calls = []
 
-        def fake_try_raw_sequence():
+        def fake_try_raw_sequence(**kwargs):
             calls.append(("try", mp.baudrate))
+            assert kwargs == {
+                "preempt": True,
+                "soft_reset_fallback": True,
+            }
             if mp.baudrate == 115200:
                 return True, b"raw REPL; CTRL-B to exit\r\n>"
             return False, b""
@@ -1024,7 +1088,7 @@ class TestRawReplBaudFallback:
         monkeypatch.setattr(
             mp,
             "_try_raw_repl_sequence",
-            lambda: calls.append("raw") or (True, b"raw REPL; CTRL-B to exit\r\n>"),
+            lambda **_kwargs: calls.append("raw") or (True, b"raw REPL; CTRL-B to exit\r\n>"),
         )
         monkeypatch.setattr(mp, "_ensure_filesystem_mounted", lambda: calls.append("fs"))
 

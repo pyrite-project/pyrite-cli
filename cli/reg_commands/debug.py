@@ -8,6 +8,7 @@ from typing import Optional
 import typer
 
 from ..utils.diagnostics import run_doctor
+from ..utils.device_context import CommandNeeds, command_needs, prepare_device
 from ..utils.ui import print_json
 from .common import (
     DEFAULT_BAUDRATE,
@@ -21,6 +22,20 @@ from .common import (
 
 
 debug_app = typer.Typer(help="设备诊断与调试信息", add_completion=False)
+
+BOARD_INFO_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    device_context=True,
+    board_extra_info=True,
+)
+
+DOCTOR_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    device_context=True,
+    capability_probe=True,
+)
 
 
 def register(app: typer.Typer) -> None:
@@ -39,6 +54,7 @@ def _section(title: str) -> None:
 
 
 @debug_app.command("board-info")
+@command_needs(BOARD_INFO_NEEDS)
 def board_info(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
@@ -51,13 +67,8 @@ def board_info(
     """连接设备并获取详细板级信息（固件、CPU、内存、Flash 等）。"""
     fmt = _resolve_format(fmt, json_output)
     code = """\
-import sys,os,gc,machine,ubinascii
-u=os.uname()
+import os,gc,machine,ubinascii
 st=os.statvfs('/')
-print('FW:'+sys.implementation.name+' '+'.'.join(str(x) for x in sys.implementation.version))
-print('PLAT:'+sys.platform)
-print('HW:'+u.machine)
-print('REL:'+u.release)
 print('CPU:'+str(machine.freq()))
 print('UID:'+ubinascii.hexlify(machine.unique_id()).decode())
 rc=machine.reset_cause()
@@ -80,7 +91,7 @@ except:pass
 """
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
-        mp.connect()
+        prepared = prepare_device(mp, BOARD_INFO_NEEDS)
         output = mp.run(code)
     finally:
         mp.disconnect()
@@ -93,6 +104,19 @@ except:pass
         raise typer.Exit(1)
 
     info: dict[str, str] = {}
+    context = prepared.device_context
+    if context is not None:
+        firmware = " ".join(
+            part for part in (context.implementation, context.version) if part
+        )
+        if firmware:
+            info["FW"] = firmware
+        if context.platform:
+            info["PLAT"] = context.platform
+        if context.machine:
+            info["HW"] = context.machine
+        if context.release:
+            info["REL"] = context.release
     for line in output.strip().splitlines():
         if ":" in line:
             k, _, v = line.partition(":")
@@ -157,6 +181,7 @@ except:pass
 
 
 @debug_app.command("doctor")
+@command_needs(DOCTOR_NEEDS)
 def doctor(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
@@ -172,7 +197,7 @@ def doctor(
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         start = time.perf_counter()
-        mp.connect()
+        prepare_device(mp, DOCTOR_NEEDS)
         connect_ms = int((time.perf_counter() - start) * 1000)
         report = run_doctor(mp, connect_ms=connect_ms)
     finally:

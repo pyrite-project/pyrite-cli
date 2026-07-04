@@ -8,6 +8,12 @@ import click
 import typer
 
 from ..utils.ui import print_json, safe_text
+from ..utils.device_context import (
+    CommandNeeds,
+    command_needs,
+    needs_no_mpy,
+    prepare_device,
+)
 from .common import (
     DEFAULT_BAUDRATE,
     MicroPython,
@@ -25,6 +31,15 @@ from .common import (
 # ═══════════════════════════════════════════════════════════════════
 
 fs_app = typer.Typer(help="MicroPython 设备文件浏览器", add_completion=False)
+
+FS_PUT_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    repl_preempt=True,
+    device_context=True,
+    active_tags=True,
+    mpy_version=True,
+)
 
 
 def register(app: typer.Typer) -> None:
@@ -78,25 +93,6 @@ def _read_one_key() -> str:
         if ch in ("q", "Q"):
             return "q"
         return "enter"
-
-
-def _build_tag_args(
-    mp: MicroPython, target: Optional[str],
-    feature: Optional[str], no_feature: Optional[str],
-) -> set[str]:
-    """构建 active_tags 公共逻辑。"""
-    if target:
-        active_tags: set[str] = set(
-            mp.config.board_tags.get(target.upper(), [target.upper()])
-        )
-        active_tags.add(target.upper())
-    else:
-        active_tags = mp.detect_tags()
-    if feature:
-        active_tags.update(t.strip() for t in feature.split(","))
-    if no_feature:
-        active_tags.difference_update(t.strip() for t in no_feature.split(","))
-    return active_tags
 
 
 @fs_app.command("ls")
@@ -244,6 +240,7 @@ def fs_cat(
 
 
 @fs_app.command("put")
+@command_needs(FS_PUT_NEEDS)
 def fs_put(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     local_path: str = typer.Argument(..., help="本地文件路径"),
@@ -268,7 +265,13 @@ def fs_put(
     remote_path = _norm_path(remote_path)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
-        mp.connect()
+        prepared = prepare_device(
+            mp,
+            FS_PUT_NEEDS if not no_compile else needs_no_mpy(FS_PUT_NEEDS),
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+        )
         if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
             mp.safe_break()
         if not force:
@@ -279,14 +282,10 @@ def fs_put(
             except RuntimeError:
                 pass
 
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
-        active_tags = _build_tag_args(mp, target, feature, no_feature)
-        if not active_tags and not target:
-            log.error("无法识别设备 target，请使用 --target 手动指定")
-            raise typer.Exit(1)
+        active_tags = prepared.active_tags or set()
         mp.flash_file(
             local_path, remote_path, compile=not no_compile,
-            bytecode_ver=ver, arch=arch,
+            bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None, dry_run=dry_run,
             safe_main=safe_main,
         )

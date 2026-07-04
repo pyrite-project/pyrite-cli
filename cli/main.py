@@ -28,6 +28,12 @@ from .utils.board_profile import (
     resolve_port_alias,
 )
 from .utils.config import DEFAULT_BAUDRATE, create_default_config, _load_config
+from .utils.device_context import (
+    CommandNeeds,
+    command_needs,
+    needs_no_mpy,
+    prepare_device,
+)
 from .utils.errors import humanize_exception
 from .utils.log import configure_from_verbosity, get_logger
 from .utils.ui import is_tty, print_json
@@ -35,32 +41,15 @@ from .utils.ui import is_tty, print_json
 log = get_logger(__name__)
 
 
-def _device_precheck_mp_version(mp, explicit_version: Optional[str]) -> Optional[str]:
-    if explicit_version is not None:
-        return explicit_version
-    version = getattr(getattr(mp, "runtime_info", None), "version", None)
-    return version if isinstance(version, str) and version.strip() else None
-
-
-def _resolve_flash_tags(
-    mp,
-    target: Optional[str],
-    feature: Optional[str],
-    no_feature: Optional[str],
-) -> set[str]:
-    if target:
-        active_tags = set(mp.config.board_tags.get(target.upper(), [target.upper()]))
-        active_tags.add(target.upper())
-    else:
-        active_tags = set(mp.detect_tags())
-        if not active_tags:
-            log.error("无法识别设备 target，请使用 --target 手动指定")
-            raise typer.Exit(1)
-    if feature:
-        active_tags.update(t.strip() for t in feature.split(",") if t.strip())
-    if no_feature:
-        active_tags.difference_update(t.strip() for t in no_feature.split(",") if t.strip())
-    return active_tags
+FLASH_NEEDS = CommandNeeds(
+    connection=True,
+    raw_repl=True,
+    repl_preempt=True,
+    device_context=True,
+    active_tags=True,
+    mpy_version=True,
+    precheck_version=True,
+)
 
 
 class _LazyObject:
@@ -242,26 +231,27 @@ def _global_options(
 
 # ── 设备信息查询 ──────────────────────────────────────────────────
 
-_BRIEF_CODE = """\
-
-import sys,os,machine
-u=os.uname()
-print(sys.implementation.name+' '+'.'.join(str(x) for x in sys.implementation.version))
-print(u.machine)
-print(str(machine.freq()//1000000)+' MHz')
-"""
+_BRIEF_FREQ_CODE = "import machine\nprint(str(machine.freq()//1000000)+' MHz')\n"
 
 
 def _fetch_brief(port: str) -> str:
     mp = MicroPython(port=port)
     try:
         mp.connect()
-        out = mp.run(_BRIEF_CODE)
+        context = mp.ensure_device_context()
+        out = mp.run(_BRIEF_FREQ_CODE)
     except Exception:
         return ""
     finally:
         mp.disconnect()
-    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    firmware = " ".join(
+        part for part in (context.implementation, context.version) if part
+    )
+    lines = [
+        item
+        for item in (firmware, context.machine, out.strip())
+        if item
+    ]
     return "  " + "  ".join(lines) if lines else ""
 
 
@@ -367,6 +357,7 @@ def scan(
 # ═══════════════════════════════════════════════════════════════════
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@command_needs(FLASH_NEEDS)
 def flash(
     ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
@@ -434,16 +425,21 @@ def flash(
             mp.set_trace_recorder(recorder)
             log.info("trace 文件: %s", recorder.path)
 
-        mp.connect()
-        with mp._trace_phase_ctx("raw_repl"):
-            mp._enter_raw_repl()
-        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        prepared = prepare_device(
+            mp,
+            FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS),
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+            explicit_mp_version=mp_version,
+        )
+        active_tags = prepared.active_tags or set()
         _run_precheck_or_exit(
             [(file, remote_path)],
             check,
             no_check,
             active_tags=active_tags,
-            mp_version=_device_precheck_mp_version(mp, mp_version),
+            mp_version=prepared.precheck_mp_version,
         )
         if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
             mp.safe_break()
@@ -455,10 +451,9 @@ def flash(
             except RuntimeError:
                 pass
 
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         mp.flash_file(
             file, remote_path, compile=not no_compile,
-            bytecode_ver=ver, arch=arch,
+            bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None, dry_run=dry_run,
             safe_main=safe_main,
         )
@@ -515,6 +510,7 @@ def repl(
 # ═══════════════════════════════════════════════════════════════════
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@command_needs(FLASH_NEEDS)
 def flash_program(
     ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
@@ -546,9 +542,15 @@ def flash_program(
     check = _consume_check_option(list(ctx.args))
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
-        mp.connect()
-        mp._enter_raw_repl()
-        active_tags = _resolve_flash_tags(mp, target, feature, no_feature)
+        prepared = prepare_device(
+            mp,
+            FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS),
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+            explicit_mp_version=mp_version,
+        )
+        active_tags = prepared.active_tags or set()
         if not no_check:
             from .utils.precheck import collect_directory_entries
 
@@ -562,13 +564,12 @@ def flash_program(
                 check,
                 no_check,
                 active_tags=active_tags,
-                mp_version=_device_precheck_mp_version(mp, mp_version),
+                mp_version=prepared.precheck_mp_version,
             )
         if no_compile:
             mp.config.auto_compile = False
-        ver, arch = mp.get_mpy_version() if not no_compile else (None, None)
         results = mp.flash_program(
-            directory, remote_path, bytecode_ver=ver, arch=arch,
+            directory, remote_path, bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None,
             manifest_path=manifest, dry_run=dry_run,
             safe_main=safe_main,

@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+from cli.project.project import detect_device_info
 from cli.project import stubs
+from cli.utils.device_context import DeviceContext
 
 
 class _FakeResponse:
@@ -136,3 +140,20 @@ def test_warn_legacy_project_stubs_does_not_remove_directory(
     stubs.warn_legacy_project_stubs(tmp_path)
 
     assert legacy.exists()
+
+
+def test_detect_device_info_uses_shared_device_context():
+    mp = MagicMock()
+    mp.ensure_device_context.return_value = DeviceContext(
+        version="1.22.0",
+        platform="esp32",
+    )
+
+    with patch("cli.utils.flash.MicroPython", return_value=mp):
+        hardware, version = detect_device_info("COM3")
+
+    assert (hardware, version) == ("esp32", "1.22.0")
+    mp.connect.assert_called_once()
+    mp.ensure_device_context.assert_called_once()
+    mp.run.assert_not_called()
+    mp.disconnect.assert_called_once()

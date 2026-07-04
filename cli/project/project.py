@@ -40,22 +40,17 @@ def detect_device_info(
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
-        output = mp.run(
-            "import sys;"
-            "print('.'.join(str(x) for x in sys.implementation.version));"
-            "print(sys.platform)",
-        )
+        context = mp.ensure_device_context()
     except Exception as e:
         raise RuntimeError(f"设备通信失败: {e}") from e
     finally:
         mp.disconnect()
 
-    lines = [line.strip() for line in output.strip().split("\n") if line.strip()]
-    if len(lines) < 2:
-        raise RuntimeError(f"设备返回数据异常:\n{output}")
+    version = context.version
+    hardware = context.platform
+    if not version or not hardware:
+        raise RuntimeError("设备返回数据异常：缺少固件版本或平台信息")
 
-    version = lines[0]
-    hardware = lines[-1]
     log.info("检测到硬件: %s, 固件版本: %s", hardware, version)
     return hardware, version
 

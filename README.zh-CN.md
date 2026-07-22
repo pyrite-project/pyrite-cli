@@ -185,7 +185,8 @@ Pyrite CLI 会进入 raw REPL、分块传输代码、校验结果，并恢复设
 
 ```bash
 pyrcli project new my-project
-pyrcli project new my-project --platform COM3
+pyrcli project new my-project --platform esp32
+pyrcli project new my-project --port COM3
 ```
 
 刷入目录：

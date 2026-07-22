@@ -185,7 +185,8 @@ Create a project and prepare editor support:
 
 ```bash
 pyrcli project new my-project
-pyrcli project new my-project --platform COM3
+pyrcli project new my-project --platform esp32
+pyrcli project new my-project --port COM3
 ```
 
 Flash a directory:

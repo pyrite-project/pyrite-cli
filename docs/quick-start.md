@@ -131,7 +131,8 @@ pyrcli pkg install-offline COM3 .pyrite/pkg-cache/aioble
 
 ```bash
 pyrcli project new my-project        # Create a project interactively
-pyrcli project new . --platform COM3 # Auto-detect through serial
+pyrcli project new . --platform esp32 # Specify the MicroPython platform
+pyrcli project new . --port COM3     # Auto-detect through serial
 pyrcli project hash .                # Calculate SHA256 hashes
 pyrcli project flash COM3 . /        # Incremental flash
 pyrcli project status COM3 . /       # Preview differences

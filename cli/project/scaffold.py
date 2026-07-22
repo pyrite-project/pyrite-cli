@@ -97,18 +97,25 @@ def _configure_project_stubs(
 
 
 def new_project_interactive(
-    proj_name: str, platform: Optional[str] = None,
+    proj_name: str,
+    platform: Optional[str] = None,
+    port: Optional[str] = None,
 ) -> None:
     """创建一个支持交互式硬件/版本选择的新 MicroPython 项目。"""
     init_project(proj_name)
 
-    if platform:
-        log.info("通过 %s 连接设备进行自动检测...", platform)
+    if port:
+        log.info("通过 %s 连接设备进行自动检测...", port)
         try:
-            hardware, version = detect_device_info(platform)
+            hardware, version = detect_device_info(port)
         except Exception as e:
             log.error("设备检测失败: %s", e)
-            log.info("项目目录 '%s' 已创建，可稍后运行 'cd %s && pyrcli init' 手动配置", proj_name, proj_name)
+            log.info(
+                "项目目录 '%s' 已创建，可稍后运行 "
+                "'cd %s && pyrcli project init' 手动配置",
+                proj_name,
+                proj_name,
+            )
             return
 
         log.info("正在查询可用存根...")
@@ -116,8 +123,15 @@ def new_project_interactive(
             dirs = list_stub_dirs()
         except Exception as e:
             log.error("获取存根列表失败: %s", e)
-            log.info("项目目录 '%s' 已创建，可稍后运行 'pyrcli init %s %s' 手动配置", proj_name, hardware, version)
+            log.info(
+                "项目目录 '%s' 已创建，可稍后运行 "
+                "'pyrcli project init %s %s' 手动配置",
+                proj_name,
+                hardware,
+                version,
+            )
             return
+        log.info("可用存根查询完成，共 %d 个目录", len(dirs))
 
         orig_cwd = os.getcwd()
         try:
@@ -141,24 +155,46 @@ def new_project_interactive(
                     variant=None,
                 )
             else:
-                log.warning("未找到 %s v%s 的匹配存根，可稍后运行 'pyrcli init %s %s' 配置", hardware, version, hardware, version)
+                log.warning(
+                    "未找到 %s v%s 的匹配存根，可稍后运行 "
+                    "'pyrcli project init %s %s' 配置",
+                    hardware,
+                    version,
+                    hardware,
+                    version,
+                )
         finally:
             os.chdir(orig_cwd)
         return
 
-    # 交互式选择模式
-    log.info("正在查询可用硬件...")
+    log.info("正在查询可用平台...")
     try:
         dirs = list_stub_dirs()
     except Exception as e:
-        log.error("获取硬件列表失败: %s", e)
+        log.error("获取平台列表失败: %s", e)
         return
 
     hw_types = sorted(get_hardware_types(dirs))
     if not hw_types:
-        log.warning("未找到可用的硬件类型")
+        log.warning("未找到可用平台")
         return
-    selected_hw = interactive_select(hw_types, "选择硬件类型")
+    log.info("可用平台查询完成，共 %d 个", len(hw_types))
+
+    if platform:
+        selected_hw = next(
+            (item for item in hw_types if item.casefold() == platform.casefold()),
+            None,
+        )
+        if selected_hw is None:
+            log.error(
+                "不支持的平台 '%s'，可用平台: %s",
+                platform,
+                ", ".join(hw_types),
+            )
+            return
+        log.info("已指定平台: %s", selected_hw)
+    else:
+        selected_hw = interactive_select(hw_types, "选择平台")
 
     versions = _get_versions_for_hardware(dirs, selected_hw)
     if not versions:
@@ -263,12 +299,12 @@ def init_stubs(
     hardware: Optional[str] = None,
     version: Optional[str] = None,
     variant: Optional[str] = None,
-    platform: Optional[str] = None,
+    port: Optional[str] = None,
 ) -> None:
     """在已有项目中下载 MicroPython 类型存根。"""
-    if platform:
+    if port:
         try:
-            hardware, version = detect_device_info(platform)
+            hardware, version = detect_device_info(port)
         except Exception as e:
             log.error("设备检测失败: %s", e)
             sys.exit(1)

@@ -54,37 +54,37 @@ Connects to a device via serial port and auto-detects hardware type and firmware
 - Returns `(hardware, version)` tuple, e.g. `('esp32', '1.22.2')`
 - Raises: `RuntimeError` — connection failed or output parsing failed
 
-### `new_project_interactive(proj_name: str, platform: str | None = None)`
+### `new_project_interactive(proj_name, platform=None, port=None)`
 
 Interactively creates a new MicroPython project and downloads stubs. The recommended entry point (called by the `pyrcli new` command).
 
-**Auto-detect mode** (when `--platform` is specified):
+**Auto-detect mode** (when `--port` is specified):
 1. Calls `init_project()` to create the directory
 2. Reads hardware and version via `detect_device_info()`
 3. Queries available stubs, auto-matches and downloads
 4. If no exact match, tries the nearest version
 5. Configures VS Code
 
-**Interactive selection mode** (when `--platform` is not specified):
+**Platform selection mode** (when `--port` is not specified):
 1. Calls `init_project()` to create the directory
 2. Fetches available hardware list from GitHub API → user selects via keyboard
 3. Filters versions based on selected hardware → user selects
 4. If variants exist (e.g. `ESP32_GENERIC`) → user selects
 5. Downloads stubs + VS Code configuration
 
-### `init_stubs(hardware=None, version=None, variant=None, platform=None)`
+### `init_stubs(hardware=None, version=None, variant=None, port=None)`
 
 Initializes MicroPython type stubs in an existing project.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `hardware` | No | Hardware type, e.g. `esp32`, `rp2` (can be omitted when using `--platform`) |
-| `version` | No | Firmware version, e.g. `1.20.0` (can be omitted when using `--platform`) |
+| `hardware` | No | Hardware type, e.g. `esp32`, `rp2` (can be omitted when using `--port`) |
+| `version` | No | Firmware version, e.g. `1.20.0` (can be omitted when using `--port`) |
 | `variant` | No | Specific hardware variant, e.g. `ESP32_GENERIC`, `PICO_W` |
-| `platform` | No | Serial port name; auto-detects hardware and downloads matching stubs |
+| `port` | No | Serial port name; auto-detects hardware and downloads matching stubs |
 
 Full procedure:
-1. If `platform` is specified, calls `detect_device_info()` for auto-detection
+1. If `port` is specified, calls `detect_device_info()` for auto-detection
 2. Calls `list_stub_dirs()` to fetch all available stub directories from the GitHub API
 3. Calls `find_stub_dir()` to find the best matching stub directory
 4. On failure, tries `_find_nearest_version()` to match the closest version
@@ -332,31 +332,31 @@ package("lib")
 ## Data Flow
 
 ```
-pyrcli new <name> [--platform COM3]
-  └── new_project_interactive(name, platform)
+pyrcli project new <name> [--platform esp32 | --port COM3]
+  └── new_project_interactive(name, platform, port)
         ├── init_project(name)
         │     ├── os.mkdir(name)
         │     ├── copy feature_stub.pyi
         │     └── create manifest.py
         │
-        ├── [--platform mode]
-        │     ├── detect_device_info(port) → (hardware, version)
+        ├── [--port mode]
+│     ├── detect_device_info(port) → (hardware, version)
         │     ├── list_stub_dirs()
         │     ├── find_stub_dir(dirs, hardware, version)
         │     ├── download_stubs(stub_dir, '')
         │     └── create_vscode_config(...)
         │
-        └── [interactive mode]
+        └── [platform/interactive mode]
               ├── list_stub_dirs()
-              ├── interactive_select(hardware)
+              ├── [without --platform] interactive_select(hardware)
               ├── interactive_select(version)
               ├── [optional] interactive_select(variant)
               ├── download_stubs(stub_dir, '')
               └── create_vscode_config(...)
 
-pyrcli init <hardware> <version> [--variant <V>] [--platform COM3]
-  └── init_stubs(hardware, version, variant, platform)
-        ├── [--platform] detect_device_info(port) → auto-detect
+pyrcli project init <hardware> <version> [--variant <V>] [--port COM3]
+  └── init_stubs(hardware, version, variant, port)
+        ├── [--port] detect_device_info(port) → auto-detect
         ├── list_stub_dirs()
         ├── find_stub_dir(...) → best match
         ├── [_find_nearest_version()] → fallback match

@@ -74,7 +74,7 @@ def test_keyboard_event_encoding_common_keys_and_reserved_exit_keys():
 
 def test_host_keyboard_unix_raw_mode_restores_terminal(monkeypatch):
     calls = []
-    monkeypatch.setattr("cli.utils.tunnel.tunnel.os.name", "posix")
+    monkeypatch.setattr("cli.utils.tunnel.host.os.name", "posix")
     monkeypatch.setattr(sys.stdin, "fileno", lambda: 7)
 
     class Termios:
@@ -107,7 +107,7 @@ def test_host_keyboard_unix_raw_mode_restores_terminal(monkeypatch):
 
 
 def test_host_keyboard_windows_reads_msvcrt(monkeypatch):
-    monkeypatch.setattr("cli.utils.tunnel.tunnel.os.name", "nt")
+    monkeypatch.setattr("cli.utils.tunnel.host.os.name", "nt")
 
     class Msvcrt:
         @staticmethod
@@ -135,7 +135,7 @@ def test_network_policy_validates_method_allowlist_and_private_targets():
     )
 
     with patch(
-        "cli.utils.tunnel.tunnel.socket.getaddrinfo",
+        "cli.utils.tunnel.host.socket.getaddrinfo",
         return_value=[
             (None, None, None, "", ("93.184.216.34", 443)),
         ],
@@ -169,7 +169,7 @@ def test_network_policy_validates_method_allowlist_and_private_targets():
 
 def test_network_policy_rejects_private_dns_resolution():
     with patch(
-        "cli.utils.tunnel.tunnel.socket.getaddrinfo",
+        "cli.utils.tunnel.host.socket.getaddrinfo",
         return_value=[
             (None, None, None, "", ("127.0.0.1", 443)),
         ],

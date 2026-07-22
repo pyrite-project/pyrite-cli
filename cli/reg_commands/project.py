@@ -169,11 +169,18 @@ def project_new(
     project_name: str = typer.Argument(..., help="新项目名称"),
     platform: Optional[str] = typer.Option(
         None, "--platform",
-        help="串口号，用于自动检测硬件并下载匹配的 stubs",
+        help="直接指定 MicroPython 平台，如 esp32 或 rp2",
+    ),
+    port: Optional[str] = typer.Option(
+        None, "--port", "-p",
+        help="串口号，用于自动检测平台和固件版本",
+        autocompletion=_complete_port,
     ),
 ) -> None:
     """创建新 MicroPython 项目目录及脚手架。"""
-    new_project_interactive(project_name, platform=platform)
+    if platform and port:
+        raise typer.BadParameter("--platform 和 --port 不能同时使用")
+    new_project_interactive(project_name, platform=platform, port=port)
 
 
 @project_app.command("init")
@@ -181,13 +188,14 @@ def project_init(
     hardware: Optional[str] = typer.Argument(None, help="MicroPython 硬件名称"),
     version: Optional[str] = typer.Argument(None, help="固件版本，如 '1.20.0'"),
     variant: Optional[str] = typer.Option(None, "--variant", "-V", help="硬件变体"),
-    platform: Optional[str] = typer.Option(
-        None, "--platform",
+    port: Optional[str] = typer.Option(
+        None, "--port", "-p",
         help="串口号，用于自动检测硬件并下载匹配的 stubs",
+        autocompletion=_complete_port,
     ),
 ) -> None:
     """在已有项目中下载 MicroPython 类型存根。"""
-    init_stubs(hardware, version, variant, platform)
+    init_stubs(hardware, version, variant, port)
 
 
 @project_app.command("hash")

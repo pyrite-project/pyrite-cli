@@ -1,3 +1,3 @@
 """Pyrite tunnel helpers."""
 
-from .tunnel import *  # noqa: F401,F403
+from .host import *  # noqa: F401,F403

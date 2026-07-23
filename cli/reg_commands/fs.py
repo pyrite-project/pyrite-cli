@@ -17,7 +17,6 @@ from ..utils.device_context import (
 )
 from .common import (
     DEFAULT_BAUDRATE,
-    MicroPython,
     _complete_port,
     _FORMAT_OPTION,
     _JSON_OPTION,

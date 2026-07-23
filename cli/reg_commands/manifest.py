@@ -29,20 +29,31 @@ def _split_tags(value: Optional[str]) -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 
 
-def _active_tags_for_profile(
-    profile: Optional[str],
+def _active_tags_for_target(
+    target: Optional[str],
     feature: Optional[str],
     no_feature: Optional[str],
 ) -> set[str]:
     active: set[str] = set()
-    if profile:
+    if target:
         cfg = _load_config()
-        key = profile.upper()
+        key = target.upper()
         active.update(cfg.board_tags.get(key, [key]))
         active.add(key)
     active.update(_split_tags(feature))
     active.difference_update(_split_tags(no_feature))
     return active
+
+
+def _resolve_target(target: Optional[str], profile: Optional[str]) -> Optional[str]:
+    """Resolve the renamed target option while accepting the old spelling."""
+    if profile is None:
+        return target
+    if target is not None and target != profile:
+        log.error("--target 与已弃用的 --profile 不能指定不同值")
+        raise typer.Exit(2)
+    log.warning("--profile 已弃用, 请改用 --target")
+    return target or profile
 
 
 def _build_settings(no_compile: bool) -> dict[str, object]:
@@ -58,8 +69,8 @@ def _print_manifest_payload(payload: Mapping[str, object], fmt: str) -> None:
     manifest = payload.get("manifest")
     if isinstance(manifest, Mapping):
         print(f"  manifest: {manifest.get('path')}")
-    if payload.get("profile"):
-        print(f"  profile: {payload['profile']}")
+    if payload.get("target"):
+        print(f"  target: {payload['target']}")
 
     features = payload.get("features")
     if isinstance(features, Mapping):
@@ -82,7 +93,8 @@ def _print_manifest_payload(payload: Mapping[str, object], fmt: str) -> None:
 def manifest_plan(
     manifest: str = typer.Option("manifest.py", "--manifest", "-m", help="manifest.py 路径"),
     base_dir: Optional[str] = typer.Option(None, "--base-dir", help="项目根目录；默认使用 manifest 所在目录"),
-    profile: Optional[str] = typer.Option(None, "--profile", help="板卡 profile/target，例如 esp32_s3"),
+    target: Optional[str] = typer.Option(None, "--target", help="板卡 target，例如 esp32_s3"),
+    profile: Optional[str] = typer.Option(None, "--profile", hidden=True, help="已弃用的 target 别名"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags，逗号分隔"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags，逗号分隔"),
     no_compile: bool = typer.Option(False, "--no-compile", help="构建摘要中记录为不自动编译 .py"),
@@ -93,13 +105,14 @@ def manifest_plan(
     from ..utils.build import ManifestLockError, build_manifest_lock
 
     fmt = _resolve_format(fmt, json_output)
-    active_tags = _active_tags_for_profile(profile, feature, no_feature)
+    target = _resolve_target(target, profile)
+    active_tags = _active_tags_for_target(target, feature, no_feature)
     try:
         lock = build_manifest_lock(
             manifest,
             active_tags,
             base_dir=base_dir,
-            profile=profile,
+            target=target,
             build_settings=_build_settings(no_compile),
         )
     except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
@@ -113,7 +126,8 @@ def manifest_plan(
 def manifest_lock(
     manifest: str = typer.Option("manifest.py", "--manifest", "-m", help="manifest.py 路径"),
     base_dir: Optional[str] = typer.Option(None, "--base-dir", help="项目根目录；默认使用 manifest 所在目录"),
-    profile: Optional[str] = typer.Option(None, "--profile", help="板卡 profile/target，例如 esp32_s3"),
+    target: Optional[str] = typer.Option(None, "--target", help="板卡 target，例如 esp32_s3"),
+    profile: Optional[str] = typer.Option(None, "--profile", hidden=True, help="已弃用的 target 别名"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags，逗号分隔"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags，逗号分隔"),
     lockfile: str = typer.Option("pyrite.lock", "--lockfile", help="输出 lockfile 路径；相对路径基于项目根目录"),
@@ -130,13 +144,14 @@ def manifest_lock(
     path = Path(lockfile)
     if not path.is_absolute():
         path = base / path
-    active_tags = _active_tags_for_profile(profile, feature, no_feature)
+    target = _resolve_target(target, profile)
+    active_tags = _active_tags_for_target(target, feature, no_feature)
     try:
         lock = build_manifest_lock(
             manifest_path,
             active_tags,
             base_dir=base,
-            profile=profile,
+            target=target,
             build_settings=_build_settings(no_compile),
         )
         written = save_manifest_lock(lock, path)

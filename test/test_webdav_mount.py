@@ -12,7 +12,6 @@ from typer.testing import CliRunner
 
 from cli.main import app
 from cli.utils import webdav_mount
-from cli.utils.config import DEFAULT_BAUDRATE
 from cli.utils.webdav_mount import (
     DeviceFileStat,
     DevicePathMapper,
@@ -1183,7 +1182,13 @@ def test_mount_accepts_webrepl_options_and_uses_mp_factory():
         ])
 
     assert result.exit_code == 0
-    factory.assert_called_once_with("COM4", DEFAULT_BAUDRATE, 10, "ws://esp32.local:8266", "secret")
+    factory.assert_called_once_with(
+        "COM4",
+        None,
+        None,
+        "ws://esp32.local:8266",
+        "secret",
+    )
     mp.connect.assert_called_once()
     serve.assert_called_once()
     assert serve.call_args.args[1].startup_empty_list_grace == 12.5

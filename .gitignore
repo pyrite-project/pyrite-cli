@@ -18,6 +18,7 @@ log/
 !cli/utils/log/
 !cli/utils/log/*.py
 .pyrite_board_profiles.json
+.pyrite_board_aliases.json
 
 # 未来功能设计方案（不纳入版本控制）
 docs/插件系统方案.md

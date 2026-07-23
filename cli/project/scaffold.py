@@ -22,7 +22,8 @@ from .stubs import (
     write_project_stub_config,
     version_to_dir,
 )
-from ..utils.config import DEFAULT_BAUDRATE
+from ..utils.board_alias import resolve_port_alias
+from ..utils.config import _load_config, resolve_connection_settings
 from ..utils.log import get_logger
 from ..utils.ui import interactive_select
 
@@ -31,12 +32,18 @@ log = get_logger(__name__)
 
 def detect_device_info(
     port: str,
-    baudrate: int = DEFAULT_BAUDRATE,
-    timeout: int = 10,
+    baudrate: Optional[int] = None,
+    timeout: Optional[int] = None,
 ) -> tuple[str, str]:
     """连接到 MicroPython 设备并自动检测硬件类型和固件版本。"""
     from ..utils.flash import MicroPython
 
+    port = resolve_port_alias(port)
+    baudrate, timeout = resolve_connection_settings(
+        baudrate,
+        timeout,
+        _load_config(),
+    )
     mp = MicroPython(port=port, baudrate=baudrate, timeout=timeout)
     try:
         mp.connect()
@@ -100,6 +107,8 @@ def new_project_interactive(
     proj_name: str,
     platform: Optional[str] = None,
     port: Optional[str] = None,
+    baudrate: Optional[int] = None,
+    timeout: Optional[int] = None,
 ) -> None:
     """创建一个支持交互式硬件/版本选择的新 MicroPython 项目。"""
     init_project(proj_name)
@@ -107,7 +116,12 @@ def new_project_interactive(
     if port:
         log.info("通过 %s 连接设备进行自动检测...", port)
         try:
-            hardware, version = detect_device_info(port)
+            connection_options = {}
+            if baudrate is not None:
+                connection_options["baudrate"] = baudrate
+            if timeout is not None:
+                connection_options["timeout"] = timeout
+            hardware, version = detect_device_info(port, **connection_options)
         except Exception as e:
             log.error("设备检测失败: %s", e)
             log.info(
@@ -300,11 +314,18 @@ def init_stubs(
     version: Optional[str] = None,
     variant: Optional[str] = None,
     port: Optional[str] = None,
+    baudrate: Optional[int] = None,
+    timeout: Optional[int] = None,
 ) -> None:
     """在已有项目中下载 MicroPython 类型存根。"""
     if port:
         try:
-            hardware, version = detect_device_info(port)
+            connection_options = {}
+            if baudrate is not None:
+                connection_options["baudrate"] = baudrate
+            if timeout is not None:
+                connection_options["timeout"] = timeout
+            hardware, version = detect_device_info(port, **connection_options)
         except Exception as e:
             log.error("设备检测失败: %s", e)
             sys.exit(1)

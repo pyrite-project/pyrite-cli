@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Optional, Set
 
 from ..utils.ui import _GREEN, _RESET, _YELLOW
-from ..utils.config import DEFAULT_BAUDRATE, HASH_CONFIG_FILE
+from ..utils.config import HASH_CONFIG_FILE
 from ..utils.device_context import (
     CommandNeeds,
     needs_no_mpy,
@@ -54,8 +54,8 @@ class DevOptions:
     port: str
     local_dir: str = "."
     remote_path: str = "/"
-    baudrate: int = DEFAULT_BAUDRATE
-    timeout: int = 10
+    baudrate: Optional[int] = None
+    timeout: Optional[int] = None
     no_compile: bool = False
     target: Optional[str] = None
     feature: Optional[str] = None

@@ -6,7 +6,6 @@ from typing import List, Optional
 
 import typer
 
-from ..utils.config import DEFAULT_BAUDRATE
 from ..utils.snapshot import (
     SNAPSHOT_DIR,
     build_current_index,
@@ -84,8 +83,8 @@ def snapshot_save(
         min=1,
         help="单个文件最大保存字节数",
     ),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
@@ -140,8 +139,8 @@ def snapshot_diff(
     name: str = typer.Argument(..., help="快照名称"),
     remote_path: str = typer.Option("/", "--remote-path", help="设备端对比根路径"),
     output_dir: str = typer.Option(SNAPSHOT_DIR, "--output-dir", help="本地快照根目录"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
@@ -168,8 +167,8 @@ def snapshot_restore(
     ),
     apply: bool = typer.Option(False, "--apply", help="执行恢复；默认只 dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认，与 --apply 一起使用"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:

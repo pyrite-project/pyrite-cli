@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 import serial
 import serial.tools.list_ports
 
-from ..config import DEFAULT_BAUDRATE, _load_config
+from ..config import DEFAULT_BAUDRATE, _load_config, resolve_connection_settings
 from ..log import TrafficMonitor, get_logger
 from ..trace import TraceRecorder
 from ..transport import SerialTransport, Transport
@@ -494,14 +494,17 @@ class MicroPythonBase:
     def __init__(
         self,
         port: Optional[str] = None,
-        baudrate: int = DEFAULT_BAUDRATE,
-        timeout: int = 10,
+        baudrate: Optional[int] = None,
+        timeout: Optional[int] = None,
         transport: Optional["Transport"] = None,
     ) -> None:
         self.config: PyriteConfig = _load_config()
         self.port = port
-        self.baudrate = baudrate or self.config.baudrate or DEFAULT_BAUDRATE
-        self.timeout = timeout or self.config.timeout or 10
+        self.baudrate, self.timeout = resolve_connection_settings(
+            baudrate,
+            timeout,
+            self.config,
+        )
         self.transport = transport or SerialTransport(port, self.baudrate, self.timeout)  # type: ignore[arg-type]
         self._traffic_monitor: Optional[TrafficMonitor] = None
         self._trace_recorder: Optional[TraceRecorder] = None

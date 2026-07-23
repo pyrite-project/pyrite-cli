@@ -10,12 +10,16 @@ from typing import List, Optional
 import click
 import typer
 
-from ..utils.board_profile import (
-    BoardProfileError,
-    BoardProfileStore,
+from ..utils.board_alias import (
+    BoardAliasError,
+    BoardAliasStore,
     resolve_port_alias,
 )
-from ..utils.config import DEFAULT_BAUDRATE as DEFAULT_BAUDRATE
+from ..utils.config import (
+    DEFAULT_BAUDRATE as DEFAULT_BAUDRATE,
+    _load_config,
+    resolve_connection_settings,
+)
 from ..utils.log import get_logger
 
 log = get_logger(__name__)
@@ -107,7 +111,7 @@ def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List
     except Exception:
         pass
     try:
-        aliases = [f"@{profile.name}" for profile in BoardProfileStore().list()]
+        aliases = [f"@{alias.name}" for alias in BoardAliasStore().list()]
         matches.extend(alias for alias in aliases if incomplete in alias)
     except Exception:
         pass
@@ -116,17 +120,22 @@ def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List
 
 def _mp_factory(
     port: str,
-    baudrate: int,
-    timeout: int,
+    baudrate: Optional[int],
+    timeout: Optional[int],
     webrepl: Optional[str] = None,
     password: Optional[str] = None,
 ):
     """创建 MicroPython 实例，支持串口和 WebREPL。"""
+    baudrate, timeout = resolve_connection_settings(
+        baudrate,
+        timeout,
+        _load_config(),
+    )
     if webrepl:
         return WebREPLMicroPython(url=webrepl, password=password, timeout=timeout)
     try:
         port = resolve_port_alias(port)
-    except BoardProfileError as exc:
+    except BoardAliasError as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)

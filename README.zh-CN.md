@@ -55,8 +55,11 @@ pip install -e .
 pyrcli scan
 pyrcli scan -i
 
+# 给常用串口注册别名
+pyrcli board register COM3 --name bench
+
 # 查看板级信息
-pyrcli debug board-info COM3
+pyrcli debug board-info @bench
 
 # 刷入，然后进入 REPL 运行代码
 pyrcli flash COM3 main.py /main.py
@@ -127,6 +130,12 @@ pyrcli mount COM3 --ws ws://esp32.local:8266 --password mypass
 
 ## 核心能力
 
+### 开发板别名
+
+`pyrcli board` 只保存开发板别名和串口的映射, 例如 `bench -> COM3`. 注册后, 你可以在所有串口参数中使用 `@bench`, 包括 `flash`、`fs`、`pkg`、`mount` 和项目脚手架命令. 默认数据写入当前目录的 `.pyrite_board_aliases.json`, 也可以通过 `PYRITE_BOARD_ALIAS_FILE` 指向统一文件.
+
+旧 `.pyrite_board_profiles.json` 仍可作为只读迁移源. 下一次注册或删除别名时, pyrite-cli 会把其中的 `name` 和 `port` 写入新文件, 不会删除旧文件. 旧 `tags`、`last_firmware` 和 `recommended` 不会迁移, Target 与项目配置由各自的独立机制管理.
+
 ### 快速刷入
 
 Pyrite CLI 会进入 raw REPL、分块传输代码、校验结果，并恢复设备会话。Python 文件可在上传前自动编译为 `.mpy`。
@@ -187,6 +196,8 @@ Pyrite CLI 会进入 raw REPL、分块传输代码、校验结果，并恢复设
 pyrcli project new my-project
 pyrcli project new my-project --platform esp32
 pyrcli project new my-project --port COM3
+pyrcli project new my-project --port COM3 --baudrate 115200 --timeout 15
+pyrcli project init --port @bench --baudrate 115200 --timeout 15
 ```
 
 刷入目录：
@@ -241,7 +252,8 @@ Pyrite CLI 会从当前目录向上查找 `.pyrite_config.json`。
   "precheck_compat": "warn",
   "precheck_mp_version": "",
   "max_retries": 2,
-  "baudrate": 921600
+  "baudrate": 921600,
+  "timeout": 10
 }
 ```
 
@@ -257,6 +269,11 @@ Pyrite CLI 会从当前目录向上查找 `.pyrite_config.json`。
 | `precheck_mp_version` | `""` | 可选目标 MicroPython 固件版本 |
 | `max_retries` | `2` | 校验失败或断线后的重试次数 |
 | `baudrate` | `921600` | 默认串口波特率 |
+| `timeout` | `10` | 默认串口连接与读写超时秒数 |
+
+连接参数按 `命令行/环境变量 > .pyrite_config.json > 内置默认值` 解析. `--baudrate` / `PYRITE_BAUDRATE` 和 `--timeout` / `PYRITE_TIMEOUT` 会覆盖项目配置. `project new/init --port` 同样支持 `--baudrate` 和 `--timeout`. 旧 `profile` / `profiles` 配置只会触发迁移警告, 不再覆盖任何字段.
+
+`pyrcli test` 是例外: `--timeout` / `PYRITE_TIMEOUT` 表示设备端测试执行超时, `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` 才表示设备连接与读写超时.
 
 可以在 `pyproject.toml` 中扩展设备标签：
 
@@ -295,6 +312,8 @@ C3 = ["ESP32", "wifi"]
 | `remount` | 通过 `mpremote` 把上位机目录反向挂载为设备端 `/remote` |
 | `snapshot` | 保存、对比和恢复设备文件系统快照 |
 | `tunnel` | 透传键盘输入和受限 HTTP(S) 请求 |
+| `board` | 注册、查看、解析和删除开发板串口别名 |
+| `manifest` | 预览 Manifest 或生成 `pyrite.lock` |
 | `pkg` | 通过 `mpremote mip` 安装 MicroPython 包 |
 | `config` | 创建默认 `.pyrite_config.json` |
 

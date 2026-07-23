@@ -1,9 +1,11 @@
 import json
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from cli.utils import config as config_module
 from cli.utils.config import (
     _load_config,
     create_default_config,
@@ -11,6 +13,7 @@ from cli.utils.config import (
     DEFAULT_BAUDRATE,
     CONFIG_FILE,
 )
+from cli.utils.config.types import PyriteConfig
 
 
 def _write_json(path: Path, data: dict):
@@ -22,6 +25,15 @@ def _write_json(path: Path, data: dict):
 
 
 class TestLoadConfig:
+    def test_non_object_config_is_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / CONFIG_FILE).write_text("[1, 2, 3]", encoding="utf-8")
+
+        cfg = _load_config()
+
+        assert cfg.chunk_size == DEFAULT_CHUNK_SIZE
+        assert cfg.baudrate == DEFAULT_BAUDRATE
+
     def test_defaults_when_no_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         cfg = _load_config()
@@ -31,6 +43,8 @@ class TestLoadConfig:
         assert cfg.verify == "size"
         assert cfg.max_retries == 2
         assert cfg.baudrate == DEFAULT_BAUDRATE
+        assert cfg.timeout == 10
+        assert not hasattr(cfg, "delta_min_size")
         assert cfg.precheck == "basic"
         assert cfg.precheck_compat == "warn"
         assert cfg.precheck_mp_version == ""
@@ -88,15 +102,10 @@ class TestLoadConfig:
         _write_json(tmp_path / CONFIG_FILE, {"delta_flash": "always"})
         assert _load_config().delta_flash == "auto"
 
-    def test_custom_delta_min_size(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_delta_min_size_is_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {"delta_min_size": 2048})
-        assert _load_config().delta_min_size == 2048
-
-    def test_invalid_delta_min_size_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.chdir(tmp_path)
-        _write_json(tmp_path / CONFIG_FILE, {"delta_min_size": -1})
-        assert _load_config().delta_min_size == 10240
+        assert not hasattr(_load_config(), "delta_min_size")
 
     def test_invalid_verify_mode_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
@@ -139,6 +148,94 @@ class TestLoadConfig:
         monkeypatch.chdir(tmp_path)
         _write_json(tmp_path / CONFIG_FILE, {"baudrate": 1500000})
         assert _load_config().baudrate == 1500000
+
+    def test_custom_timeout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"timeout": 25})
+        assert _load_config().timeout == 25
+
+    @pytest.mark.parametrize("value", [0, -1, "25", True])
+    def test_invalid_timeout_ignored(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        value,
+    ):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"timeout": value})
+        assert _load_config().timeout == 10
+
+    @pytest.mark.parametrize("value", [True, 1.5])
+    def test_invalid_integer_config_values_are_ignored(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        value,
+    ):
+        monkeypatch.chdir(tmp_path)
+        _write_json(
+            tmp_path / CONFIG_FILE,
+            {
+                "chunk_size": value,
+                "download_threads": value,
+                "max_retries": value,
+                "baudrate": value,
+            },
+        )
+
+        cfg = _load_config()
+
+        assert cfg.chunk_size == DEFAULT_CHUNK_SIZE
+        assert cfg.download_threads == 4
+        assert cfg.max_retries == 2
+        assert cfg.baudrate == DEFAULT_BAUDRATE
+
+    @pytest.mark.parametrize(
+        "legacy",
+        [
+            {"profile": "fast"},
+            {"profiles": {"fast": {"baudrate": 460800, "timeout": 30}}},
+            {
+                "profile": "fast",
+                "profiles": {"fast": {"baudrate": 460800, "timeout": 30}},
+            },
+        ],
+    )
+    def test_legacy_profile_keys_warn_once_and_are_ignored(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        legacy: dict,
+    ):
+        monkeypatch.chdir(tmp_path)
+        _write_json(
+            tmp_path / CONFIG_FILE,
+            {"baudrate": 115200, "timeout": 7, **legacy},
+        )
+        warning = MagicMock()
+        monkeypatch.setattr(config_module.log, "warning", warning)
+
+        cfg = _load_config()
+
+        assert cfg.baudrate == 115200
+        assert cfg.timeout == 7
+        warning.assert_called_once()
+        assert "profile" in warning.call_args.args[0]
+
+    def test_legacy_profile_warning_is_deduplicated_for_same_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        _write_json(tmp_path / CONFIG_FILE, {"profile": "fast"})
+        warning = MagicMock()
+        monkeypatch.setattr(config_module.log, "warning", warning)
+
+        _load_config()
+        _load_config()
+
+        warning.assert_called_once()
 
     def test_negative_max_retries_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
@@ -197,7 +294,9 @@ class TestCreateDefaultConfig:
         assert data["download_threads"] == 4
         assert data["auto_compile"] is True
         assert data["baudrate"] == DEFAULT_BAUDRATE
+        assert data["timeout"] == 10
         assert data["delta_flash"] == "auto"
+        assert "delta_min_size" not in data
         assert data["precheck"] == "basic"
         assert data["precheck_compat"] == "warn"
         assert data["precheck_mp_version"] == ""
@@ -208,3 +307,39 @@ class TestCreateDefaultConfig:
         cfg = _load_config()
         assert cfg.chunk_size == DEFAULT_CHUNK_SIZE
         assert cfg.verify == "size"
+
+    def test_prints_default_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        monkeypatch.chdir(tmp_path)
+        create_default_config()
+        assert "timeout = 10" in capsys.readouterr().out
+
+
+class TestResolveConnectionSettings:
+    def test_explicit_values_take_precedence(self):
+        cfg = PyriteConfig(baudrate=460800, timeout=20)
+
+        assert config_module.resolve_connection_settings(115200, 5, cfg) == (
+            115200,
+            5,
+        )
+
+    def test_config_values_are_used_when_explicit_values_are_missing(self):
+        cfg = PyriteConfig(baudrate=460800, timeout=20)
+
+        assert config_module.resolve_connection_settings(None, None, cfg) == (
+            460800,
+            20,
+        )
+
+    def test_invalid_values_fall_back_to_defaults(self):
+        cfg = PyriteConfig(baudrate=0, timeout=0)
+
+        assert config_module.resolve_connection_settings(0, -1, cfg) == (
+            DEFAULT_BAUDRATE,
+            10,
+        )

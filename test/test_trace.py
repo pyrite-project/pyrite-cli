@@ -131,6 +131,8 @@ def test_flash_trace_option_attaches_recorder_and_writes_session(tmp_path: Path)
     trace_path = tmp_path / "flash.pyrite-trace"
     mp = MagicMock()
     mp.config = SimpleNamespace(board_tags={})
+    mp.baudrate = 460800
+    mp.timeout = 23
 
     with patch("cli.main._mp_factory", return_value=mp):
         result = runner.invoke(app, [
@@ -155,5 +157,7 @@ def test_flash_trace_option_attaches_recorder_and_writes_session(tmp_path: Path)
     records = load_trace(trace_path)
     assert records[0]["event"] == "session_start"
     assert records[0]["operation"] == "flash"
+    assert records[0]["metadata"]["baudrate"] == 460800
+    assert records[0]["metadata"]["timeout"] == 23
     assert records[-1]["event"] == "session_end"
     assert records[-1]["status"] == "ok"

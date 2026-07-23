@@ -16,7 +16,7 @@ from pathlib import Path
 from .manifest_loader import ManifestPlan, load_manifest_plan
 
 LOCKFILE_NAME = "pyrite.lock"
-LOCKFILE_VERSION = 1
+LOCKFILE_VERSION = 2
 
 
 class ManifestLockError(ValueError):
@@ -87,7 +87,7 @@ class ManifestLock:
     manifest_sha256: str
     modules: tuple[ManifestLockModule, ...]
     features: ManifestFeatureSummary
-    profile: str | None = None
+    target: str | None = None
     build: Mapping[str, object] | None = None
     packages: tuple[dict[str, object], ...] = ()
 
@@ -98,7 +98,7 @@ class ManifestLock:
                 "path": self.manifest_path,
                 "sha256": self.manifest_sha256,
             },
-            "profile": self.profile,
+            "target": self.target,
             "features": self.features.to_dict(),
             "build": dict(self.build or {}),
             "modules": [module.to_dict() for module in self.modules],
@@ -132,15 +132,27 @@ class ManifestLock:
         if not isinstance(version, int):
             raise ManifestLockError("pyrite.lock version must be an integer")
 
-        profile = data.get("profile")
-        if profile is not None and not isinstance(profile, str):
-            raise ManifestLockError("pyrite.lock profile must be a string or null")
+        if version == 1:
+            target = data.get("profile")
+            target_key = "profile"
+        elif version == LOCKFILE_VERSION:
+            target = data.get("target")
+            target_key = "target"
+        else:
+            raise ManifestLockError(
+                f"unsupported pyrite.lock version {version}; "
+                f"expected 1 or {LOCKFILE_VERSION}"
+            )
+        if target is not None and not isinstance(target, str):
+            raise ManifestLockError(
+                f"pyrite.lock {target_key} must be a string or null"
+            )
 
         return cls(
-            version=version,
+            version=LOCKFILE_VERSION,
             manifest_path=_require_str(manifest, "path"),
             manifest_sha256=_require_str(manifest, "sha256"),
-            profile=profile,
+            target=target,
             features=ManifestFeatureSummary.from_dict(features),
             build=dict(build),
             modules=tuple(
@@ -156,7 +168,7 @@ def build_manifest_lock(
     active_tags: set[str] | None = None,
     *,
     base_dir: str | Path | None = None,
-    profile: str | None = None,
+    target: str | None = None,
     build_settings: Mapping[str, object] | None = None,
 ) -> ManifestLock:
     """Build a deterministic lockfile payload from manifest.py."""
@@ -168,7 +180,7 @@ def build_manifest_lock(
         version=LOCKFILE_VERSION,
         manifest_path=_relative_path(manifest_resolved, base),
         manifest_sha256=_file_sha256(manifest_resolved),
-        profile=profile,
+        target=target,
         features=ManifestFeatureSummary(
             active_tags=tuple(sorted(active_tags or set())),
             included=plan.included_features,
@@ -197,7 +209,7 @@ def write_manifest_lock(
     *,
     base_dir: str | Path | None = None,
     lock_path: str | Path | None = None,
-    profile: str | None = None,
+    target: str | None = None,
     build_settings: Mapping[str, object] | None = None,
 ) -> Path:
     """Build and write ``pyrite.lock``; returns the written path."""
@@ -207,7 +219,7 @@ def write_manifest_lock(
         manifest,
         active_tags,
         base_dir=base,
-        profile=profile,
+        target=target,
         build_settings=build_settings,
     )
     return save_manifest_lock(lock, path)
@@ -224,12 +236,7 @@ def load_manifest_lock(lock_path: str | Path) -> ManifestLock:
         raise ManifestLockError(f"lockfile is not valid JSON: {path}: {exc.msg}") from exc
     if not isinstance(data, Mapping):
         raise ManifestLockError("pyrite.lock top-level value must be an object")
-    lock = ManifestLock.from_dict(data)
-    if lock.version != LOCKFILE_VERSION:
-        raise ManifestLockError(
-            f"unsupported pyrite.lock version {lock.version}; expected {LOCKFILE_VERSION}"
-        )
-    return lock
+    return ManifestLock.from_dict(data)
 
 
 def check_manifest_lock_current(
@@ -238,7 +245,7 @@ def check_manifest_lock_current(
     *,
     base_dir: str | Path | None = None,
     lock_path: str | Path | None = None,
-    profile: str | None = None,
+    target: str | None = None,
     build_settings: Mapping[str, object] | None = None,
 ) -> bool:
     """Raise if the lockfile does not match the current manifest plan."""
@@ -249,7 +256,7 @@ def check_manifest_lock_current(
         manifest,
         active_tags,
         base_dir=base,
-        profile=profile,
+        target=target,
         build_settings=build_settings,
     )
     actual = load_manifest_lock(path)

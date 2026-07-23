@@ -5,7 +5,6 @@ from typing import Optional
 import typer
 
 from .common import (
-    DEFAULT_BAUDRATE,
     ProjectSyncManager,
     _complete_port,
     _FORMAT_OPTION,
@@ -30,8 +29,8 @@ def device_backup(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地备份目录"),
     remote_path: str = typer.Argument("/", help="设备上的备份根路径"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -58,8 +57,8 @@ def device_restore(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地待恢复目录"),
     remote_path: str = typer.Argument("/", help="设备上的恢复根路径"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
     no_overwrite: bool = typer.Option(False, "--no-overwrite", help="跳过设备上已存在的文件"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),

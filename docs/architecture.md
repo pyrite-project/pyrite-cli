@@ -19,6 +19,7 @@ pyrite-cli/
 |   |   |   |-- transport.py
 |   |   |   `-- micropython.py
 |   |   |-- build/            # mpy-cross, conditional compilation, manifest parser
+|   |   |-- board_alias.py    # Local name-to-serial-port aliases and migration
 |   |   |-- config/           # Config loading and PyriteConfig
 |   |   |-- diagnostics/      # doctor and monitor helpers
 |   |   |-- log/              # Unified logging package
@@ -121,14 +122,20 @@ class PyriteConfig:
     auto_compile: bool = True       # Auto-compile .py → .mpy
     verify: str = "size"            # Verification mode: off / size / crc32
     max_retries: int = 2            # Max retries on verify failure
-    board_tags: Dict[str, List[str]]  # Board tag mapping (from pyproject.toml)
+    baudrate: int = 921600           # Default serial baudrate
+    timeout: int = 10                # Serial connection and I/O timeout
+    delta_flash: str = "auto"       # Delta policy: off / auto / on
+    precheck: str = "basic"          # Pre-flash check: off / basic / strict
+    precheck_compat: str = "warn"    # Compatibility policy: warn / error / off
+    precheck_mp_version: str = ""    # Optional target firmware version
+    board_tags: Dict[str, List[str]] = field(default_factory=dict)
 ```
 
 Usage changed from `self.config["chunk_size"]` to `self.config.chunk_size`.
 
 ---
 
-## Config System (`utils/config.py`)
+## Config System (`utils/config/`)
 
 Loads configuration from the filesystem, merging multiple sources:
 
@@ -137,11 +144,60 @@ Loads configuration from the filesystem, merging multiple sources:
 | `_load_config()` | `PyriteConfig` | Search CWD upward for `.pyrite_config.json`, merge `pyproject.toml` board_tags |
 | `create_default_config()` | `str` | Create default `.pyrite_config.json` in CWD |
 
+`.pyrite_config.json` is the only project-config object. Its settings are flat, at the top level. Legacy `profile` and `profiles` keys are ignored with a warning; there is no profile overlay, and `delta_min_size` is not an active setting.
+
 **Load order**:
 1. Start with `PyriteConfig()` defaults
 2. Search upward for `.pyrite_config.json`, merge fields
 3. Search upward for `pyproject.toml`, merge `[tool.pyrite.board_tags]`
 4. Precedence: built-in < JSON file < pyproject.toml board_tags
+
+`baudrate` and `timeout` use a separate runtime precedence because Typer supplies CLI options and their environment variables before the connection factory runs:
+
+```text
+explicit CLI option / environment variable > .pyrite_config.json > built-in default
+```
+
+The relevant environment variables are `PYRITE_BAUDRATE` and `PYRITE_TIMEOUT`. `project new --port` and `project init --port` forward these optional baudrate and timeout values to device probing; omitted values fall back through Project Config to built-in defaults.
+
+`pyrcli test` is intentionally separate. Its `--timeout` / `PYRITE_TIMEOUT` pair controls device-test execution, while `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` controls the connection and I/O timeout. An omitted connection timeout still falls back through Project Config to the built-in default.
+
+---
+
+## Board Alias, Project Config, and Target
+
+These mechanisms have separate ownership:
+
+| Mechanism | Owns | Source |
+|-----------|------|--------|
+| Board Alias | Local `name -> serial port` mapping | `.pyrite_board_aliases.json` |
+| Project Config | Flat build, transfer, verification, and connection settings | `.pyrite_config.json` |
+| Target | Board identity and active tags for manifests and conditional compilation | `--target` plus `board_tags` |
+
+### Board Alias (`utils/board_alias.py`)
+
+`BoardAlias` contains only `name` and `port`. `BoardAliasStore` writes schema version 1:
+
+```json
+{
+  "version": 1,
+  "aliases": {
+    "lab-esp32": "COM3"
+  }
+}
+```
+
+The default path is `.pyrite_board_aliases.json` in the current directory. `PYRITE_BOARD_ALIAS_FILE` overrides it, while `--alias-file` selects a file for `pyrcli board` management commands. The command group exposes `register`, `list`, `show`, `remove`, and `resolve`.
+
+All serial entry points resolve a leading `@alias` before connecting or building an `mpremote` command. Ordinary port strings pass through unchanged. Shell completion includes both detected ports and saved aliases.
+
+If the canonical file does not exist, `.pyrite_board_profiles.json` is a read-only migration fallback. The loader extracts only each profile's name and port. The first modifying command writes the canonical alias schema and leaves the legacy file untouched; an existing canonical file always wins.
+
+### Target and Manifest Locks
+
+`--target` selects a board identity. Its uppercase key and configured `board_tags` become active tags for Manifest filtering and the `@target(...)` / `with target(...)` conditional-build syntax. It does not select a serial port or a Project Config overlay.
+
+`pyrcli manifest plan --target TARGET` produces a resolved plan without writing, and `pyrcli manifest lock --target TARGET` writes `pyrite.lock`. Lockfile schema version 2 stores the value under `target`. The loader accepts version 1 lockfiles containing `profile`, normalizes that value to `target`, and compares the normalized payload. The hidden `--profile` CLI spelling is accepted only to ease command migration; it is deprecated, and conflicting `--target` and `--profile` values fail.
 
 ---
 
@@ -189,10 +245,17 @@ Two new global options added to all device communication commands:
 Centralized `MicroPython` instance creation:
 
 ```python
-def _mp_factory(port, baudrate, timeout, ws, password) -> MicroPython:
+def _mp_factory(port, baudrate=None, timeout=None, ws=None, password=None) -> MicroPython:
+    baudrate, timeout = resolve_connection_settings(
+        baudrate, timeout, _load_config()
+    )
     if ws:
         return WebREPLMicroPython(url=ws, password=password, timeout=timeout)
-    return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
+    return MicroPython(
+        port=resolve_port_alias(port),
+        baudrate=baudrate,
+        timeout=timeout,
+    )
 ```
 
 WebREPLMicroPython is a subclass of MicroPython that internally creates a `WebREPLTransport` — `flash.py` has no WebREPL awareness at all.
@@ -334,7 +397,7 @@ class WebREPLMicroPython(MicroPython):
 
 ### Auto-Completion
 
-The main Typer app registers `--install-completion` and `--show-completion` for bash/zsh/PowerShell. All commands with a `port` argument have a serial-port auto-completion callback (`_complete_port`) that scans available ports via `MicroPython.scan_ports()`.
+The main Typer app registers `--install-completion` and `--show-completion` for bash/zsh/PowerShell. All commands with a `port` argument have a serial-port auto-completion callback (`_complete_port`) that combines ports from `MicroPython.scan_ports()` with saved `@alias` values.
 
 ### `fs ls` Enhancements
 

@@ -6,7 +6,6 @@ from typing import Optional
 import typer
 
 from .common import (
-    DEFAULT_BAUDRATE,
     MicroPython,
     ProjectSyncManager,
     init_stubs,
@@ -144,7 +143,7 @@ def _check_project_manifest_lock(
             active_tags=active_tags,
             base_dir=directory,
             lock_path=lock_path,
-            profile=target,
+            target=target,
             build_settings={"auto_compile": auto_compile},
         )
     except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
@@ -176,11 +175,23 @@ def project_new(
         help="串口号，用于自动检测平台和固件版本",
         autocompletion=_complete_port,
     ),
+    baudrate: Optional[int] = typer.Option(
+        None, "--baudrate", "-b", help="设备探测波特率", envvar="PYRITE_BAUDRATE",
+    ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout", "-t", help="设备探测超时秒数", envvar="PYRITE_TIMEOUT",
+    ),
 ) -> None:
     """创建新 MicroPython 项目目录及脚手架。"""
     if platform and port:
         raise typer.BadParameter("--platform 和 --port 不能同时使用")
-    new_project_interactive(project_name, platform=platform, port=port)
+    new_project_interactive(
+        project_name,
+        platform=platform,
+        port=port,
+        baudrate=baudrate,
+        timeout=timeout,
+    )
 
 
 @project_app.command("init")
@@ -193,9 +204,22 @@ def project_init(
         help="串口号，用于自动检测硬件并下载匹配的 stubs",
         autocompletion=_complete_port,
     ),
+    baudrate: Optional[int] = typer.Option(
+        None, "--baudrate", "-b", help="设备探测波特率", envvar="PYRITE_BAUDRATE",
+    ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout", "-t", help="设备探测超时秒数", envvar="PYRITE_TIMEOUT",
+    ),
 ) -> None:
     """在已有项目中下载 MicroPython 类型存根。"""
-    init_stubs(hardware, version, variant, port)
+    init_stubs(
+        hardware,
+        version,
+        variant,
+        port,
+        baudrate=baudrate,
+        timeout=timeout,
+    )
 
 
 @project_app.command("hash")
@@ -241,8 +265,8 @@ def project_flash(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -357,8 +381,8 @@ def project_status(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地项目目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
@@ -399,8 +423,8 @@ def project_pull(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(help="本地项目目录路径（如 . 或 ./bak）"),
     remote_path: str = typer.Argument("/", help="设备上的远程路径前缀", show_default=False),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
@@ -451,8 +475,8 @@ def project_run(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -501,8 +525,8 @@ def project_dev(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument("./", help="本地项目目录路径"),
     remote_path: str = typer.Argument("./", help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),

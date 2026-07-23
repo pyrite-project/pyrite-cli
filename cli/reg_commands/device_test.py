@@ -4,7 +4,6 @@ from typing import Optional
 
 import typer
 
-from ..utils.config import DEFAULT_BAUDRATE
 from ..utils.device_tests import (
     DEFAULT_REMOTE_DIR,
     DeviceTestResult,
@@ -88,12 +87,19 @@ def device_test(
         "--remote-dir",
         help="设备端临时测试目录",
     ),
-    baudrate: int = typer.Option(
-        DEFAULT_BAUDRATE,
+    baudrate: Optional[int] = typer.Option(
+        None,
         "--baudrate",
         "-b",
         help="波特率",
         envvar="PYRITE_BAUDRATE",
+    ),
+    connect_timeout: Optional[int] = typer.Option(
+        None,
+        "--connect-timeout",
+        min=1,
+        help="设备连接与读写超时秒数",
+        envvar="PYRITE_CONNECT_TIMEOUT",
     ),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
@@ -105,7 +111,7 @@ def device_test(
         log.error("%s", exc)
         raise typer.Exit(1) from exc
 
-    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    mp = _mp_factory(port, baudrate, connect_timeout, ws, password)
     try:
         mp.connect()
         session = run_device_test_plan(

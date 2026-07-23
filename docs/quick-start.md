@@ -46,6 +46,8 @@ CLI entry point (main.py)       <- commands you run
     |
     +-- Flash engine (flash/)   <- raw REPL protocol and file transfer
     |
+    +-- Board aliases           <- local name-to-serial-port mappings
+    |
     +-- Project sync (sync.py)  <- SHA256 incremental flashing and status diffing
     |
     +-- Dev sessions and tests  <- project dev, device tests, traceback mapping
@@ -66,6 +68,7 @@ Module responsibilities:
 | Module | Responsibility |
 |--------|----------------|
 | `main.py` | CLI entry point and command definitions |
+| `board_alias.py` | Local Board Alias storage, legacy migration, and `@alias` resolution |
 | `flash/` | Serial connection, raw REPL communication, flashing, device file browsing |
 | `sync.py` | SHA256-based incremental sync, status comparison, bulk pull |
 | `transport/` | Transport abstraction and serial implementation; WebREPL lives in `webrepl/` |
@@ -89,7 +92,27 @@ pyrcli scan -a                    # Show all devices, including entries without 
 pyrcli debug board-info COM3      # Show firmware, CPU, flash, and other board details
 ```
 
-### 3.2 Interactive REPL
+### 3.2 Board Aliases
+
+```bash
+pyrcli board register COM3 --name lab # Save lab -> COM3
+pyrcli board list                     # List aliases
+pyrcli board show @lab                # Inspect one alias
+pyrcli board resolve @lab             # Print COM3
+pyrcli board remove lab               # Remove it
+```
+
+Board Alias stores only a local name and serial port. It does not store tags, firmware metadata, or connection settings. Any device command that accepts a serial `PORT` can use `@alias`, including `pkg install`, `pkg install-offline`, and `project new/init --port`:
+
+```bash
+pyrcli flash @lab main.py /main.py
+pyrcli pkg install @lab aioble
+pyrcli project new my-project --port @lab
+```
+
+Aliases use `.pyrite_board_aliases.json` in the current directory by default. `PYRITE_BOARD_ALIAS_FILE` selects another store, and `pyrcli board ... --alias-file PATH` selects one for that management command. When the new file is absent, pyrite-cli can read `.pyrite_board_profiles.json` as a migration source. It extracts only `name` and `port`; the next modifying command writes the new alias schema without deleting the legacy file.
+
+### 3.3 Interactive REPL
 
 ```bash
 pyrcli repl COM3                  # Interactive MicroPython REPL
@@ -97,7 +120,7 @@ pyrcli repl COM3                  # Interactive MicroPython REPL
 pyrcli reset COM3                 # Soft-reset the device
 ```
 
-### 3.3 File Operations
+### 3.4 File Operations
 
 ```bash
 pyrcli fs ls COM3 /                    # List a directory
@@ -110,15 +133,19 @@ pyrcli fs get COM3 /remote.py backup.py # Download a file
 pyrcli fs rm COM3 /remote.py           # Remove a file
 ```
 
-### 3.4 Flashing
+### 3.5 Flashing and Manifest Targets
 
 ```bash
 pyrcli flash COM3 main.py /main.py                  # Single file
 pyrcli flash-program COM3 src/ /app                 # Whole directory
-pyrcli flash-program COM3 . / --manifest manifest.py # manifest filtering
+pyrcli flash-program COM3 . / --manifest manifest.py --target esp32_s3
+pyrcli manifest plan --target esp32_s3              # Preview the resolved manifest plan
+pyrcli manifest lock --target esp32_s3              # Write pyrite.lock
 ```
 
-### 3.5 Package Installation
+A Target identifies the board for manifest filtering and conditional compilation. It activates the target's `board_tags` plus any explicit feature tags; it is separate from Board Alias and connection config. New lockfiles use schema version 2 and store `target`. Version 1 lockfiles that stored the same value as `profile` remain readable for compatibility.
+
+### 3.6 Package Installation
 
 ```bash
 pyrcli pkg install COM3 aioble --target /lib --dry-run # Show mpremote mip install plan
@@ -127,31 +154,36 @@ pyrcli pkg cache aioble --version latest --dry-run     # Plan local cache paths
 pyrcli pkg install-offline COM3 .pyrite/pkg-cache/aioble
 ```
 
-### 3.6 Project Management
+### 3.7 Project Management
 
 ```bash
 pyrcli project new my-project        # Create a project interactively
 pyrcli project new . --platform esp32 # Specify the MicroPython platform
 pyrcli project new . --port COM3     # Auto-detect through serial
+pyrcli project new . --port COM3 --baudrate 115200 --timeout 15
+pyrcli project init --port COM3 --baudrate 115200 --timeout 15
 pyrcli project hash .                # Calculate SHA256 hashes
 pyrcli project flash COM3 . /        # Incremental flash
 pyrcli project status COM3 . /       # Preview differences
 pyrcli project pull COM3 . /         # Pull files from the device
 ```
 
-### 3.7 Development Sessions and Device Tests
+With `project new/init --port`, `--baudrate` / `PYRITE_BAUDRATE` and `--timeout` / `PYRITE_TIMEOUT` control device probing. Omitted values fall back to `.pyrite_config.json`, then built-in defaults.
+
+### 3.8 Development Sessions and Device Tests
 
 ```bash
 pyrcli test COM3 test_device/ --timeout 15
+pyrcli test COM3 test_device/ --timeout 15 --connect-timeout 4
 pyrcli test COM3 test_device/ --keep-files
 pyrcli project dev COM3 . /app --lens
 pyrcli project dev COM3 . /app --test-on-save=all --test-path test_device/
 pyrcli project dev COM3 . /app --once --no-repl --test-on-save=all
 ```
 
-`pyrcli test` uploads local test files to a temporary directory on the device, runs them there, and parses only `PYRITE_TEST` result frames. Normal `print()` output from tests is shown as ordinary device output. `project dev --test-on-save` can run device tests automatically after a successful save-and-flash cycle, and `--lens` expands tracebacks into local source context.
+`pyrcli test` uploads local test files to a temporary directory on the device, runs them there, and parses only `PYRITE_TEST` result frames. Its `--timeout` / `PYRITE_TIMEOUT` value limits device-test execution. Its separate `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` value controls the device connection and I/O timeout; when omitted, it falls back to Project Config and then the built-in default. Normal `print()` output from tests is shown as ordinary device output. `project dev --test-on-save` can run device tests automatically after a successful sync, and `--lens` expands tracebacks into local source context.
 
-### 3.8 Snapshots and Restore
+### 3.9 Snapshots and Restore
 
 ```bash
 pyrcli snapshot save COM3 before-change --remote-path /app
@@ -164,7 +196,7 @@ pyrcli project flash COM3 . /app --snapshot-before before-flash
 
 `snapshot restore` is a dry run by default; writing back to the device requires `--apply`, and unattended runs should also pass `--yes`. During diffing, pyrite-cli downloads device files and calculates SHA256 on the host, avoiding a dependency on `hashlib.sha256` in older firmware. If `--remote-path` is not specified, restore scans only the common parent directory from the snapshot files, so unrelated device paths are not pulled into the delete plan.
 
-### 3.9 Host Capability Tunnel
+### 3.10 Host Capability Tunnel
 
 ```bash
 pyrcli tunnel kb COM3
@@ -175,7 +207,7 @@ pyrcli tunnel network COM3 --ws ws://192.168.4.1:8266/ --allow example.com --all
 
 `tunnel kb` forwards host keyboard events to a device helper. `tunnel network` lets the device send restricted HTTP(S) requests through the host and requires explicit `--allow` entries. Access to localhost, private addresses, or link-local addresses also requires `--allow-private`. Starting a network tunnel over WebREPL requires `--allow-webrepl`.
 
-### 3.10 Mounting
+### 3.11 Mounting
 
 ```bash
 pyrcli mount COM3             # Browse the device filesystem from the PC file manager
@@ -185,7 +217,7 @@ pyrcli remount COM3 src/ --unsafe-links
 
 `mount` is a PC-side WebDAV bridge: the host accesses the device filesystem. `remount` is the reverse direction: it delegates to `mpremote mount` so the device can access a host directory.
 
-### 3.11 GPIO Monitoring
+### 3.12 GPIO Monitoring
 
 ```bash
 pyrcli monitor COM3 --pins 0,2,4,5 --interval 0.2 --count 20
@@ -195,7 +227,7 @@ pyrcli monitor COM3 --pins 0,2,4 --edge changed --duration 10
 
 `monitor` only reads input state with `machine.Pin(pin, machine.Pin.IN)`. It does not switch pins to output mode or configure pulls. If `--pins` is omitted, pyrite-cli conservatively probes common GPIO numbers.
 
-### 3.12 WebREPL Connections
+### 3.13 WebREPL Connections
 
 All device commands can use a WebSocket connection instead of serial:
 
@@ -206,7 +238,7 @@ pyrcli flash COM3 main.py /main.py --ws ws://esp32.local:8266
 
 Password resolution order: `--password`, then `PYRITE_WEBREPL_PASSWORD`, then interactive input.
 
-### 3.13 Serial Port Occupancy Handling
+### 3.14 Serial Port Occupancy Handling
 
 When opening a serial port fails with an error that looks like permission denied, already occupied, or resource busy, an interactive terminal asks whether to scan and release the holder. Windows prefers Sysinternals `handle.exe` for precise handle lookup and falls back to command-line heuristics. Linux and macOS use `lsof` or `fuser`. pyrite-cli asks again before terminating a process, and non-interactive sessions skip this flow.
 
@@ -277,9 +309,14 @@ Create this file at the project root. pyrite-cli searches upward from the curren
   "precheck_compat": "warn",
   "precheck_mp_version": "",
   "max_retries": 2,
-  "baudrate": 921600
+  "baudrate": 921600,
+  "timeout": 10
 }
 ```
+
+Keep settings in this one flat top-level object. Legacy `profile` and `profiles` keys are ignored with a warning.
+
+`pyrcli test` is the naming exception: `--timeout` / `PYRITE_TIMEOUT` controls device-test execution, while `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` controls its connection timeout.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -293,6 +330,7 @@ Create this file at the project root. pyrite-cli searches upward from the curren
 | `precheck_mp_version` | `""` | Optional target MicroPython firmware version, for example `1.20.0` |
 | `max_retries` | `2` | Maximum retries after verification failure or disconnect; `0` disables retries |
 | `baudrate` | `921600` | Default serial baudrate; tune per board stability |
+| `timeout` | `10` | Default serial connection and I/O timeout in seconds |
 
 Generate a default config with:
 
@@ -314,6 +352,22 @@ MY_BOARD = ["MY_BOARD", "wifi", "sdcard"]
 These tags affect automatic feature activation for conditional compilation. See [Conditional Compilation: Practical Guide](conditional-compilation-guide.md).
 
 ### 5.3 Configuration Load Order
+
+For ordinary serial connection settings, the highest-precedence available value wins:
+
+```text
+explicit --baudrate/--timeout or PYRITE_BAUDRATE/PYRITE_TIMEOUT
+    |
+    v
+.pyrite_config.json
+    |
+    v
+built-in defaults
+```
+
+For `pyrcli test`, substitute `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` for the connection-timeout part of this chain. Its `--timeout` / `PYRITE_TIMEOUT` pair is reserved for test execution.
+
+Project data loads in this order, with custom `board_tags` extending the built-in mapping:
 
 ```text
 PyriteConfig() built-in defaults

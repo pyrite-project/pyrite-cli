@@ -136,6 +136,26 @@ class TestPkgManifestAudit:
 
 
 class TestPkgCli:
+    def test_pkg_install_resolves_board_alias_in_dry_run_plan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        alias_file = tmp_path / "aliases.json"
+        _write_json(alias_file, {"version": 1, "aliases": {"bench": "COM7"}})
+        monkeypatch.setenv("PYRITE_BOARD_ALIAS_FILE", str(alias_file))
+
+        result = runner.invoke(app, [
+            "pkg", "install", "@bench", "aioble",
+            "--dry-run",
+            "--format", "json",
+        ])
+
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["port"] == "COM7"
+        assert data["command"][:3] == ["mpremote", "connect", "COM7"]
+
     def test_pkg_install_dry_run_outputs_plan_json_without_subprocess(self):
         with patch("cli.utils.pkg.subprocess.run", side_effect=AssertionError("no subprocess")):
             result = runner.invoke(app, [
@@ -175,3 +195,25 @@ class TestPkgCli:
 
         assert result.exit_code == 1
         assert "离线包路径不存在" in result.output
+
+    def test_pkg_install_offline_resolves_board_alias_in_dry_run_plan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        alias_file = tmp_path / "aliases.json"
+        _write_json(alias_file, {"version": 1, "aliases": {"bench": "COM8"}})
+        monkeypatch.setenv("PYRITE_BOARD_ALIAS_FILE", str(alias_file))
+        package_dir = tmp_path / "pkg"
+        _write_json(package_dir / "package.json", {"deps": [], "urls": []})
+
+        result = runner.invoke(app, [
+            "pkg", "install-offline", "@bench", str(package_dir),
+            "--dry-run",
+            "--format", "json",
+        ])
+
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["port"] == "COM8"
+        assert data["command"][:3] == ["mpremote", "connect", "COM8"]

@@ -16,6 +16,7 @@ from typing import Optional
 
 import requests
 
+from ..utils.config import _load_config
 from ..utils.log import get_logger
 
 log = get_logger(__name__)
@@ -32,23 +33,9 @@ PROJECT_CONFIG = ".pyrite_config.json"
 STUB_CACHE_ROOT = Path("~/.pyrcli/stubs")
 PYRITE_STUB_DIR = "pyrite"
 
-_DEFAULT_THREADS = 4
-_MAX_THREADS = 12
-
-
 def _get_download_threads() -> int:
     """从 .pyrite_config.json 读取下载线程数。"""
-    cfg_file = Path(".pyrite_config.json")
-    if not cfg_file.exists():
-        return _DEFAULT_THREADS
-    try:
-        data = json.loads(cfg_file.read_text(encoding="utf-8"))
-        t = data.get("download_threads", _DEFAULT_THREADS)
-        if not isinstance(t, int) or t <= 0:
-            return _DEFAULT_THREADS
-        return min(t, _MAX_THREADS)
-    except (json.JSONDecodeError, OSError):
-        return _DEFAULT_THREADS
+    return _load_config().download_threads
 
 
 def version_to_dir(v: str) -> str:

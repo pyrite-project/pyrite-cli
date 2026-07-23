@@ -11,7 +11,6 @@ from ..utils.diagnostics import run_doctor
 from ..utils.device_context import CommandNeeds, command_needs, prepare_device
 from ..utils.ui import print_json
 from .common import (
-    DEFAULT_BAUDRATE,
     _complete_port,
     _FORMAT_OPTION,
     _JSON_OPTION,
@@ -56,8 +55,8 @@ def _section(title: str) -> None:
 @command_needs(BOARD_INFO_NEEDS)
 def board_info(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     fmt: str = _FORMAT_OPTION,
@@ -183,8 +182,8 @@ except:pass
 @command_needs(DOCTOR_NEEDS)
 def doctor(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     save: Optional[str] = typer.Option(None, "--save", help="保存 JSON 诊断报告到文件"),

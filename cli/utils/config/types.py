@@ -11,9 +11,8 @@ class PyriteConfig:
     max_retries: int = 2
     board_tags: Dict[str, List[str]] = field(default_factory=dict)
     baudrate: int = 921600
-    timeout: int = 0  # 0 means use CLI default
+    timeout: int = 10
     delta_flash: str = "auto"
-    delta_min_size: int = 10240
     precheck: str = "basic"
     precheck_compat: str = "warn"
     precheck_mp_version: str = ""

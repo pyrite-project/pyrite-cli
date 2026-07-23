@@ -16,6 +16,7 @@ It talks to boards through UART raw REPL by default, and can use WebREPL over We
 | Task | Command | Notes |
 |------|---------|-------|
 | Find boards | `pyrcli scan` | Serial scan, optional board probing, JSON output |
+| Name a serial port | `pyrcli board register COM3 --name lab` | Save a local `name -> port` alias |
 | Flash one file | `pyrcli flash COM3 main.py /main.py` | Preprocess, optionally compile to `.mpy`, transfer, verify |
 | Sync a project | `pyrcli project flash COM3 . /app` | Upload only added or changed files |
 | Develop live | `pyrcli project dev COM3 . /app --lens` | Watch, sync, map tracebacks, and run device tests |
@@ -58,9 +59,13 @@ pyrcli scan -i
 # Inspect a board
 pyrcli debug board-info COM3
 
+# Save a local serial-port alias, then use it anywhere a serial PORT is accepted
+pyrcli board register COM3 --name lab
+pyrcli debug board-info @lab
+
 # Flash, then use the REPL
-pyrcli flash COM3 main.py /main.py
-pyrcli repl COM3
+pyrcli flash @lab main.py /main.py
+pyrcli repl @lab
 # In the REPL: import machine; print(machine.freq())
 
 # Watch the project and expand tracebacks to local source context
@@ -131,25 +136,31 @@ If `--password` is omitted, WebREPL password resolution is: CLI option, `PYRITE_
 
 Pyrite CLI connects your device, transfers code in chunks, verifies the result, and restores the device session. Python files can be compiled to `.mpy` automatically before upload(Expect the main.py and boot.py). Pyrite CLI will check the update the code with smaller blocks that flashing can be much faster.
 
+### Board Aliases
+
+Board Alias stores only a local `name -> serial port` mapping. Manage aliases with `pyrcli board register/list/show/remove/resolve`, then use `@alias` anywhere a device serial `PORT` is accepted, including project setup and package installation.
+
+The default store is `.pyrite_board_aliases.json` in the current directory. Set `PYRITE_BOARD_ALIAS_FILE` to choose another file, or pass `--alias-file` to a `pyrcli board` command. If no new alias file exists, the legacy `.pyrite_board_profiles.json` file is read only as a migration source; only its names and ports are imported when the next alias change writes the new format.
+
 ### Incremental Project Sync
 
 `pyrcli project hash` records local SHA256 hashes. `pyrcli project flash` compares that state and uploads only added or changed files.
 
 ### Live Development and Device Tests
 
-`pyrcli project dev` watches a project and incrementally flashes changes. `--lens` expands MicroPython tracebacks into local source context, and `--test-on-save=all|changed|off` can run device-side tests after a successful sync. `pyrcli test` can upload and run `test_device/` independently.
+`pyrcli project dev` watches a project and incrementally flashes changes. `--lens` expands MicroPython tracebacks into local source context, and `--test-on-save=all|changed|off` can run device-side tests after a successful sync. `pyrcli test` can upload and run `test_device/` independently. On that command, `--timeout` / `PYRITE_TIMEOUT` controls device-test execution; `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` controls the device connection and I/O timeout.
 
 ### Snapshots and Restore
 
 `pyrcli snapshot save/list/diff/restore` saves device filesystem state, previews differences, and restores files. `restore` is dry-run by default and only writes to the device with `--apply`; diffing computes SHA256 on the host side for older firmware compatibility.
 
-### Conditional Builds
+### Targets and Conditional Builds
 
-Use `@feature("wifi")`, `@target("esp32")`, `with feature(...)`, and `with target(...)` to keep one source tree for several boards or firmware variants. Pyrite CLI rewrites the syntax with `libcst`, not regular expressions.
+A Target is the board build identity used to activate board tags. It is independent of the local Board Alias and project connection settings. Use `@feature("wifi")`, `@target("esp32")`, `with feature(...)`, and `with target(...)` to keep one source tree for several boards or firmware variants. Pyrite CLI rewrites the syntax with `libcst`, not regular expressions.
 
 ### Manifest-Based Flashing
 
-`manifest.py` can select modules and packages, remap remote paths, and filter files by feature tags. It is parsed with `ast` and does not execute arbitrary code.
+`manifest.py` can select modules and packages, remap remote paths, and filter files by feature tags. Use `pyrcli manifest plan --target esp32_s3` to inspect the resolved plan and `pyrcli manifest lock --target esp32_s3` to write `pyrite.lock`. Lockfile version 2 records `target`; version 1 lockfiles containing `profile` remain readable for compatibility. The manifest is parsed with `ast` and does not execute arbitrary code.
 
 ### Micropython Filesystem Bridge
 
@@ -187,7 +198,11 @@ Create a project and prepare editor support:
 pyrcli project new my-project
 pyrcli project new my-project --platform esp32
 pyrcli project new my-project --port COM3
+pyrcli project new my-project --port COM3 --baudrate 115200 --timeout 15
+pyrcli project init --port COM3 --baudrate 115200 --timeout 15
 ```
+
+When `project new` or `project init` probes a device through `--port`, `--baudrate` / `PYRITE_BAUDRATE` and `--timeout` / `PYRITE_TIMEOUT` override the project config defaults.
 
 Flash a directory:
 
@@ -239,9 +254,14 @@ Pyrite CLI looks for `.pyrite_config.json` from the current directory upward.
   "precheck_compat": "warn",
   "precheck_mp_version": "",
   "max_retries": 2,
-  "baudrate": 921600
+  "baudrate": 921600,
+  "timeout": 10
 }
 ```
+
+The project config is one flat top-level JSON object. Legacy `profile` and `profiles` keys are ignored with a warning. For ordinary connection settings, precedence is: `--baudrate` / `--timeout` or `PYRITE_BAUDRATE` / `PYRITE_TIMEOUT`, then `.pyrite_config.json`, then the built-in default.
+
+`pyrcli test` is the naming exception: `--timeout` / `PYRITE_TIMEOUT` is its device-test execution timeout, while `--connect-timeout` / `PYRITE_CONNECT_TIMEOUT` is its connection timeout.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -255,6 +275,7 @@ Pyrite CLI looks for `.pyrite_config.json` from the current directory upward.
 | `precheck_mp_version` | `""` | Optional target MicroPython firmware version |
 | `max_retries` | `2` | Retry count after verification or connection failure |
 | `baudrate` | `921600` | Default serial baudrate |
+| `timeout` | `10` | Default serial connection and I/O timeout in seconds |
 
 Board tags can be extended in `pyproject.toml`:
 
@@ -296,6 +317,8 @@ C3 = ["ESP32", "wifi"]
 | `snapshot` | Save, diff, and restore device filesystem snapshots |
 | `tunnel` | Forward keyboard input and restricted HTTP(S) requests |
 | `pkg` | Install MicroPython packages via `mpremote mip` |
+| `board` | Register, list, show, remove, and resolve local serial-port aliases |
+| `manifest` | Preview a manifest plan or write a target-aware `pyrite.lock` |
 | `config` | Create a default `.pyrite_config.json` |
 
 ### `pyrcli project`

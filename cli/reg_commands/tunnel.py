@@ -10,7 +10,7 @@ from ..utils.tunnel import (
     run_keyboard_tunnel,
     run_network_tunnel,
 )
-from .common import DEFAULT_BAUDRATE, _complete_port, _mp_factory, log
+from .common import _complete_port, _mp_factory, log
 
 
 tunnel_app = typer.Typer(
@@ -26,15 +26,15 @@ def register(app: typer.Typer) -> None:
 @tunnel_app.command("kb")
 def tunnel_kb(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(
-        DEFAULT_BAUDRATE,
+    baudrate: Optional[int] = typer.Option(
+        None,
         "--baudrate",
         "-b",
         help="波特率",
         envvar="PYRITE_BAUDRATE",
     ),
-    timeout: int = typer.Option(
-        10,
+    timeout: Optional[int] = typer.Option(
+        None,
         "--timeout",
         "-t",
         help="连接超时秒数",
@@ -94,15 +94,15 @@ def tunnel_network(
         "--allow-webrepl",
         help="允许在 WebREPL 连接上启动 network tunnel",
     ),
-    baudrate: int = typer.Option(
-        DEFAULT_BAUDRATE,
+    baudrate: Optional[int] = typer.Option(
+        None,
         "--baudrate",
         "-b",
         help="波特率",
         envvar="PYRITE_BAUDRATE",
     ),
-    timeout: int = typer.Option(
-        10,
+    timeout: Optional[int] = typer.Option(
+        None,
         "--timeout",
         "-t",
         help="连接超时秒数",

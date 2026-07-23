@@ -98,6 +98,22 @@ def test_download_stubs_reuses_cached_pyi_without_file_download(
     assert stub_path == cached_dir.resolve()
 
 
+def test_download_threads_uses_parent_directory_config(
+    tmp_path: Path,
+    monkeypatch,
+):
+    project_dir = tmp_path / "project"
+    nested_dir = project_dir / "src" / "lib"
+    nested_dir.mkdir(parents=True)
+    (project_dir / ".pyrite_config.json").write_text(
+        json.dumps({"download_threads": 7}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(nested_dir)
+
+    assert stubs._get_download_threads() == 7
+
+
 def test_write_project_stub_config_preserves_existing_fields(
     tmp_path: Path,
     monkeypatch,

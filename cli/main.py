@@ -22,12 +22,16 @@ import typer
 from . import __version__
 from .reg_commands import register_command_groups
 
-from .utils.board_profile import (
-    BoardProfileError,
-    BoardProfileStore,
+from .utils.board_alias import (
+    BoardAliasError,
+    BoardAliasStore,
     resolve_port_alias,
 )
-from .utils.config import DEFAULT_BAUDRATE, create_default_config, _load_config
+from .utils.config import (
+    create_default_config,
+    _load_config,
+    resolve_connection_settings,
+)
 from .utils.device_context import (
     CommandNeeds,
     command_needs,
@@ -197,7 +201,7 @@ def _complete_port(ctx: click.Context, args: List[str], incomplete: str) -> List
     except Exception:
         pass
     try:
-        aliases = [f"@{profile.name}" for profile in BoardProfileStore().list()]
+        aliases = [f"@{alias.name}" for alias in BoardAliasStore().list()]
         matches.extend(alias for alias in aliases if incomplete in alias)
     except Exception:
         pass
@@ -264,25 +268,39 @@ def _version_callback(value: bool) -> None:
 
 def _mp_factory(
     port: str,
-    baudrate: int,
-    timeout: int,
+    baudrate: Optional[int],
+    timeout: Optional[int],
     webrepl: Optional[str] = None,
     password: Optional[str] = None,
 ) -> MicroPython:
     """创建 MicroPython 实例，支持串口和 WebREPL。"""
+    baudrate, timeout = resolve_connection_settings(
+        baudrate,
+        timeout,
+        _load_config(),
+    )
     if webrepl:
         return WebREPLMicroPython(url=webrepl, password=password, timeout=timeout)
     try:
         port = resolve_port_alias(port)
-    except BoardProfileError as exc:
+    except BoardAliasError as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
     return MicroPython(port=port, baudrate=baudrate, timeout=timeout)
 
 
-def _serial_transport_factory(port: str, baudrate: int, timeout: int):
+def _serial_transport_factory(
+    port: str,
+    baudrate: Optional[int],
+    timeout: Optional[int],
+):
     from .utils.transport.serial import SerialTransport
 
+    baudrate, timeout = resolve_connection_settings(
+        baudrate,
+        timeout,
+        _load_config(),
+    )
     return SerialTransport(port=port, baudrate=baudrate, timeout=timeout)
 
 
@@ -365,8 +383,8 @@ def flash(
                                autocompletion=_complete_port),
     file: str = typer.Argument(..., help="待刷入的本地文件路径"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -409,8 +427,16 @@ def flash(
                 port=ws or port,
                 session_id=session_id,
                 metadata={
-                    "baudrate": baudrate,
-                    "timeout": timeout,
+                    "baudrate": (
+                        mp.baudrate
+                        if isinstance(getattr(mp, "baudrate", None), int)
+                        else baudrate
+                    ),
+                    "timeout": (
+                        mp.timeout
+                        if isinstance(getattr(mp, "timeout", None), int)
+                        else timeout
+                    ),
                     "webrepl": ws,
                     "password": password,
                     "local_file": file,
@@ -480,8 +506,8 @@ def flash(
 @app.command()
 def repl(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     map_traceback: bool = typer.Option(
@@ -519,8 +545,8 @@ def flash_program(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     directory: str = typer.Argument(..., help="本地目录路径"),
     remote_path: str = typer.Argument(..., help="设备上的远程路径前缀"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
     target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
     feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
@@ -599,8 +625,8 @@ def flash_program(
 @app.command()
 def reset(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
@@ -645,8 +671,8 @@ def monitor(
     duration: Optional[float] = typer.Option(None, "--duration", help="监控持续秒数"),
     count: Optional[int] = typer.Option(None, "--count", help="采样次数"),
     edge: Optional[str] = typer.Option(None, "--edge", help="仅支持 changed，状态变化时输出"),
-    baudrate: int = typer.Option(DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
-    timeout: int = typer.Option(10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     fmt: str = _FORMAT_OPTION,
@@ -709,11 +735,13 @@ def monitor(
             if ws or password:
                 raise MonitorError("--uart does not support WebREPL options")
 
+            raw_uart_ports = parse_uart_ports(port)
             try:
-                port = resolve_port_alias(port)
-            except BoardProfileError as exc:
+                uart_ports = parse_uart_ports(
+                    [resolve_port_alias(item) for item in raw_uart_ports]
+                )
+            except BoardAliasError as exc:
                 raise MonitorError(str(exc)) from exc
-            uart_ports = parse_uart_ports(port)
             for uart_port in uart_ports:
                 transport = _serial_transport_factory(uart_port, baudrate, timeout)
                 transport.connect()
@@ -824,11 +852,11 @@ def mount(
         False, "--load-all",
         help="挂载前先递归读取并缓存完整目录结构",
     ),
-    baudrate: int = typer.Option(
-        DEFAULT_BAUDRATE, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
+    baudrate: Optional[int] = typer.Option(
+        None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE",
     ),
-    timeout: int = typer.Option(
-        10, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT",
     ),
     run_timeout: int = typer.Option(
         300, "--run-timeout", help="mount-run 执行脚本的超时秒数",
@@ -1002,7 +1030,7 @@ def remount(
             mpremote=mpremote_cmd,
             unsafe_links=unsafe_links,
         )
-    except BoardProfileError as exc:
+    except BoardAliasError as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
     except FileNotFoundError as exc:

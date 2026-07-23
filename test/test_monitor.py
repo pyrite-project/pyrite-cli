@@ -503,3 +503,33 @@ class TestMonitorCli:
         assert "COM4\tb'\\xff'\tff\t<decode failed>" in result.stdout
         assert transports["COM3"].connected is False
         assert transports["COM4"].connected is False
+
+    def test_monitor_command_uart_resolves_each_board_alias(self, tmp_path, monkeypatch):
+        alias_file = tmp_path / "aliases.json"
+        alias_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "aliases": {"left": "COM3", "right": "COM4"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYRITE_BOARD_ALIAS_FILE", str(alias_file))
+        transports = {
+            "COM3": FakeSerialTransport([b"left"]),
+            "COM4": FakeSerialTransport([b"right"]),
+        }
+        monkeypatch.setattr(
+            "cli.main._serial_transport_factory",
+            lambda port, *_args: transports[port],
+        )
+
+        result = runner.invoke(
+            app,
+            ["monitor", "@left,@right", "--uart", "--count", "1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "COM3" in result.stdout
+        assert "COM4" in result.stdout

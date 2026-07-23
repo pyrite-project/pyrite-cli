@@ -5,6 +5,7 @@ from typing import Optional
 
 import typer
 
+from ..utils.board_alias import BoardAliasError, resolve_port_alias
 from ..utils.ui import print_json
 from .common import (
     _complete_port,
@@ -59,6 +60,14 @@ def _run_pkg_plan_or_exit(plan) -> None:
         raise typer.Exit(result.returncode)
 
 
+def _resolve_pkg_port(port: str) -> str:
+    try:
+        return resolve_port_alias(port)
+    except BoardAliasError as exc:
+        log.error("%s", exc)
+        raise typer.Exit(1) from exc
+
+
 @pkg_app.command("install")
 def pkg_install(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
@@ -73,6 +82,7 @@ def pkg_install(
     from ..utils.pkg import PkgError, build_install_plan
 
     fmt = _resolve_format(fmt, json_output)
+    port = _resolve_pkg_port(port)
     try:
         plan = build_install_plan(
             port, package, target=target, dry_run=dry_run, mpremote=mpremote_cmd,
@@ -124,6 +134,7 @@ def pkg_install_offline(
     from ..utils.pkg import PkgError, build_install_offline_plan
 
     fmt = _resolve_format(fmt, json_output)
+    port = _resolve_pkg_port(port)
     try:
         plan = build_install_offline_plan(
             port, package_source, target=target, dry_run=dry_run, mpremote=mpremote_cmd,

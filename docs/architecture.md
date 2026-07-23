@@ -242,7 +242,7 @@ The former monolithic `cli/utils/flash.py` is now a package:
 | Path | Responsibility |
 |------|----------------|
 | `cli/utils/flash/core.py` | Raw REPL protocol, file transfer, verification, filesystem helpers |
-| `cli/utils/flash/flash.py` | Public command-facing facade |
+| `cli/utils/flash/facade.py` | Public command-facing facade |
 | `cli/utils/flash/__init__.py` | Public import surface |
 | `cli/utils/flash/mp_scripts/` | Device-side upload scripts packaged with `cli.utils.flash` |
 

@@ -42,8 +42,8 @@ class _LazyObject:
 MicroPython = _LazyObject("cli.utils.flash", "MicroPython")
 WebREPLMicroPython = _LazyObject("cli.utils.webrepl", "WebREPLMicroPython")
 ProjectSyncManager = _LazyObject("cli.project.sync", "ProjectSyncManager")
-init_stubs = _LazyObject("cli.project.project", "init_stubs")
-new_project_interactive = _LazyObject("cli.project.project", "new_project_interactive")
+init_stubs = _LazyObject("cli.project.scaffold", "init_stubs")
+new_project_interactive = _LazyObject("cli.project.scaffold", "new_project_interactive")
 
 
 def _validate_format(value: str) -> str:

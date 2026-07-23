@@ -3,7 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from cli.project.project import detect_device_info
+from cli.project import scaffold as project_module
+from cli.project.scaffold import detect_device_info
 from cli.project import stubs
 from cli.utils.device_context import DeviceContext
 
@@ -157,3 +158,58 @@ def test_detect_device_info_uses_shared_device_context():
     mp.ensure_device_context.assert_called_once()
     mp.run.assert_not_called()
     mp.disconnect.assert_called_once()
+
+
+def test_new_project_platform_selects_version_without_device_detection(
+    tmp_path: Path,
+    monkeypatch,
+):
+    project_dir = tmp_path / "demo"
+    dirs = [
+        "micropython-v1_22_0-esp32",
+        "micropython-v1_21_0-esp32",
+        "micropython-v1_22_0-rp2",
+    ]
+    selections: list[tuple[list[str], str]] = []
+
+    def fake_select(options: list[str], title: str) -> str:
+        selections.append((options, title))
+        return options[0]
+
+    monkeypatch.setattr(project_module, "list_stub_dirs", lambda: dirs)
+    monkeypatch.setattr(project_module, "interactive_select", fake_select)
+    monkeypatch.setattr(
+        project_module,
+        "detect_device_info",
+        lambda value: (_ for _ in ()).throw(
+            AssertionError(f"platform must not be used as a port: {value}")
+        ),
+    )
+    configure = MagicMock()
+    monkeypatch.setattr(project_module, "_configure_project_stubs", configure)
+
+    project_module.new_project_interactive(str(project_dir), platform="esp32")
+
+    assert selections == [(["1.22.0", "1.21.0"], "选择固件版本")]
+    configure.assert_called_once_with(
+        stub_dir="micropython-v1_22_0-esp32",
+        hardware="esp32",
+        version="1.22.0",
+        variant=None,
+    )
+
+
+def test_new_project_port_uses_device_detection(tmp_path: Path, monkeypatch):
+    project_dir = tmp_path / "demo"
+    dirs = ["micropython-v1_22_0-esp32"]
+    detect = MagicMock(return_value=("esp32", "1.22.0"))
+    configure = MagicMock()
+
+    monkeypatch.setattr(project_module, "detect_device_info", detect)
+    monkeypatch.setattr(project_module, "list_stub_dirs", lambda: dirs)
+    monkeypatch.setattr(project_module, "_configure_project_stubs", configure)
+
+    project_module.new_project_interactive(str(project_dir), port="COM3")
+
+    detect.assert_called_once_with("COM3")
+    configure.assert_called_once()

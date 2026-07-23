@@ -1,6 +1,6 @@
 """Public import surface for flash utilities."""
 
-from . import flash as _flash
+from . import facade as _flash
 
 _export_names = list(_flash.__all__)
 

@@ -202,6 +202,45 @@ class MissingOnDeleteAdapter(FakeAdapter):
         raise FileNotFoundError(path)
 
 
+class BlockingDeleteAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def delete(self, path: str) -> None:
+        self.operations.append(("delete-start", path))
+        if path == "/flash/first":
+            self.first_started.set()
+            assert self.release_first.wait(2)
+        self.operations.append(("delete-end", path))
+
+
+class TransientDeleteFailureAdapter(FakeAdapter):
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures = failures
+        self.delete_attempts = []
+
+    def delete(self, path: str) -> None:
+        self.delete_attempts.append(path)
+        if len(self.delete_attempts) <= self.failures:
+            raise OSError("transient delete failure")
+        super().delete(path)
+
+
+class FirstPathDeleteFailureAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.delete_attempts = []
+
+    def delete(self, path: str) -> None:
+        self.delete_attempts.append(path)
+        if path == "/flash/first":
+            raise OSError("persistent delete failure")
+        super().delete(path)
+
+
 class RecursiveListingAdapter(FakeAdapter):
     def __init__(self):
         super().__init__()
@@ -886,6 +925,126 @@ def test_delete_is_idempotent_when_file_manager_retries_missing_path():
 
     assert status == 204
     assert body == b""
+
+
+def test_concurrent_delete_requests_finish_in_arrival_order():
+    adapter = BlockingDeleteAdapter()
+    server = _serve(adapter)
+    first_done = threading.Event()
+    second_done = threading.Event()
+    results = {}
+
+    def delete_request(name, done):
+        results[name] = _request(server, "DELETE", f"/{name}")
+        done.set()
+
+    first_thread = threading.Thread(
+        target=delete_request,
+        args=("first", first_done),
+        daemon=True,
+    )
+    second_thread = threading.Thread(
+        target=delete_request,
+        args=("second", second_done),
+        daemon=True,
+    )
+    try:
+        first_thread.start()
+        assert adapter.first_started.wait(1)
+        second_thread.start()
+        assert not second_done.wait(0.1)
+        assert adapter.operations == [("delete-start", "/flash/first")]
+
+        adapter.release_first.set()
+        assert first_done.wait(1)
+        assert second_done.wait(1)
+    finally:
+        adapter.release_first.set()
+        server.shutdown()
+
+    assert results["first"][0] == 204
+    assert results["second"][0] == 204
+    assert adapter.operations == [
+        ("delete-start", "/flash/first"),
+        ("delete-end", "/flash/first"),
+        ("delete-start", "/flash/second"),
+        ("delete-end", "/flash/second"),
+    ]
+
+
+def test_delete_finishes_before_following_write_request():
+    adapter = BlockingDeleteAdapter()
+    server = _serve(adapter)
+    delete_done = threading.Event()
+    put_done = threading.Event()
+    results = {}
+
+    def delete_request():
+        results["delete"] = _request(server, "DELETE", "/first")
+        delete_done.set()
+
+    def put_request():
+        results["put"] = _request(
+            server,
+            "PUT",
+            "/after.txt",
+            body=b"x",
+            headers={"Content-Length": "1"},
+        )
+        put_done.set()
+
+    delete_thread = threading.Thread(target=delete_request, daemon=True)
+    put_thread = threading.Thread(target=put_request, daemon=True)
+    try:
+        delete_thread.start()
+        assert adapter.first_started.wait(1)
+        put_thread.start()
+        assert not put_done.wait(0.1)
+        assert adapter.operations == [("delete-start", "/flash/first")]
+
+        adapter.release_first.set()
+        assert delete_done.wait(1)
+        assert put_done.wait(1)
+    finally:
+        adapter.release_first.set()
+        server.shutdown()
+
+    assert results["delete"][0] == 204
+    assert results["put"][0] == 201
+    assert adapter.operations == [
+        ("delete-start", "/flash/first"),
+        ("delete-end", "/flash/first"),
+        ("write", "/flash/after.txt"),
+    ]
+
+
+def test_delete_retries_three_times_before_succeeding():
+    adapter = TransientDeleteFailureAdapter(failures=3)
+    server = _serve(adapter, delete_retries=3, delete_retry_delay=0)
+    try:
+        status, _headers, body = _request(server, "DELETE", "/test")
+    finally:
+        server.shutdown()
+
+    assert status == 204
+    assert body == b""
+    assert adapter.delete_attempts == ["/flash/test"] * 4
+
+
+def test_delete_retry_exhaustion_releases_next_request():
+    adapter = FirstPathDeleteFailureAdapter()
+    server = _serve(adapter, delete_retries=3, delete_retry_delay=0)
+    try:
+        first_status, _headers, first_body = _request(server, "DELETE", "/first")
+        second_status, _headers, second_body = _request(server, "DELETE", "/second")
+    finally:
+        server.shutdown()
+
+    assert first_status == 500
+    assert first_body == b"delete failed"
+    assert second_status == 204
+    assert second_body == b""
+    assert adapter.delete_attempts == ["/flash/first"] * 4 + ["/flash/second"]
 
 
 def test_put_writes_uploaded_body_to_device_path():

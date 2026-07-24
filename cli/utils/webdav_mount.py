@@ -94,6 +94,8 @@ class WebDavConfig:
     run_queue_max_operations: int = 64
     run_queue_max_bytes: int = 64 * 1024 * 1024
     max_upload_bytes: int = 64 * 1024 * 1024
+    delete_retries: int = 3
+    delete_retry_delay: float = 0.1
 
 
 def mount_run_executable_for_system(
@@ -244,6 +246,28 @@ class MountRunState:
                 item.error = exc
             finally:
                 item.done.set()
+
+
+class _FifoOperationExecutor:
+    """Execute callbacks one at a time in the order they were submitted."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+
+    def execute(self, callback: Callable[[], Any]) -> Any:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            while ticket != self._serving_ticket:
+                self._condition.wait()
+        try:
+            return callback()
+        finally:
+            with self._condition:
+                self._serving_ticket += 1
+                self._condition.notify_all()
 
 
 class WebDavThreadingHTTPServer(ThreadingHTTPServer):
@@ -830,6 +854,7 @@ def make_webdav_handler(
 ) -> type[BaseHTTPRequestHandler]:
     run_executable = mount_run_executable_for_system(trigger_name=config.run_trigger_name)
     trigger_href = "/" + quote(run_executable.name, safe="/") if run_executable else ""
+    write_executor = _FifoOperationExecutor()
 
     class WebDavHandler(BaseHTTPRequestHandler):
         server_version = "PyriteWebDAV/0.1"
@@ -932,9 +957,16 @@ def make_webdav_handler(
             callback: Callable[[], Any],
             size_bytes: int = 0,
         ) -> Any:
+            def serialized_callback() -> Any:
+                return write_executor.execute(callback)
+
             if run_state is None:
-                return callback()
-            return run_state.execute_or_queue(description, callback, size_bytes=size_bytes)
+                return serialized_callback()
+            return run_state.execute_or_queue(
+                description,
+                serialized_callback,
+                size_bytes=size_bytes,
+            )
 
         def _run_target_path(self) -> str:
             query = parse_qs(self._parsed_path.query)
@@ -1230,15 +1262,39 @@ def make_webdav_handler(
             remote = self._remote()
 
             def delete() -> None:
-                try:
-                    adapter.delete(remote)
-                except FileNotFoundError:
-                    log.debug("WebDAV DELETE already absent path=%s", remote)
+                retries = max(0, int(config.delete_retries))
+                delay = max(0.0, float(config.delete_retry_delay))
+                for attempt in range(retries + 1):
+                    try:
+                        adapter.delete(remote)
+                        return
+                    except FileNotFoundError:
+                        log.debug("WebDAV DELETE already absent path=%s", remote)
+                        return
+                    except Exception as exc:
+                        if attempt >= retries:
+                            raise
+                        log.warning(
+                            "WebDAV DELETE retry path=%s attempt=%d/%d reason=%s",
+                            remote,
+                            attempt + 1,
+                            retries,
+                            exc,
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
 
             try:
                 self._execute_write(f"DELETE {remote}", delete)
             except MountRunBusyError:
                 self._send_queue_full()
+                return
+            except Exception as exc:
+                log.error("WebDAV DELETE failed path=%s reason=%s", remote, exc)
+                self._send_bytes(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    b"delete failed",
+                )
                 return
             self._send_bytes(HTTPStatus.NO_CONTENT)
 

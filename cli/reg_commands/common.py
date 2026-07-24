@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import tempfile
 from importlib import import_module
+from pathlib import Path
 from typing import List, Optional
 
 import click
@@ -21,6 +24,7 @@ from ..utils.config import (
     resolve_connection_settings,
 )
 from ..utils.log import get_logger
+from ..utils.ui import is_tty
 
 log = get_logger(__name__)
 
@@ -65,6 +69,38 @@ _JSON_OPTION = typer.Option(False, "--json", help="等同于 --format json")
 
 def _resolve_format(fmt: str, json_output: bool) -> str:
     return "json" if json_output else fmt
+
+
+def _materialize_stdin_source(local_path: str, remote_path: str) -> tuple[str, Optional[str]]:
+    """将 ``-`` 形式的 stdin 输入落盘为临时文件。"""
+    if local_path != "-":
+        return local_path, None
+
+    suffix = Path(remote_path).suffix
+    if suffix not in {".py", ".mpy", ".bin"}:
+        suffix = ".bin"
+
+    fd, temp_path = tempfile.mkstemp(prefix="pyrite-stdin-", suffix=suffix)
+    os.close(fd)
+    try:
+        stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+        data = stdin_stream.read()
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        Path(temp_path).write_bytes(data or b"")
+    except Exception:
+        Path(temp_path).unlink(missing_ok=True)
+        raise
+    return temp_path, temp_path
+
+
+def _confirm_overwrite(remote_path: str) -> None:
+    """在需要交互确认时提示覆盖；非 TTY 直接失败。"""
+    if not is_tty():
+        log.error("文件 '%s' 已存在于设备，使用 --force 覆盖或先删除", remote_path)
+        log.error("非交互终端下请显式添加 --force")
+        raise typer.Exit(1)
+    click.confirm("  继续覆盖?", default=False, abort=True)
 
 
 def _norm_path(p: str) -> str:

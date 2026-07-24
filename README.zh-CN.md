@@ -343,6 +343,19 @@ C3 = ["ESP32", "wifi"]
 | `fs mv` | 移动或重命名 |
 | `fs cp` | 复制 |
 
+`flash` 和 `fs put` 支持把 `-` 当作 stdin 输入；`fs get REMOTE -` 会把原始字节写到 stdout。若文件名真的是 `-`，请写成 `./-`。
+
+批量管道命令统一使用 JSONL：stdin 一行一个 JSON 对象，stdout 一行一个结果对象。上传记录支持 `{"local":"main.py","remote":"/main.py"}`，也支持自包含的 `{"remote":"/main.py","content_b64":"..."}`；下载记录使用 `{"remote":"/main.py"}`，返回 `content_b64`。
+
+```bash
+printf '{"remote":"/main.py","content_b64":"cHJpbnQoMSkK"}\n' | pyrcli flash-batch COM3 --force
+printf '{"remote":"/main.py"}\n' | pyrcli fs get-batch COM3 | jq -r '.content_b64' | base64 -d
+printf '{"path":"/tmp.txt"}\n' | pyrcli fs rm-batch COM3 --force
+pyrcli device backup COM3 ignored /app --stdout-jsonl > app-backup.jsonl
+pyrcli device restore COM3 - /app --stdin-jsonl app-backup.jsonl
+pyrcli snapshot restore COM3 - --stdin-jsonl app-backup.jsonl --apply --yes
+```
+
 ### `pyrcli pkg`
 
 | 命令 | 作用 |

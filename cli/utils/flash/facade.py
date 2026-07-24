@@ -1554,11 +1554,15 @@ class MicroPython(MicroPythonBase):
     def fs_get(self, remote_path: str, local_path: str) -> int:
         """从设备下载文件到本地路径。"""
         log.debug("fs_get: %s → %s", remote_path, local_path)
-        data = self._read_device_file(remote_path)
+        data = self.fs_get_bytes(remote_path)
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         with open(local_path, "wb") as f:
             f.write(data)
         return len(data)
+
+    def fs_get_bytes(self, remote_path: str) -> bytes:
+        """从设备读取文件并以原始字节返回。"""
+        return self._read_device_file(remote_path)
 
     def fs_mv(self, src: str, dst: str) -> bool:
         """重命名/移动设备上的文件或目录。"""

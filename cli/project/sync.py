@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from ..utils.config import HASH_CONFIG_FILE, _HASH_VERSION
 from ..utils.flash import SET_EXECUTE, _strip_repl_trailer
 from ..utils.log import get_logger
+from ..utils.pipes import b64encode, sha256_bytes, write_jsonl
 from ..utils.project_files import collect_project_files
 from ..utils.ui import log as output_log, print_json, safe_text
 
@@ -651,6 +652,32 @@ class ProjectSyncManager:
             pre_skipped=pre_skipped,
         )
 
+    def pull_stdout_jsonl(
+        self,
+        local_dir: str,
+        remote_prefix: str,
+        hash_config_path: Optional[str] = None,
+        active_tags: Optional[Set[str]] = None,
+        manifest_path: Optional[str] = None,
+    ) -> bool:
+        """Stream project-selected device files as JSONL records."""
+        entries = self._collect_project_files(
+            local_dir,
+            active_tags,
+            manifest_path,
+            exclude_paths={hash_config_path} if hash_config_path else None,
+        )
+        if not entries:
+            remote_files = [rp for rp, _sz in self._discover_device_files(remote_prefix)]
+        else:
+            remote_files = [
+                str(rp_part).replace("\\", "/")
+                if str(rp_part).startswith("/")
+                else os.path.join(remote_prefix, rp_part).replace("\\", "/")
+                for _lp, rp_part in entries
+            ]
+        return self._stream_device_files_jsonl(remote_files)
+
     # ── device backup / restore ─────────────────────
 
     def backup(
@@ -691,6 +718,11 @@ class ProjectSyncManager:
             fmt=fmt,
             pre_skipped=pre_skipped,
         ))
+
+    def backup_stdout_jsonl(self, remote_prefix: str = "/") -> bool:
+        """Stream every file below a device path as JSONL records."""
+        remote_files = [rp for rp, _sz in self._discover_device_files(remote_prefix)]
+        return self._stream_device_files_jsonl(remote_files)
 
     def restore(
         self,
@@ -953,6 +985,24 @@ class ProjectSyncManager:
                 parts.append(f"{fail} 失败")
             log.info("下载完成: %s", ", ".join(parts))
         return True
+
+    def _stream_device_files_jsonl(self, remote_files: List[str]) -> bool:
+        failed = False
+        for remote in remote_files:
+            try:
+                reader = getattr(self.mp, "fs_get_bytes", None)
+                data = reader(remote) if callable(reader) else self.mp._read_device_file(remote)
+                write_jsonl({
+                    "ok": True,
+                    "remote": remote,
+                    "size": len(data),
+                    "sha256": sha256_bytes(data),
+                    "content_b64": b64encode(data),
+                })
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "remote": remote, "error": str(exc)})
+        return not failed
 
     def _pull_transfer_error(
         self, fmt: str, code: str, message: str, **details: int,

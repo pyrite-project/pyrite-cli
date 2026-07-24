@@ -6,6 +6,15 @@ from typing import List, Optional
 
 import typer
 
+from ..utils.pipes import (
+    b64decode_text,
+    b64encode,
+    cleanup_paths,
+    read_jsonl,
+    record_text,
+    sha256_bytes,
+    write_jsonl,
+)
 from ..utils.snapshot import (
     SNAPSHOT_DIR,
     build_current_index,
@@ -83,6 +92,7 @@ def snapshot_save(
         min=1,
         help="单个文件最大保存字节数",
     ),
+    stdout_jsonl: bool = typer.Option(False, "--stdout-jsonl", help="将快照文件内容作为 JSONL 输出到 stdout，不写本地快照目录"),
     baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
@@ -98,16 +108,28 @@ def snapshot_save(
     mp = _mp_factory(port, baudrate, timeout, ws, password)
     try:
         mp.connect()
-        manifest = save_device_snapshot(
-            mp,
-            name=name,
-            port=port,
-            remote_path=remote_path,
-            include=include,
-            exclude=exclude,
-            output_dir=output_dir,
-            max_file_bytes=max_file_bytes,
-        )
+        if stdout_jsonl:
+            ok = _snapshot_save_stdout_jsonl(
+                mp,
+                remote_path=remote_path,
+                include=include,
+                exclude=exclude,
+                max_file_bytes=max_file_bytes,
+            )
+            if not ok:
+                raise typer.Exit(1)
+            return
+        else:
+            manifest = save_device_snapshot(
+                mp,
+                name=name,
+                port=port,
+                remote_path=remote_path,
+                include=include,
+                exclude=exclude,
+                output_dir=output_dir,
+                max_file_bytes=max_file_bytes,
+            )
     finally:
         mp.disconnect()
     typer.echo(f"snapshot saved: {manifest.name} ({len(manifest.files)} files)")
@@ -167,12 +189,28 @@ def snapshot_restore(
     ),
     apply: bool = typer.Option(False, "--apply", help="执行恢复；默认只 dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认，与 --apply 一起使用"),
+    stdin_jsonl: Optional[str] = typer.Option(None, "--stdin-jsonl", help="从 JSONL 内容流恢复；使用 - 从 stdin 读取"),
     baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
 ) -> None:
     """恢复快照；默认只展示 dry-run 计划。"""
+    if stdin_jsonl is not None or name == "-":
+        ok = _snapshot_restore_stdin_jsonl(
+            port,
+            stdin_jsonl or "-",
+            apply=apply,
+            yes=yes,
+            baudrate=baudrate,
+            timeout=timeout,
+            ws=ws,
+            password=password,
+        )
+        if not ok:
+            raise typer.Exit(1)
+        return
+
     snap_dir = snapshot_path(name, root=output_dir)
     manifest = load_snapshot_manifest(snap_dir)
     mp = _mp_factory(port, baudrate, timeout, ws, password)
@@ -218,3 +256,103 @@ def _apply_restore_plan(mp, snap_dir: Path, plan) -> None:
         mp.flash_file(str(snap_dir / item.local_path), item.path, compile=False)
     for item in plan.delete:
         mp.fs_rm(item.path, recursive=True, force=True)
+
+
+def _snapshot_save_stdout_jsonl(
+    mp,
+    *,
+    remote_path: str,
+    include: Optional[List[str]],
+    exclude: Optional[List[str]],
+    max_file_bytes: int,
+) -> bool:
+    entries = filter_device_entries(
+        mp.fs_ls_recursive(_norm_path(remote_path)),
+        include=tuple(include or ()),
+        exclude=tuple(exclude or ()),
+        max_file_bytes=max_file_bytes,
+    )
+    failed = False
+    for entry in entries:
+        remote = normalize_device_path(str(entry["name"]))
+        try:
+            reader = getattr(mp, "fs_get_bytes", None)
+            if callable(reader):
+                data = reader(remote)
+            else:
+                with tempfile.TemporaryDirectory(prefix="pyrite-snapshot-jsonl-") as temp_dir:
+                    local_path = Path(temp_dir) / remote.strip("/")
+                    mp.fs_get(remote, str(local_path))
+                    data = local_path.read_bytes()
+            write_jsonl({
+                "ok": True,
+                "remote": remote,
+                "size": len(data),
+                "sha256": sha256_bytes(data),
+                "content_b64": b64encode(data),
+            })
+        except Exception as exc:
+            failed = True
+            write_jsonl({"ok": False, "remote": remote, "error": str(exc)})
+    return not failed
+
+
+def _snapshot_restore_stdin_jsonl(
+    port: str,
+    input_path: str,
+    *,
+    apply: bool,
+    yes: bool,
+    baudrate: Optional[int],
+    timeout: Optional[int],
+    ws: Optional[str],
+    password: Optional[str],
+) -> bool:
+    records: list[tuple[int, str, bytes]] = []
+    failed = False
+    for item in read_jsonl(input_path):
+        record = item.data
+        if record.get("_invalid"):
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "error": record.get("error", "invalid record")})
+            continue
+        remote = record_text(record, "remote", "path")
+        if not remote or "content_b64" not in record:
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "error": "missing remote or content_b64"})
+            continue
+        try:
+            records.append((item.line, normalize_device_path(remote), b64decode_text(record["content_b64"])))
+        except Exception as exc:
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "remote": remote, "error": str(exc)})
+
+    if not apply:
+        for line, remote, data in records:
+            write_jsonl({"ok": True, "line": line, "remote": remote, "size": len(data), "dry_run": True})
+        return not failed
+
+    if not yes and not typer.confirm("Apply JSONL restore plan?"):
+        return False
+
+    temp_paths: list[str] = []
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    try:
+        mp.connect()
+        for line, remote, data in records:
+            try:
+                fd, temp_path = tempfile.mkstemp(prefix="pyrite-snapshot-restore-", suffix=Path(remote).suffix or ".bin")
+                temp_paths.append(temp_path)
+                with open(fd, "wb", closefd=True) as handle:
+                    handle.write(data)
+                mp.flash_file(temp_path, remote, compile=False)
+                write_jsonl({"ok": True, "line": line, "remote": remote, "size": len(data)})
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": line, "remote": remote, "error": str(exc)})
+    finally:
+        try:
+            mp.disconnect()
+        finally:
+            cleanup_paths(temp_paths)
+    return not failed

@@ -1079,6 +1079,53 @@ class MicroPythonBase:
             time.sleep(sleep_time)
         return False, buf
 
+    def _read_raw_exec_response(
+        self,
+        timeout: Optional[int] = None,
+    ) -> Tuple[bool, bytes]:
+        """Read a complete Raw REPL stdout/stderr frame without leaving trailers."""
+        timeout = timeout or self.timeout
+        deadline = time.time() + timeout
+        buf = bytearray()
+        last_eot_count = 0
+        last_eot_at: Optional[float] = None
+        sleep_time = 0.001
+        idle_count = 0
+
+        while time.time() < deadline:
+            if self.transport.in_waiting:
+                chunk = self.transport.read(self.transport.in_waiting)
+                buf.extend(chunk)
+                self._record_rx(chunk)
+                idle_count = 0
+                sleep_time = 0.001
+
+                eot_count = buf.count(SET_EXECUTE)
+                if eot_count > last_eot_count:
+                    last_eot_count = eot_count
+                    last_eot_at = time.time()
+                if eot_count >= 2:
+                    second_eot = buf.find(
+                        SET_EXECUTE,
+                        buf.find(SET_EXECUTE) + len(SET_EXECUTE),
+                    )
+                    if b">" in buf[second_eot + len(SET_EXECUTE):]:
+                        return True, bytes(buf)
+                elif eot_count == 1:
+                    first_eot = buf.find(SET_EXECUTE)
+                    if b">" in buf[first_eot + len(SET_EXECUTE):]:
+                        return True, bytes(buf)
+            else:
+                idle_count += 1
+                if idle_count > 10:
+                    sleep_time = 0.02
+
+            if last_eot_at is not None and time.time() - last_eot_at >= 0.1:
+                return True, bytes(buf)
+            time.sleep(sleep_time)
+
+        return bool(last_eot_count), bytes(buf)
+
     def _read_until_marker(
         self, marker: bytes, timeout: int = 30,
     ) -> Tuple[bool, bytes]:
@@ -1144,18 +1191,23 @@ class MicroPythonBase:
         self._write(code)
         self._write(SET_EXECUTE)
 
-        _, resp = self._read_until(SET_EXECUTE, timeout=timeout)
-        resp = resp.rstrip(SET_EXECUTE)
-        text = resp.decode("utf-8", errors="replace")
-        if text.startswith("OK"):
-            text = text[2:]
-        text = text.strip()
+        _, resp = self._read_raw_exec_response(timeout=timeout)
+        if resp.startswith(b"OK"):
+            resp = resp[2:]
+        parts = resp.split(SET_EXECUTE, 2)
+        stdout_text = parts[0].decode("utf-8", errors="replace").strip()
+        stderr_text = (
+            parts[1].decode("utf-8", errors="replace").strip()
+            if len(parts) > 1
+            else ""
+        )
+        combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
 
-        if raise_on_error and "Traceback" in text:
-            log.trace("设备执行错误:\n%s", text)
-            raise RuntimeError(f"设备执行错误:\n{text}")
+        if raise_on_error and "Traceback" in combined:
+            log.trace("设备执行错误:\n%s", combined)
+            raise RuntimeError(f"设备执行错误:\n{combined}")
 
-        return text
+        return stdout_text
 
     def _exec_raw(self, code: str | bytes, timeout: int = 10) -> str:
         """在原始 REPL 中执行代码，忽略设备启动阶段的 Traceback。"""

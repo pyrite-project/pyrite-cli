@@ -194,6 +194,91 @@ class MicroPython(MicroPythonBase):
             return 1
         return BATCH_ACK_EVERY
 
+    def _uses_repl_chunked_flash(self) -> bool:
+        """Use code-literal writes on RT-Smart ports with unreliable raw stdin."""
+        return (self.runtime_info.platform or "").strip().lower() == "rt-smart"
+
+    def _send_repl_chunked_file(
+        self,
+        local_path: str,
+        remote_path: str,
+        expected_size: int,
+        verify_mode: str,
+        expected_crc: Optional[int],
+    ) -> None:
+        """Write a file through short Raw REPL commands without reading stdin."""
+        init_marker = "PYRITE_WRITE_READY|0"
+        init_out = self._execute(
+            "import os\n"
+            f"_p={remote_path!r}\n"
+            "with open(_p,'wb') as _f:\n"
+            " _f.flush()\n"
+            "_s=os.stat(_p);_s=os.stat(_p)\n"
+            "print('PYRITE_WRITE_READY|'+str(_s[6]))",
+            timeout=10,
+        )
+        if init_marker not in {line.strip() for line in init_out.splitlines()}:
+            root_hint = ""
+            if len(remote_path.strip("/").split("/")) == 1:
+                root_hint = "；RT-Smart 根目录通常不可写，请使用 /data/... 或 /sdcard/..."
+            raise RuntimeError(
+                f"RT-Smart 兼容刷入无法创建目标文件 {remote_path}{root_hint}"
+            )
+
+        literal_chunk_size = 256
+        written = 0
+        progress = None
+        if tqdm:
+            progress = tqdm(
+                total=expected_size,
+                desc="兼容传输",
+                unit="B",
+                unit_scale=True,
+                leave=False,
+            )
+        try:
+            with open(local_path, "rb") as local_file:
+                while True:
+                    chunk = local_file.read(literal_chunk_size)
+                    if not chunk:
+                        break
+                    expected_written = written + len(chunk)
+                    out = self._execute(
+                        "import os\n"
+                        f"_p={remote_path!r}\n"
+                        f"_payload={chunk!r}\n"
+                        "with open(_p,'ab') as _f:\n"
+                        " _f.write(_payload)\n"
+                        " _f.flush()\n"
+                        "_s=os.stat(_p);_s=os.stat(_p)\n"
+                        "print('PYRITE_WRITE|'+str(_s[6]))",
+                        timeout=10,
+                    )
+                    marker = f"PYRITE_WRITE|{expected_written}"
+                    if marker not in {line.strip() for line in out.splitlines()}:
+                        raise RuntimeError(
+                            "RT-Smart 兼容刷入未确认数据块 "
+                            f"{written}:{expected_written} ({remote_path})"
+                        )
+                    written = expected_written
+                    if progress is not None:
+                        progress.update(len(chunk))
+        finally:
+            if progress is not None:
+                progress.close()
+
+        if written != expected_size:
+            raise RuntimeError(
+                f"RT-Smart 兼容刷入数据不完整: 期望 {expected_size}，实际 {written}"
+            )
+        if verify_mode != "off" and not self._verify_file_on_device(
+            remote_path,
+            expected_size,
+            verify_mode,
+            expected_crc,
+        ):
+            raise RuntimeError(f"刷入后校验失败: {remote_path}")
+
     def repl_(
         self,
         command_handler: Optional[Callable[[bytes], bool]] = None,
@@ -880,6 +965,54 @@ class MicroPython(MicroPythonBase):
                 with self._trace_phase_ctx("filesystem", remote_path=actual_remote):
                     self._mkdirs_on_device([actual_remote])
 
+                if self._uses_repl_chunked_flash():
+                    log.warning(
+                        "检测到 RT-Smart，使用 Raw REPL 分块兼容刷入 (%s)",
+                        actual_remote,
+                    )
+                    for attempt in range(max_retries + 1):
+                        if attempt > 0:
+                            with self._trace_phase_ctx("raw_repl", retry=attempt):
+                                self._enter_raw_repl()
+                            log.warning("兼容刷入重试 %d/%d", attempt, max_retries)
+                        try:
+                            with self._trace_phase_ctx(
+                                "transfer_repl_chunks",
+                                remote_path=actual_remote,
+                            ):
+                                self._send_repl_chunked_file(
+                                    actual_local,
+                                    actual_remote,
+                                    file_size,
+                                    verify_mode,
+                                    expected_crc,
+                                )
+                            elapsed = time.time() - _t0
+                            rate = file_size / elapsed / 1024 if elapsed > 0 else 0
+                            if verify_mode == "off":
+                                log.info(
+                                    "刷入成功 (校验已关闭) (%s)", actual_remote,
+                                )
+                            else:
+                                log.info(
+                                    "刷入成功 (%s): %.1f KB, %.1fs, %.0f KB/s",
+                                    actual_remote,
+                                    file_size / 1024,
+                                    elapsed,
+                                    rate,
+                                )
+                            return
+                        except (serial.SerialException, ConnectionError, RuntimeError) as e:
+                            self.invalidate_device_context(raw_repl=True)
+                            if attempt >= max_retries:
+                                raise
+                            log.warning(
+                                "%s，准备重试兼容刷入 (%d/%d)...",
+                                e,
+                                attempt + 1,
+                                max_retries,
+                            )
+
                 if delta_enabled:
                     for attempt in range(max_retries + 1):
                         if attempt > 0:
@@ -1403,28 +1536,35 @@ class MicroPython(MicroPythonBase):
         """列出设备目录下的文件和子目录。"""
         script = (
             "import os\n"
+            "def _st(p):\n"
+            " s=os.stat(p); s=os.stat(p)\n"
+            " return s\n"
+            "def _fp(d,n):\n"
+            " return '/'+n if not d or d=='/' else d+'/'+n\n"
+            "def _sz(p,e):\n"
+            " return e[3] if len(e)>3 else _st(p)[6]\n"
             "def _ds(p,_d=0):\n"
             " t=0\n"
             " if _d>32:\n"
             "  return 0\n"
             " try:\n"
-            "  for n,fl,_,sz in os.ilistdir(p):\n"
+            "  for e in os.ilistdir(p):\n"
+            "   n=e[0]; fl=e[1]; fp=_fp(p,n)\n"
             "   if fl&0x4000:\n"
-            "    fp='/'+n if p=='/' else p+'/'+n\n"
             "    t+=_ds(fp,_d+1)\n"
             "   else:\n"
-            "    t+=sz\n"
+            "    t+=_sz(fp,e)\n"
             " except:\n"
             "  pass\n"
             " return t\n"
-            f"p={remote_path!r}\n"
-            "for n,fl,_,sz in os.ilistdir(p or '/'):\n"
+           f"p={remote_path!r}\n"
+            "for e in os.ilistdir(p or '/'):\n"
+            " n=e[0]; fl=e[1]; fp=_fp(p,n)\n"
             " try:\n"
             "  if fl&0x4000:\n"
-            "   fp='/'+n if p=='/' else p+'/'+n\n"
             "   print(str(_ds(fp))+'|D|'+n)\n"
             "  else:\n"
-            "   print(str(sz)+'|F|'+n)\n"
+            "   print(str(_sz(fp,e))+'|F|'+n)\n"
             " except OSError:\n"
             "  print('?|?|'+n)\n"
         )
@@ -1444,6 +1584,7 @@ class MicroPython(MicroPythonBase):
         """递归列出设备目录下的所有文件和子目录。"""
         script = (
             "import os\n"
+            "print(os.listdir())\n"
             "def _st(p):\n"
             " s=os.stat(p); s=os.stat(p)\n"
             " return s\n"

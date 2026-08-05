@@ -1,3 +1,4 @@
+import ast
 import os
 import binascii
 import io
@@ -40,6 +41,39 @@ _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
+
+
+class _ChunkedRawExecTransport:
+    def __init__(self, responses):
+        self.connected = True
+        self.responses = list(responses)
+        self.pending = []
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+        if data == b"\x04":
+            self.pending.extend(self.responses.pop(0))
+
+    @property
+    def in_waiting(self):
+        return len(self.pending[0]) if self.pending else 0
+
+    def read(self, _size):
+        return self.pending.pop(0)
+
+
+class TestRawReplExecutionFraming:
+    def test_execute_consumes_stdout_stderr_trailers_before_next_command(self):
+        transport = _ChunkedRawExecTransport([
+            [b"OKfirst\x04", b"\x04>"],
+            [b"OKsecond\x04\x04>"],
+        ])
+        mp = MicroPython(port="COM99", transport=transport)
+
+        assert mp._execute("print('first')") == "first"
+        assert mp._execute("print('second')") == "second"
+        assert transport.pending == []
 
 
 class TestDeviceRuntimeInfo:
@@ -632,6 +666,57 @@ class TestFilesystemMountGuard:
         assert kwargs == {"timeout": 5, "raise_on_error": False}
 
 
+class TestFilesystemListing:
+    def test_fs_ls_supports_three_field_ilistdir_entries(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        stat_calls = []
+
+        class ThreeFieldIlistdirOS:
+            @staticmethod
+            def ilistdir(path):
+                entries = {
+                    "/": [("lib", 0x4000, 0), ("main.py", 0x8000, 0)],
+                    "/lib": [("module.py", 0x8000, 0)],
+                }
+                return iter(entries[path])
+
+            @staticmethod
+            def stat(path):
+                stat_calls.append(path)
+                size = {"/lib/module.py": 7, "/main.py": 11}[path]
+                return (0x8000, 0, 0, 0, 0, 0, size)
+
+        def fake_run(code, timeout):
+            import builtins
+            from contextlib import redirect_stdout
+
+            real_import = builtins.__import__
+
+            def fake_import(name, *args, **kwargs):
+                if name == "os":
+                    return ThreeFieldIlistdirOS
+                return real_import(name, *args, **kwargs)
+
+            fake_builtins = dict(vars(builtins), __import__=fake_import)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(code, {"__builtins__": fake_builtins})
+            return output.getvalue()
+
+        monkeypatch.setattr(mp, "run", fake_run)
+
+        assert mp.fs_ls("/") == [
+            {"size": "7", "type": "D", "name": "lib"},
+            {"size": "11", "type": "F", "name": "main.py"},
+        ]
+        assert stat_calls == [
+            "/lib/module.py",
+            "/lib/module.py",
+            "/main.py",
+            "/main.py",
+        ]
+
+
 class _SafeBreakTransport:
     def __init__(self):
         self.connected = True
@@ -847,6 +932,95 @@ class TestUploadAckWindow:
             MicroPython(port="COM99", baudrate=921600)._upload_ack_every()
             == BATCH_ACK_EVERY
         )
+
+    def test_rt_smart_repl_chunk_transfer_preserves_binary_payload(
+        self, tmp_path, monkeypatch
+    ):
+        payload = bytes(range(256)) + b"\x00\x03\x04binary-tail" * 24
+        local = tmp_path / "payload.bin"
+        local.write_bytes(payload)
+        mp = MicroPython(port="COM99")
+        device_data = bytearray()
+        executed = []
+
+        def fake_execute(code, **_kwargs):
+            executed.append(code)
+            if "PYRITE_WRITE_READY|" in code:
+                device_data.clear()
+                return "PYRITE_WRITE_READY|0"
+            if "PYRITE_WRITE|" in code:
+                payload_line = next(
+                    line for line in code.splitlines() if line.startswith("_payload=")
+                )
+                chunk = ast.literal_eval(payload_line.split("=", 1)[1])
+                device_data.extend(chunk)
+                return f"PYRITE_WRITE|{len(device_data)}"
+            raise AssertionError(code)
+
+        monkeypatch.setattr(mp, "_execute", fake_execute)
+        monkeypatch.setattr(
+            mp,
+            "_verify_file_on_device",
+            lambda path, size, mode, crc: (
+                path == "/data/payload.bin"
+                and size == len(payload)
+                and mode == "size"
+                and crc is None
+                and bytes(device_data) == payload
+            ),
+        )
+
+        mp._send_repl_chunked_file(
+            str(local),
+            "/data/payload.bin",
+            len(payload),
+            "size",
+            None,
+        )
+
+        assert bytes(device_data) == payload
+        assert all("sys.stdin.buffer" not in code for code in executed)
+        chunks = [
+            ast.literal_eval(
+                next(
+                    line for line in code.splitlines() if line.startswith("_payload=")
+                ).split("=", 1)[1]
+            )
+            for code in executed
+            if "PYRITE_WRITE|" in code
+        ]
+        assert max(map(len, chunks)) <= 256
+
+    def test_flash_file_uses_repl_chunks_on_rt_smart(self, tmp_path, monkeypatch):
+        local = tmp_path / "payload.bin"
+        local.write_bytes(b"hello")
+        mp = MicroPython(port="COM99")
+        mp.runtime_info = DeviceRuntimeInfo(platform="rt-smart")
+        mp.config.auto_compile = False
+        mp.config.delta_flash = "off"
+        mp.config.verify = "size"
+        mp.config.max_retries = 0
+        calls = []
+
+        monkeypatch.setattr(mp, "_traffic_log_ctx", lambda: nullcontext())
+        monkeypatch.setattr(mp, "_enter_raw_repl", lambda: None)
+        monkeypatch.setattr(mp, "_mkdirs_on_device", lambda paths: None)
+        monkeypatch.setattr(
+            mp,
+            "_send_flash_payload",
+            lambda *args, **kwargs: pytest.fail("stdin streaming must be bypassed"),
+        )
+        monkeypatch.setattr(
+            mp,
+            "_send_repl_chunked_file",
+            lambda *args: calls.append(args),
+        )
+
+        mp.flash_file(str(local), "/data/payload.bin", compile=False)
+
+        assert calls == [
+            (str(local), "/data/payload.bin", 5, "size", None),
+        ]
 
     def test_flash_file_passes_adaptive_ack_to_script_and_sender(
         self, tmp_path, monkeypatch

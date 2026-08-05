@@ -21,6 +21,10 @@ import typer
 
 from . import __version__
 from .reg_commands import register_command_groups
+from .reg_commands.common import (
+    _confirm_overwrite,
+    _materialize_stdin_source,
+)
 
 from .utils.board_alias import (
     BoardAliasError,
@@ -41,6 +45,13 @@ from .utils.device_context import (
 )
 from .utils.errors import humanize_exception
 from .utils.log import configure_from_verbosity, get_logger
+from .utils.pipes import (
+    cleanup_paths,
+    materialize_record_source,
+    read_jsonl,
+    record_text,
+    write_jsonl,
+)
 from .utils.ui import is_tty, print_json
 
 log = get_logger(__name__)
@@ -381,7 +392,7 @@ def flash(
     ctx: typer.Context,
     port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
                                autocompletion=_complete_port),
-    file: str = typer.Argument(..., help="待刷入的本地文件路径"),
+    file: str = typer.Argument(..., help="待刷入的本地文件路径，或 - 从 stdin 读取"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
     baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
@@ -408,11 +419,13 @@ def flash(
     预检查可用 --check、--check=basic|strict 或 --no-check 控制。
     """
     remote_path = _norm_path(remote_path)
+    file, stdin_temp_path = _materialize_stdin_source(file, remote_path)
     check = _consume_check_option(list(ctx.args))
-    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    mp = None
     recorder = None
     trace_status = "ok"
     try:
+        mp = _mp_factory(port, baudrate, timeout, ws, password)
         if trace:
             from .utils.trace import TraceRecorder, default_trace_path, make_session_id
 
@@ -472,13 +485,15 @@ def flash(
         )
         if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
             mp.safe_break()
-        if not force and remote_path:
+        if not force and remote_path and not dry_run:
+            remote_exists = False
             try:
                 mp.run(f"import os;os.stat({remote_path!r})")
-                log.warning("文件 '%s' 已存在于设备，使用 --force 覆盖或先删除", remote_path)
-                click.confirm("  继续覆盖?", default=False, abort=True)
+                remote_exists = True
             except RuntimeError:
                 pass
+            if remote_exists:
+                _confirm_overwrite(remote_path)
 
         mp.flash_file(
             file, remote_path, compile=not no_compile,
@@ -493,10 +508,136 @@ def flash(
         raise
     finally:
         try:
-            mp.disconnect()
+            if mp is not None:
+                mp.disconnect()
         finally:
             if recorder is not None:
                 recorder.close(status=trace_status)
+            if stdin_temp_path is not None:
+                try:
+                    os.unlink(stdin_temp_path)
+                except FileNotFoundError:
+                    pass
+
+
+@app.command("flash-batch", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@command_needs(FLASH_NEEDS)
+def flash_batch(
+    ctx: typer.Context,
+    port: str = typer.Argument(..., help="串口号，如 COM3 或 /dev/ttyUSB0",
+                               autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
+    mp_version: Optional[str] = typer.Option(None, "--mp-version", help="目标 MicroPython 固件版本，用于 strict 兼容性预检查"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    force: bool = typer.Option(False, "--force", "-F", help="强制覆盖"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    safe_main: bool = typer.Option(
+        True,
+        "--safe-main/--no-safe-main",
+        help="刷入根 /main.py 前先 Ctrl+C 打断并备份原文件",
+    ),
+    no_check: bool = typer.Option(False, "--no-check", help="跳过刷入前预检查"),
+) -> None:
+    """从 JSONL 批量刷入文件。"""
+    check = _consume_check_option(list(ctx.args))
+    prepared_records: list[dict[str, object]] = []
+    temp_paths: list[str] = []
+    failed = False
+    for item in read_jsonl(input):
+        record = item.data
+        if record.get("_invalid"):
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "error": record.get("error", "invalid record")})
+            continue
+        remote_path = record_text(record, "remote", "remote_path")
+        if not remote_path:
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "error": "missing remote"})
+            continue
+        remote_path = _norm_path(remote_path)
+        try:
+            local_path, temp_path = materialize_record_source(record, remote_path=remote_path)
+            if temp_path:
+                temp_paths.append(temp_path)
+            if not local_path:
+                raise ValueError("missing local or content_b64")
+            prepared_records.append({
+                "line": item.line,
+                "local": local_path,
+                "remote": remote_path,
+            })
+        except Exception as exc:
+            failed = True
+            write_jsonl({"ok": False, "line": item.line, "remote": remote_path, "error": str(exc)})
+
+    if not prepared_records:
+        cleanup_paths(temp_paths)
+        if failed:
+            raise typer.Exit(1)
+        return
+
+    mp = None
+    try:
+        mp = _mp_factory(port, baudrate, timeout, ws, password)
+        needs = FLASH_NEEDS if not no_compile else needs_no_mpy(FLASH_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
+        prepared = prepare_device(
+            mp,
+            needs,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+            explicit_mp_version=mp_version,
+        )
+        active_tags = prepared.active_tags or set()
+        _run_precheck_or_exit(
+            [(str(item["local"]), str(item["remote"])) for item in prepared_records],
+            check,
+            no_check,
+            active_tags=active_tags,
+            mp_version=prepared.precheck_mp_version,
+        )
+        for item in prepared_records:
+            local_path = str(item["local"])
+            remote_path = str(item["remote"])
+            try:
+                if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
+                    mp.safe_break()
+                if not force and remote_path and not dry_run:
+                    try:
+                        mp.run(f"import os;os.stat({remote_path!r})")
+                        raise FileExistsError("remote exists; pass --force")
+                    except RuntimeError:
+                        pass
+                mp.flash_file(
+                    local_path,
+                    remote_path,
+                    compile=not no_compile,
+                    bytecode_ver=prepared.bytecode_ver,
+                    arch=prepared.arch,
+                    active_tags=active_tags or None,
+                    dry_run=dry_run,
+                    safe_main=safe_main,
+                )
+                write_jsonl({"ok": True, "line": item["line"], "local": local_path, "remote": remote_path})
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": item["line"], "local": local_path, "remote": remote_path, "error": str(exc)})
+    finally:
+        try:
+            if mp is not None:
+                mp.disconnect()
+        finally:
+            cleanup_paths(temp_paths)
+    if failed:
+        raise typer.Exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════════

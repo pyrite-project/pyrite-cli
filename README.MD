@@ -347,6 +347,19 @@ C3 = ["ESP32", "wifi"]
 | `fs mv` | Move or rename |
 | `fs cp` | Copy |
 
+`flash` and `fs put` accept `-` as stdin input, and `fs get REMOTE -` writes raw bytes to stdout. If you need a literal file named `-`, use `./-`.
+
+Batch pipe commands use JSONL: one JSON object per line in, one JSON object per line out. Upload records accept `{"local":"main.py","remote":"/main.py"}` or self-contained `{"remote":"/main.py","content_b64":"..."}`; download records use `{"remote":"/main.py"}` and return `content_b64`.
+
+```bash
+printf '{"remote":"/main.py","content_b64":"cHJpbnQoMSkK"}\n' | pyrcli flash-batch COM3 --force
+printf '{"remote":"/main.py"}\n' | pyrcli fs get-batch COM3 | jq -r '.content_b64' | base64 -d
+printf '{"path":"/tmp.txt"}\n' | pyrcli fs rm-batch COM3 --force
+pyrcli device backup COM3 ignored /app --stdout-jsonl > app-backup.jsonl
+pyrcli device restore COM3 - /app --stdin-jsonl app-backup.jsonl
+pyrcli snapshot restore COM3 - --stdin-jsonl app-backup.jsonl --apply --yes
+```
+
 ### `pyrcli pkg`
 
 | Command | Purpose |

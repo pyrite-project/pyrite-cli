@@ -4,9 +4,17 @@ import os
 import sys
 from typing import List, Optional
 
-import click
 import typer
 
+from ..utils.pipes import (
+    b64encode,
+    cleanup_paths,
+    materialize_record_source,
+    read_jsonl,
+    record_text,
+    sha256_bytes,
+    write_jsonl,
+)
 from ..utils.ui import print_json, safe_text
 from ..utils.device_context import (
     CommandNeeds,
@@ -18,9 +26,11 @@ from ..utils.device_context import (
 from .common import (
     DEFAULT_BAUDRATE,
     MicroPython,
+    _confirm_overwrite,
     _complete_port,
     _FORMAT_OPTION,
     _JSON_OPTION,
+    _materialize_stdin_source,
     _mp_factory,
     _norm_path,
     _resolve_format,
@@ -244,7 +254,7 @@ def fs_cat(
 @command_needs(FS_PUT_NEEDS)
 def fs_put(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
-    local_path: str = typer.Argument(..., help="本地文件路径"),
+    local_path: str = typer.Argument(..., help="本地文件路径，或 - 从 stdin 读取"),
     remote_path: str = typer.Argument(..., help="设备上的目标路径"),
     baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
@@ -264,8 +274,10 @@ def fs_put(
 ) -> None:
     """连接设备并上传本地文件。"""
     remote_path = _norm_path(remote_path)
-    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    local_path, stdin_temp_path = _materialize_stdin_source(local_path, remote_path)
+    mp = None
     try:
+        mp = _mp_factory(port, baudrate, timeout, ws, password)
         needs = FS_PUT_NEEDS if not no_compile else needs_no_mpy(FS_PUT_NEEDS)
         needs = needs_with_flash_verify_feature(needs, mp.config)
         prepared = prepare_device(
@@ -277,13 +289,15 @@ def fs_put(
         )
         if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
             mp.safe_break()
-        if not force:
+        if not force and not dry_run:
+            remote_exists = False
             try:
                 mp.run(f"import os;os.stat({repr(remote_path)})")
-                log.warning("文件 '%s' 已存在于设备，使用 --force 覆盖或先删除", remote_path)
-                click.confirm("  继续覆盖?", default=False, abort=True)
+                remote_exists = True
             except RuntimeError:
                 pass
+            if remote_exists:
+                _confirm_overwrite(remote_path)
 
         active_tags = prepared.active_tags or set()
         mp.flash_file(
@@ -293,14 +307,22 @@ def fs_put(
             safe_main=safe_main,
         )
     finally:
-        mp.disconnect()
+        try:
+            if mp is not None:
+                mp.disconnect()
+        finally:
+            if stdin_temp_path is not None:
+                try:
+                    os.unlink(stdin_temp_path)
+                except FileNotFoundError:
+                    pass
 
 
 @fs_app.command("get")
 def fs_get(
     port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
     remote_path: str = typer.Argument(..., help="设备上的文件路径"),
-    local_path: str = typer.Argument(None, help="本地保存路径"),
+    local_path: str = typer.Argument(None, help="本地保存路径，或 - 写到 stdout"),
     baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
     timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
@@ -308,14 +330,255 @@ def fs_get(
 ) -> None:
     """连接设备并下载指定文件到本地。"""
     remote_path = _norm_path(remote_path)
+    mp = None
+    try:
+        mp = _mp_factory(port, baudrate, timeout, ws, password)
+        mp.connect()
+        if local_path == "-":
+            data = mp.fs_get_bytes(remote_path)
+            out = getattr(sys.stdout, "buffer", None)
+            if out is None:
+                sys.stdout.write(data.decode("utf-8", errors="replace"))
+            else:
+                out.write(data)
+                out.flush()
+        else:
+            dst = local_path or os.path.basename(remote_path)
+            sz = mp.fs_get(remote_path, dst)
+            log.info("已下载: %s → %s (%d 字节)", remote_path, dst, sz)
+    finally:
+        if mp is not None:
+            mp.disconnect()
+
+
+@fs_app.command("put-batch")
+@command_needs(FS_PUT_NEEDS)
+def fs_put_batch(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="跳过 mpy 编译"),
+    target: Optional[str] = typer.Option(None, "--target", help="手动指定 board target"),
+    feature: Optional[str] = typer.Option(None, "--feature", "-f", help="追加激活的 feature tags"),
+    no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+    force: bool = typer.Option(False, "--force", "-F", help="强制覆盖"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式"),
+    safe_main: bool = typer.Option(
+        True,
+        "--safe-main/--no-safe-main",
+        help="上传根 /main.py 前先 Ctrl+C 打断并备份原文件",
+    ),
+) -> None:
+    """从 JSONL 批量上传文件。"""
     mp = _mp_factory(port, baudrate, timeout, ws, password)
+    temp_paths: list[str] = []
+    failed = False
+    try:
+        needs = FS_PUT_NEEDS if not no_compile else needs_no_mpy(FS_PUT_NEEDS)
+        needs = needs_with_flash_verify_feature(needs, mp.config)
+        prepared = prepare_device(
+            mp,
+            needs,
+            target=target,
+            feature=feature,
+            no_feature=no_feature,
+        )
+        active_tags = prepared.active_tags or set()
+        for item in read_jsonl(input):
+            record = item.data
+            if record.get("_invalid"):
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "error": record.get("error", "invalid record")})
+                continue
+            remote_path = record_text(record, "remote", "remote_path")
+            if not remote_path:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "error": "missing remote"})
+                continue
+            remote_path = _norm_path(remote_path)
+            try:
+                local_path, temp_path = materialize_record_source(record, remote_path=remote_path)
+                if temp_path:
+                    temp_paths.append(temp_path)
+                if not local_path:
+                    raise ValueError("missing local or content_b64")
+                if safe_main and not dry_run and mp.is_safe_main_path(remote_path):
+                    mp.safe_break()
+                if not force and not dry_run:
+                    try:
+                        mp.run(f"import os;os.stat({remote_path!r})")
+                        raise FileExistsError("remote exists; pass --force")
+                    except RuntimeError:
+                        pass
+                mp.flash_file(
+                    local_path,
+                    remote_path,
+                    compile=not no_compile,
+                    bytecode_ver=prepared.bytecode_ver,
+                    arch=prepared.arch,
+                    active_tags=active_tags or None,
+                    dry_run=dry_run,
+                    safe_main=safe_main,
+                )
+                write_jsonl({"ok": True, "line": item.line, "local": local_path, "remote": remote_path})
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "remote": remote_path, "error": str(exc)})
+    finally:
+        try:
+            mp.disconnect()
+        finally:
+            cleanup_paths(temp_paths)
+    if failed:
+        raise typer.Exit(1)
+
+
+@fs_app.command("get-batch")
+def fs_get_batch(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+) -> None:
+    """从 JSONL 批量下载文件，stdout 输出 content_b64 JSONL。"""
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    failed = False
     try:
         mp.connect()
-        dst = local_path or os.path.basename(remote_path)
-        sz = mp.fs_get(remote_path, dst)
-        log.info("已下载: %s → %s (%d 字节)", remote_path, dst, sz)
+        for item in read_jsonl(input):
+            record = item.data
+            if record.get("_invalid"):
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "error": record.get("error", "invalid record")})
+                continue
+            remote_path = record_text(record, "remote", "remote_path", "path")
+            if not remote_path:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "error": "missing remote"})
+                continue
+            remote_path = _norm_path(remote_path)
+            try:
+                data = mp.fs_get_bytes(remote_path)
+                write_jsonl({
+                    "ok": True,
+                    "line": item.line,
+                    "remote": remote_path,
+                    "size": len(data),
+                    "sha256": sha256_bytes(data),
+                    "content_b64": b64encode(data),
+                })
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "remote": remote_path, "error": str(exc)})
     finally:
         mp.disconnect()
+    if failed:
+        raise typer.Exit(1)
+
+
+@fs_app.command("rm-batch")
+def fs_rm_batch(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    recursive: bool = typer.Option(False, "-r", "--recursive", help="递归删除"),
+    force: bool = typer.Option(False, "-f", "--force", help="忽略错误"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+) -> None:
+    """从 JSONL 批量删除文件或目录。"""
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    failed = False
+    try:
+        mp.connect()
+        for item in read_jsonl(input):
+            record = item.data
+            path = record_text(record, "path", "remote", "remote_path")
+            if record.get("_invalid") or not path:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "error": record.get("error", "missing path")})
+                continue
+            path = _norm_path(path)
+            try:
+                ok = bool(mp.fs_rm(path, recursive=recursive, force=force))
+                failed = failed or not ok
+                write_jsonl({"ok": ok, "line": item.line, "path": path})
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "path": path, "error": str(exc)})
+    finally:
+        mp.disconnect()
+    if failed:
+        raise typer.Exit(1)
+
+
+@fs_app.command("mv-batch")
+def fs_mv_batch(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+) -> None:
+    """从 JSONL 批量移动或重命名设备路径。"""
+    _fs_two_path_batch(port, input, baudrate, timeout, ws, password, op="mv")
+
+
+@fs_app.command("cp-batch")
+def fs_cp_batch(
+    port: str = typer.Argument(..., help="串口号", autocompletion=_complete_port),
+    input: str = typer.Argument("-", help="JSONL 输入路径，或 - 从 stdin 读取"),
+    baudrate: Optional[int] = typer.Option(None, "--baudrate", "-b", help="波特率", envvar="PYRITE_BAUDRATE"),
+    timeout: Optional[int] = typer.Option(None, "--timeout", "-t", help="超时秒数", envvar="PYRITE_TIMEOUT"),
+    ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
+    password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
+) -> None:
+    """从 JSONL 批量复制设备路径。"""
+    _fs_two_path_batch(port, input, baudrate, timeout, ws, password, op="cp")
+
+
+def _fs_two_path_batch(
+    port: str,
+    input_path: str,
+    baudrate: Optional[int],
+    timeout: Optional[int],
+    ws: Optional[str],
+    password: Optional[str],
+    *,
+    op: str,
+) -> None:
+    mp = _mp_factory(port, baudrate, timeout, ws, password)
+    failed = False
+    try:
+        mp.connect()
+        for item in read_jsonl(input_path):
+            record = item.data
+            src = record_text(record, "src", "source", "from")
+            dst = record_text(record, "dst", "dest", "to")
+            if record.get("_invalid") or not src or not dst:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "op": op, "error": record.get("error", "missing src or dst")})
+                continue
+            src = _norm_path(src)
+            dst = _norm_path(dst)
+            try:
+                ok = bool(mp.fs_mv(src, dst) if op == "mv" else mp.fs_cp(src, dst))
+                failed = failed or not ok
+                write_jsonl({"ok": ok, "line": item.line, "op": op, "src": src, "dst": dst})
+            except Exception as exc:
+                failed = True
+                write_jsonl({"ok": False, "line": item.line, "op": op, "src": src, "dst": dst, "error": str(exc)})
+    finally:
+        mp.disconnect()
+    if failed:
+        raise typer.Exit(1)
 
 
 @fs_app.command("tree")

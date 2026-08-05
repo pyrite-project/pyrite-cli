@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
@@ -107,17 +109,21 @@ def manifest_plan(
     fmt = _resolve_format(fmt, json_output)
     target = _resolve_target(target, profile)
     active_tags = _active_tags_for_target(target, feature, no_feature)
+    manifest_value, temp_path = _materialize_manifest_stdin(manifest)
     try:
         lock = build_manifest_lock(
-            manifest,
+            manifest_value,
             active_tags,
-            base_dir=base_dir,
+            base_dir=base_dir or ("." if manifest == "-" else None),
             target=target,
             build_settings=_build_settings(no_compile),
         )
     except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
     _print_manifest_payload(lock.to_dict(), fmt)
 
@@ -139,8 +145,9 @@ def manifest_lock(
     from ..utils.build import ManifestLockError, build_manifest_lock, save_manifest_lock
 
     fmt = _resolve_format(fmt, json_output)
-    manifest_path = Path(manifest)
-    base = Path(base_dir or manifest_path.parent).resolve()
+    manifest_value, temp_path = _materialize_manifest_stdin(manifest)
+    manifest_path = Path(manifest_value)
+    base = Path(base_dir or ("." if manifest == "-" else manifest_path.parent)).resolve()
     path = Path(lockfile)
     if not path.is_absolute():
         path = base / path
@@ -158,7 +165,18 @@ def manifest_lock(
     except (FileNotFoundError, OSError, ValueError, ManifestLockError) as exc:
         log.error("%s", exc)
         raise typer.Exit(1) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
     payload = lock.to_dict()
     payload["lockfile"] = str(written)
     _print_manifest_payload(payload, fmt)
+
+
+def _materialize_manifest_stdin(manifest: str) -> tuple[str, Optional[Path]]:
+    if manifest != "-":
+        return manifest, None
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix="-manifest.py", delete=False) as handle:
+        handle.write(sys.stdin.read())
+        return handle.name, Path(handle.name)

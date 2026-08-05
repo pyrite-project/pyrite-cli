@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +32,12 @@ def trace_view(
     tail: Optional[int] = typer.Option(None, "--tail", help="Only show the last N events"),
 ) -> None:
     """Render a trace file as readable event lines."""
-    records = load_trace(path)
+    actual_path, temp_path = _materialize_stdin_path(path, suffix=".pyrite-trace")
+    try:
+        records = load_trace(actual_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     typer.echo(format_trace_view(records, limit=tail))
 
 
@@ -42,9 +49,24 @@ def trace_summarize(
     json_output: bool = _JSON_OPTION,
 ) -> None:
     """Summarize traffic, phases, and failures in a trace file."""
-    summary = summarize_trace(path, tail=tail)
+    actual_path, temp_path = _materialize_stdin_path(path, suffix=".pyrite-trace")
+    try:
+        summary = summarize_trace(actual_path, tail=tail)
+        if str(path) == "-":
+            summary["path"] = "-"
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     fmt = _resolve_format(fmt, json_output)
     if fmt == "json":
         print_json(summary)
         return
     typer.echo(format_trace_summary(summary))
+
+
+def _materialize_stdin_path(path: Path, *, suffix: str) -> tuple[Path, Optional[Path]]:
+    if str(path) != "-":
+        return path, None
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=suffix, delete=False) as handle:
+        handle.write(sys.stdin.read())
+        return Path(handle.name), Path(handle.name)

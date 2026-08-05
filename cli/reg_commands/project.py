@@ -28,6 +28,7 @@ from ..utils.device_context import (
     resolve_active_tags,
     split_tags,
 )
+from ..utils.pipes import read_jsonl, record_text
 
 # project 子命令组
 # ═══════════════════════════════════════════════════════════════════
@@ -274,6 +275,7 @@ def project_flash(
     mp_version: Optional[str] = typer.Option(None, "--mp-version", help="目标 MicroPython 固件版本，用于 strict 兼容性预检查"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     hash_config: Optional[str] = typer.Option(None, "--config", "-c", help="哈希配置文件路径"),
+    changed_from: Optional[str] = typer.Option(None, "--changed-from", help="JSONL 变更清单路径，或 - 从 stdin 读取"),
     locked: bool = typer.Option(False, "--locked", help="要求 manifest 与 pyrite.lock 一致后才刷入"),
     lockfile: str = typer.Option("pyrite.lock", "--lockfile", help="lockfile 路径；相对路径基于项目目录"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
@@ -292,6 +294,7 @@ def project_flash(
     """
     remote_path = _norm_path(remote_path)
     check = _consume_check_option(list(ctx.args))
+    changed_paths = _read_changed_paths_jsonl(changed_from) if changed_from else None
     if locked and manifest is None:
         manifest = str(Path(directory) / "manifest.py")
     mp = _mp_factory(port, baudrate, timeout, ws, password)
@@ -370,6 +373,7 @@ def project_flash(
             bytecode_ver=prepared.bytecode_ver, arch=prepared.arch,
             active_tags=active_tags or None,
             manifest_path=manifest, dry_run=dry_run,
+            changed_paths=changed_paths,
         )
     finally:
         mp.disconnect()
@@ -430,6 +434,7 @@ def project_pull(
     no_feature: Optional[str] = typer.Option(None, "--no-feature", help="强制禁用的 feature tags"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="manifest.py 路径"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="预览模式"),
+    stdout_jsonl: bool = typer.Option(False, "--stdout-jsonl", help="将设备文件内容作为 JSONL 输出到 stdout，不写本地文件"),
     ws: Optional[str] = typer.Option(None, "--ws", help="WebREPL URL"),
     password: Optional[str] = typer.Option(None, "--password", help="WebREPL 密码"),
     fmt: str = _FORMAT_OPTION,
@@ -458,15 +463,43 @@ def project_pull(
             if active_tags is None:
                 active_tags = set()
             active_tags.difference_update(split_tags(no_feature))
-        ok = ProjectSyncManager(mp).pull(
-            directory, remote_path,
-            active_tags=active_tags, manifest_path=manifest,
-            dry_run=dry_run, fmt=fmt,
-        )
+        manager = ProjectSyncManager(mp)
+        if stdout_jsonl:
+            ok = manager.pull_stdout_jsonl(
+                directory, remote_path,
+                active_tags=active_tags,
+                manifest_path=manifest,
+            )
+        else:
+            ok = manager.pull(
+                directory, remote_path,
+                active_tags=active_tags, manifest_path=manifest,
+                dry_run=dry_run, fmt=fmt,
+            )
     finally:
         mp.disconnect()
     if ok is False:
         raise typer.Exit(1)
+
+
+def _read_changed_paths_jsonl(path: str) -> set[str]:
+    changed: set[str] = set()
+    failed = False
+    for item in read_jsonl(path):
+        record = item.data
+        if record.get("_invalid"):
+            log.error("changed-from line %d: %s", item.line, record.get("error", "invalid record"))
+            failed = True
+            continue
+        value = record_text(record, "local", "path", "file")
+        if not value:
+            log.error("changed-from line %d: missing local/path", item.line)
+            failed = True
+            continue
+        changed.add(value)
+    if failed:
+        raise typer.Exit(1)
+    return changed
 
 
 @project_app.command("run")

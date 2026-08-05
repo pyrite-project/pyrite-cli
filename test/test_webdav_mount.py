@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import socket
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -241,6 +242,34 @@ class FirstPathDeleteFailureAdapter(FakeAdapter):
         super().delete(path)
 
 
+class TransientWriteFailureAdapter(FakeAdapter):
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures = failures
+        self.write_attempts = []
+
+    def write_file(self, path: str, data: bytes) -> None:
+        self.write_attempts.append((path, data))
+        if len(self.write_attempts) <= self.failures:
+            raise OSError("transient write failure")
+        super().write_file(path, data)
+
+
+class PathWriteAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.path_writes = []
+
+    def write_file(self, path: str, data: bytes) -> None:
+        raise AssertionError("PUT should reuse its existing temporary file")
+
+    def write_file_from_path(self, path: str, local_path: str, size: int) -> None:
+        with open(local_path, "rb") as f:
+            data = f.read()
+        self.files[path] = data
+        self.path_writes.append((path, data, size))
+
+
 class RecursiveListingAdapter(FakeAdapter):
     def __init__(self):
         super().__init__()
@@ -308,6 +337,42 @@ class EmptyDirRemoveMicroPython:
 
     def fs_rm(self, path: str, recursive: bool = False, force: bool = False):
         self.fs_rm_calls.append((path, recursive, force))
+        return True
+
+
+class InterruptedStagedWriteMicroPython:
+    def __init__(self):
+        self.files = {"/main.py": b"old"}
+        self.flash_calls = []
+
+    def flash_file(self, local_path: str, remote_path: str, compile: bool = False):
+        self.flash_calls.append((local_path, remote_path, compile))
+        self.files[remote_path] = b"partial"
+        raise OSError("interrupted transfer")
+
+    def fs_rm(self, path: str, recursive: bool = False, force: bool = False):
+        self.files.pop(path, None)
+        return True
+
+
+class SuccessfulStagedWriteMicroPython:
+    def __init__(self):
+        self.files = {"/main.py": b"old"}
+        self.staging_path = None
+        self.commit_scripts = []
+
+    def flash_file(self, local_path: str, remote_path: str, compile: bool = False):
+        self.staging_path = remote_path
+        with open(local_path, "rb") as f:
+            self.files[remote_path] = f.read()
+
+    def run(self, script: str, timeout: int = 10):
+        self.commit_scripts.append(script)
+        self.files["/main.py"] = self.files.pop(self.staging_path)
+        return "OK\n"
+
+    def fs_rm(self, path: str, recursive: bool = False, force: bool = False):
+        self.files.pop(path, None)
         return True
 
 
@@ -915,6 +980,36 @@ def test_device_delete_uses_rmdir_for_empty_directory_before_recursive_rm():
     assert mp.fs_rm_calls == []
 
 
+def test_device_write_failure_preserves_existing_destination(tmp_path):
+    local_path = tmp_path / "payload.bin"
+    local_path.write_bytes(b"new")
+    mp = InterruptedStagedWriteMicroPython()
+    adapter = MicroPythonWebDavAdapter(mp)
+
+    with pytest.raises(OSError, match="interrupted transfer"):
+        adapter.write_file_from_path("/main.py", str(local_path), 3)
+
+    assert mp.files["/main.py"] == b"old"
+    assert len(mp.flash_calls) == 1
+    assert mp.flash_calls[0][1] != "/main.py"
+    assert set(mp.files) == {"/main.py"}
+
+
+def test_device_write_commits_verified_staging_file(tmp_path):
+    local_path = tmp_path / "payload.bin"
+    local_path.write_bytes(b"new")
+    mp = SuccessfulStagedWriteMicroPython()
+    adapter = MicroPythonWebDavAdapter(mp)
+
+    adapter.write_file_from_path("/main.py", str(local_path), 3)
+
+    assert mp.files == {"/main.py": b"new"}
+    assert mp.staging_path != "/main.py"
+    assert len(mp.commit_scripts) == 1
+    assert "os.rename(src,dst)" in mp.commit_scripts[0]
+    assert "os.rename(bak,dst)" in mp.commit_scripts[0]
+
+
 def test_delete_is_idempotent_when_file_manager_retries_missing_path():
     adapter = MissingOnDeleteAdapter()
     server = _serve(adapter)
@@ -1063,6 +1158,188 @@ def test_put_writes_uploaded_body_to_device_path():
 
     assert status == 201
     assert adapter.writes == [("/flash/new.txt", b"abc")]
+
+
+def test_keep_alive_put_requests_do_not_reuse_previous_path():
+    adapter = FakeAdapter()
+    server = _serve(adapter)
+    conn = http.client.HTTPConnection(
+        server.server_address[0],
+        server.server_address[1],
+        timeout=5,
+    )
+    try:
+        conn.request(
+            "PUT",
+            "/first.txt",
+            body=b"first",
+            headers={"Content-Length": "5"},
+        )
+        first = conn.getresponse()
+        first_body = first.read()
+
+        conn.request(
+            "PUT",
+            "/second.txt",
+            body=b"second",
+            headers={"Content-Length": "6"},
+        )
+        second = conn.getresponse()
+        second_body = second.read()
+    finally:
+        conn.close()
+        server.shutdown()
+
+    assert first.status == 201
+    assert first_body == b""
+    assert second.status == 201
+    assert second_body == b""
+    assert adapter.writes == [
+        ("/flash/first.txt", b"first"),
+        ("/flash/second.txt", b"second"),
+    ]
+
+
+def test_put_retries_three_times_before_succeeding():
+    adapter = TransientWriteFailureAdapter(failures=3)
+    server = _serve(adapter, write_retries=3, write_retry_delay=0)
+    try:
+        status, _headers, body = _request(
+            server,
+            "PUT",
+            "/new.txt",
+            body=b"abc",
+            headers={"Content-Length": "3"},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 201
+    assert body == b""
+    assert adapter.write_attempts == [("/flash/new.txt", b"abc")] * 4
+
+
+def test_put_retry_exhaustion_releases_next_request():
+    adapter = TransientWriteFailureAdapter(failures=4)
+    server = _serve(adapter, write_retries=3, write_retry_delay=0)
+    try:
+        first_status, _headers, first_body = _request(
+            server,
+            "PUT",
+            "/first.txt",
+            body=b"first",
+            headers={"Content-Length": "5"},
+        )
+        second_status, _headers, second_body = _request(
+            server,
+            "PUT",
+            "/second.txt",
+            body=b"second",
+            headers={"Content-Length": "6"},
+        )
+    finally:
+        server.shutdown()
+
+    assert first_status == 500
+    assert first_body == b"write failed"
+    assert second_status == 201
+    assert second_body == b""
+    assert adapter.write_attempts == [
+        ("/flash/first.txt", b"first"),
+    ] * 4 + [
+        ("/flash/second.txt", b"second"),
+    ]
+
+
+def test_put_reuses_received_tempfile_for_device_write():
+    adapter = PathWriteAdapter()
+    server = _serve(adapter)
+    try:
+        status, _headers, body = _request(
+            server,
+            "PUT",
+            "/new.txt",
+            body=b"abc",
+            headers={"Content-Length": "3"},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 201
+    assert body == b""
+    assert adapter.path_writes == [("/flash/new.txt", b"abc", 3)]
+
+
+def test_put_reuses_received_tempfile_through_directory_cache():
+    device_adapter = PathWriteAdapter()
+    cache = DirectoryCachingWebDavAdapter(
+        device_adapter,
+        "/flash",
+        WebDavConfig(empty_list_retry_delay=0),
+    )
+    server = _serve(cache)
+    try:
+        status, _headers, body = _request(
+            server,
+            "PUT",
+            "/new.txt",
+            body=b"abc",
+            headers={"Content-Length": "3"},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 201
+    assert body == b""
+    assert device_adapter.path_writes == [("/flash/new.txt", b"abc", 3)]
+
+
+def test_put_rejects_incomplete_request_body_without_writing():
+    adapter = FakeAdapter()
+    server = _serve(adapter)
+    sock = socket.create_connection(server.server_address, timeout=5)
+    try:
+        sock.sendall(
+            b"PUT /partial.bin HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 3\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b"a"
+        )
+        sock.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    finally:
+        sock.close()
+        server.shutdown()
+
+    assert bytes(response).startswith(b"HTTP/1.1 400")
+    assert b"incomplete request body" in response
+    assert adapter.writes == []
+
+
+def test_put_rejects_existing_directory_without_writing():
+    adapter = FakeAdapter()
+    server = _serve(adapter)
+    try:
+        status, _headers, body = _request(
+            server,
+            "PUT",
+            "/",
+            body=b"abc",
+            headers={"Content-Length": "3"},
+        )
+    finally:
+        server.shutdown()
+
+    assert status == 405
+    assert body == b"directory"
+    assert adapter.writes == []
 
 
 def test_put_rejects_body_larger_than_upload_limit_before_tempfile():

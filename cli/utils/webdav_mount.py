@@ -96,6 +96,8 @@ class WebDavConfig:
     max_upload_bytes: int = 64 * 1024 * 1024
     delete_retries: int = 3
     delete_retry_delay: float = 0.1
+    write_retries: int = 3
+    write_retry_delay: float = 0.1
 
 
 def mount_run_executable_for_system(
@@ -396,11 +398,79 @@ class MicroPythonWebDavAdapter:
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            with self._lock:
-                self._mp.flash_file(local_path, path, compile=False)
+            self.write_file_from_path(path, local_path, len(data))
         finally:
             with contextlib.suppress(OSError):
                 os.remove(local_path)
+
+    def write_file_from_path(self, path: str, local_path: str, size: int) -> None:
+        actual_size = os.path.getsize(local_path)
+        if actual_size != size:
+            raise ValueError(
+                f"upload tempfile size changed: expected {size}, got {actual_size}"
+            )
+        parent = posixpath.dirname(path) or "/"
+        token = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
+        staging_path = posixpath.join(parent, f".pyrite-upload-{token}")
+        backup_path = posixpath.join(parent, f".pyrite-backup-{token}")
+
+        with self._lock:
+            try:
+                self._mp.flash_file(local_path, staging_path, compile=False)
+                self._commit_staged_file(staging_path, path, backup_path)
+            except Exception:
+                try:
+                    self._mp.fs_rm(staging_path, recursive=False, force=True)
+                except Exception as cleanup_exc:
+                    log.debug(
+                        "WebDAV PUT staging cleanup failed path=%s reason=%s",
+                        staging_path,
+                        cleanup_exc,
+                    )
+                raise
+
+    def _commit_staged_file(
+        self,
+        staging_path: str,
+        path: str,
+        backup_path: str,
+    ) -> None:
+        script = (
+            "import os\n"
+            f"src={staging_path!r}\n"
+            f"dst={path!r}\n"
+            f"bak={backup_path!r}\n"
+            "def _exists(p):\n"
+            " try:\n"
+            "  os.stat(p)\n"
+            "  return True\n"
+            " except:\n"
+            "  return False\n"
+            "try:\n"
+            " had_dst=_exists(dst)\n"
+            " if _exists(bak):\n"
+            "  if had_dst:\n"
+            "   os.remove(bak)\n"
+            "  else:\n"
+            "   os.rename(bak,dst)\n"
+            "   had_dst=True\n"
+            " if had_dst:\n"
+            "  os.rename(dst,bak)\n"
+            " try:\n"
+            "  os.rename(src,dst)\n"
+            " except:\n"
+            "  if had_dst and _exists(bak):\n"
+            "   os.rename(bak,dst)\n"
+            "  raise\n"
+            " if had_dst and _exists(bak):\n"
+            "  os.remove(bak)\n"
+            " print('OK')\n"
+            "except Exception as e:\n"
+            " print('ERR|'+repr(e))\n"
+        )
+        out = self._mp.run(script, timeout=10)
+        if not any(line.strip() == "OK" for line in out.splitlines()):
+            raise OSError(f"failed to commit staged upload {path}: {out.strip()}")
 
     def make_dir(self, path: str) -> None:
         script = "import os\n" f"os.mkdir({path!r})\n" "print('OK')\n"
@@ -658,6 +728,19 @@ class DirectoryCachingWebDavAdapter:
             raise
         self._cache_file_write(path, len(data))
 
+    def write_file_from_path(self, path: str, local_path: str, size: int) -> None:
+        try:
+            write_from_path = getattr(self._adapter, "write_file_from_path", None)
+            if write_from_path is not None:
+                write_from_path(path, local_path, size)
+            else:
+                with open(local_path, "rb") as f:
+                    self._adapter.write_file(path, f.read())
+        except Exception:
+            self._invalidate()
+            raise
+        self._cache_file_write(path, size)
+
     def make_dir(self, path: str) -> None:
         try:
             self._adapter.make_dir(path)
@@ -859,6 +942,17 @@ def make_webdav_handler(
     class WebDavHandler(BaseHTTPRequestHandler):
         server_version = "PyriteWebDAV/0.1"
         protocol_version = "HTTP/1.1"
+
+        def handle_one_request(self) -> None:
+            for name in (
+                "_cached_parsed_path",
+                "_cached_remote_path",
+                "_cached_request_path",
+            ):
+                with contextlib.suppress(AttributeError):
+                    delattr(self, name)
+            self._request_started_at = time.perf_counter()
+            super().handle_one_request()
 
         @property
         def _parsed_path(self):
@@ -1084,6 +1178,20 @@ def make_webdav_handler(
                     f.write(chunk)
                     written += len(chunk)
                     remaining -= len(chunk)
+            if remaining > 0:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                log.warning(
+                    "WebDAV PUT incomplete path=%s expected=%d received=%d",
+                    self._remote(),
+                    length,
+                    written,
+                )
+                self._send_unread_upload_rejection(
+                    HTTPStatus.BAD_REQUEST,
+                    b"incomplete request body",
+                )
+                return None
             return path, written
 
         def _reject_readonly(self) -> bool:
@@ -1238,16 +1346,55 @@ def make_webdav_handler(
             temp_path, size = body
 
             def write() -> HTTPStatus:
-                existed = adapter.stat(remote) is not None
-                with open(temp_path, "rb") as f:
-                    data = f.read()
-                adapter.write_file(remote, data)
-                return HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED
+                existing = adapter.stat(remote)
+                if existing is not None and existing.is_dir:
+                    raise IsADirectoryError(remote)
+                existed = existing is not None
+                write_from_path = getattr(adapter, "write_file_from_path", None)
+                data: Optional[bytes] = None
+                if write_from_path is None:
+                    with open(temp_path, "rb") as f:
+                        data = f.read()
+                retries = max(0, int(config.write_retries))
+                delay = max(0.0, float(config.write_retry_delay))
+                for attempt in range(retries + 1):
+                    try:
+                        if write_from_path is not None:
+                            write_from_path(remote, temp_path, size)
+                        else:
+                            adapter.write_file(remote, data)
+                        return HTTPStatus.NO_CONTENT if existed else HTTPStatus.CREATED
+                    except Exception as exc:
+                        if attempt >= retries:
+                            raise
+                        log.warning(
+                            "WebDAV PUT retry path=%s attempt=%d/%d reason=%s",
+                            remote,
+                            attempt + 1,
+                            retries,
+                            exc,
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
+                raise AssertionError("unreachable")
 
             try:
                 status = self._execute_write(f"PUT {remote}", write, size_bytes=size)
             except MountRunBusyError:
                 self._send_queue_full()
+                return
+            except IsADirectoryError:
+                self._send_bytes(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    b"directory",
+                )
+                return
+            except Exception as exc:
+                log.error("WebDAV PUT failed path=%s reason=%s", remote, exc)
+                self._send_bytes(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    b"write failed",
+                )
                 return
             finally:
                 with contextlib.suppress(OSError):

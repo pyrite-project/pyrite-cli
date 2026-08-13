@@ -1709,9 +1709,10 @@ def test_remount_reports_missing_mpremote(monkeypatch, tmp_path):
     assert "mpremote" in result.output
 
 
-def test_top_level_help_lists_remount_not_firmware():
+def test_top_level_help_lists_remount_and_firmware():
     result = runner.invoke(app, ["--help"])
+    help_text = click.utils.strip_ansi(result.stdout)
 
     assert result.exit_code == 0
-    assert "remount" in result.stdout
-    assert "firmware" not in result.stdout
+    assert "remount" in help_text
+    assert "firmware" in help_text

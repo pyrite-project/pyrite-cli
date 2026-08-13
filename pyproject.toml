@@ -20,6 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tui = [
+    "textual>=0.47.0",
+]
 dev = [
     "mypy>=1.8.0",
     "pytest>=8.0",
@@ -64,6 +67,8 @@ testpaths = [
     "test/test_trace.py",
     "test/test_tunnel.py",
     "test/test_snapshot.py",
+    "test/test_firmware_builder.py",
+    "test/test_firmware.py",
 ]
 
 [tool.ruff]

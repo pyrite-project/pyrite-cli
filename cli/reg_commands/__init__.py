@@ -18,6 +18,7 @@ def register_command_groups(app: typer.Typer) -> None:
         snapshot,
         trace,
         tunnel,
+        firmware,
     )
 
     board.register(app)
@@ -31,3 +32,4 @@ def register_command_groups(app: typer.Typer) -> None:
     snapshot.register(app)
     trace.register(app)
     tunnel.register(app)
+    firmware.register(app)

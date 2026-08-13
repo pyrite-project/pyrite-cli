@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import click
 from typer.testing import CliRunner
 
 from cli.main import app
@@ -14,11 +15,13 @@ runner = CliRunner()
 def test_project_new_help_distinguishes_platform_and_port():
     result = runner.invoke(app, ["project", "new", "--help"])
 
+    help_text = click.utils.strip_ansi(result.stdout)
+
     assert result.exit_code == 0
-    assert "--platform" in result.stdout
-    assert "直接指定 MicroPython 平台" in result.stdout
-    assert "--port" in result.stdout
-    assert "串口号" in result.stdout
+    assert "--platform" in help_text
+    assert "直接指定 MicroPython 平台" in help_text
+    assert "--port" in help_text
+    assert "串口号" in help_text
 
 
 def test_project_new_rejects_platform_and_port_together():
@@ -36,7 +39,7 @@ def test_project_new_rejects_platform_and_port_together():
     )
 
     assert result.exit_code == 2
-    assert "--platform 和 --port 不能同时使用" in result.stderr
+    assert "--platform 和 --port 不能同时使用" in click.utils.strip_ansi(result.stderr)
 
 
 def test_project_new_passes_explicit_connection_settings():

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -302,10 +303,12 @@ def test_board_cli_rejects_both_alias_and_profile_files(tmp_path: Path):
 def test_board_register_help_drops_unused_metadata_options():
     result = runner.invoke(board_app, ["register", "--help"])
 
+    help_text = click.utils.strip_ansi(result.stdout)
+
     assert result.exit_code == 0, result.output
-    assert "--alias-file" in result.stdout
-    assert "--profile-file" in result.stdout
-    assert "--tag" not in result.stdout
-    assert "--tags" not in result.stdout
-    assert "--firmware" not in result.stdout
-    assert "--recommended" not in result.stdout
+    assert "--alias-file" in help_text
+    assert "--profile-file" in help_text
+    assert "--tag" not in help_text
+    assert "--tags" not in help_text
+    assert "--firmware" not in help_text
+    assert "--recommended" not in help_text

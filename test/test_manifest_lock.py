@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -223,9 +224,10 @@ def test_manifest_cli_profile_is_hidden_deprecated_alias(tmp_path: Path):
     _write(tmp_path / "manifest.py", 'module("main.py")\n')
 
     help_result = runner.invoke(app, ["manifest", "plan", "--help"])
+    help_text = click.utils.strip_ansi(help_result.stdout)
     assert help_result.exit_code == 0
-    assert "--target" in help_result.stdout
-    assert "--profile" not in help_result.stdout
+    assert "--target" in help_text
+    assert "--profile" not in help_text
 
     result = runner.invoke(app, [
         "manifest", "plan",
@@ -235,9 +237,10 @@ def test_manifest_cli_profile_is_hidden_deprecated_alias(tmp_path: Path):
         "--format", "json",
     ])
     assert result.exit_code == 0
-    assert "--profile" in result.output
-    assert "--target" in result.output
-    payload = json.loads(result.stdout[result.stdout.index("{"):])
+    result_text = click.utils.strip_ansi(result.output)
+    assert "--profile" in result_text
+    assert "--target" in result_text
+    payload = json.loads(result_text[result_text.index("{"):])
     assert payload["target"] == "esp32_s3"
     assert "profile" not in payload
 
@@ -254,8 +257,9 @@ def test_manifest_cli_rejects_conflicting_target_and_profile(tmp_path: Path):
     ])
 
     assert result.exit_code == 2
-    assert "--target" in result.output
-    assert "--profile" in result.output
+    result_text = click.utils.strip_ansi(result.output)
+    assert "--target" in result_text
+    assert "--profile" in result_text
 
 
 def test_manifest_plan_text_uses_target_label(tmp_path: Path):
@@ -270,5 +274,6 @@ def test_manifest_plan_text_uses_target_label(tmp_path: Path):
     ])
 
     assert result.exit_code == 0
-    assert "target: esp32_s3" in result.stdout
-    assert "profile:" not in result.stdout
+    result_text = click.utils.strip_ansi(result.stdout)
+    assert "target: esp32_s3" in result_text
+    assert "profile:" not in result_text

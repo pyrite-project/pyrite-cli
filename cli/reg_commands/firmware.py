@@ -146,9 +146,9 @@ def _extension_checks(plan: FirmwarePlan) -> list[dict[str, object]]:
 
 @firmware_app.command("options")
 def options(
-    action: str = typer.Argument("list"),
-    option_id: str | None = typer.Argument(None),
-    fmt: str = typer.Option("text", "--format"),
+    action: str = typer.Argument("list", help="操作：list 或 show"),
+    option_id: str | None = typer.Argument(None, help="show 操作要查看的固件选项 ID"),
+    fmt: str = typer.Option("text", "--format", help="输出格式：text 或 json"),
 ) -> None:
     """列出或查看可用固件选项。"""
     payload: object
@@ -172,8 +172,15 @@ def options(
 
 
 @board_app.command("list")
-def board_list(fmt: str = typer.Option("text", "--format"), checkout: Path | None = typer.Option(None, "--checkout")) -> None:
-    """列出 checkout 中的 ESP32 boards."""
+def board_list(
+    fmt: str = typer.Option("text", "--format", help="输出格式：text 或 json"),
+    checkout: Path | None = typer.Option(
+        None,
+        "--checkout",
+        help="MicroPython checkout 路径；默认读取项目固件配置",
+    ),
+) -> None:
+    """列出 MicroPython checkout 中的 ESP32 boards。"""
     root = checkout or _path(_firmware_config().get("micropython"), "micropython")
     try:
         names = discover_boards(root)
@@ -183,7 +190,21 @@ def board_list(fmt: str = typer.Option("text", "--format"), checkout: Path | Non
 
 
 @board_app.command("show")
-def board_show(name: str, checkout: Path | None = typer.Option(None, "--checkout"), base_board: str = typer.Option("GENERIC", "--base-board"), fmt: str = typer.Option("text", "--format")) -> None:
+def board_show(
+    name: str = typer.Argument(..., help="要查看的自定义 board 名称"),
+    checkout: Path | None = typer.Option(
+        None,
+        "--checkout",
+        help="MicroPython checkout 路径；默认读取项目固件配置",
+    ),
+    base_board: str = typer.Option(
+        "GENERIC",
+        "--base-board",
+        help="自定义 board 继承的基础 board",
+    ),
+    fmt: str = typer.Option("text", "--format", help="输出格式：text 或 json"),
+) -> None:
+    """查看自定义 board 的构建契约。"""
     root = checkout or _path(_firmware_config().get("micropython"), "micropython")
     try:
         payload = load_contract(root, base_board, name).__dict__
@@ -193,8 +214,20 @@ def board_show(name: str, checkout: Path | None = typer.Option(None, "--checkout
 
 
 @board_app.command("new")
-def board_new(name: str, base_board: str = typer.Option("GENERIC", "--base-board"), output: Path = typer.Option(Path(".pyrite/firmware/board"), "--output")) -> None:
-    """Configure a board name without touching the MicroPython checkout."""
+def board_new(
+    name: str = typer.Argument(..., help="要配置的自定义 board 名称"),
+    base_board: str = typer.Option(
+        "GENERIC",
+        "--base-board",
+        help="自定义 board 继承的基础 board",
+    ),
+    output: Path = typer.Option(
+        Path(".pyrite/firmware/board"),
+        "--output",
+        help="生成 board 文件的目录",
+    ),
+) -> None:
+    """配置自定义 board，不修改 MicroPython checkout。"""
     firmware = _firmware_config()
     firmware.update({"board": name, "base_board": base_board, "board_dir": str(output)})
     update_firmware(_config_path(), firmware)
@@ -202,7 +235,10 @@ def board_new(name: str, base_board: str = typer.Option("GENERIC", "--base-board
 
 
 @firmware_app.command("plan")
-def plan(fmt: str = typer.Option("text", "--format")) -> None:
+def plan(
+    fmt: str = typer.Option("text", "--format", help="输出格式：text 或 json"),
+) -> None:
+    """检查当前固件配置并输出构建计划状态。"""
     current, checkout, _, _ = _plan_from_config()
     _extension_checks(current)
     payload = current.to_dict()
@@ -211,7 +247,20 @@ def plan(fmt: str = typer.Option("text", "--format")) -> None:
 
 
 @firmware_app.command("config")
-def config(set_values: list[str] = typer.Option([], "--set"), tui: bool = typer.Option(False, "--tui"), keys: str = typer.Option("arrows", "--keys")) -> None:
+def config(
+    set_values: list[str] = typer.Option(
+        [],
+        "--set",
+        help="设置固件选项（OPTION_ID=true|false），可重复指定",
+    ),
+    tui: bool = typer.Option(False, "--tui", help="打开交互式固件配置界面"),
+    keys: str = typer.Option(
+        "arrows",
+        "--keys",
+        help="TUI 按键方案：arrows 或 vim",
+    ),
+) -> None:
+    """查看或修改当前项目的固件配置。"""
     if tui:
         if keys not in {"arrows", "vim"}:
             raise typer.BadParameter("--keys must be arrows or vim")
@@ -250,6 +299,7 @@ def config(set_values: list[str] = typer.Option([], "--set"), tui: bool = typer.
 
 @firmware_app.command("setup")
 def setup() -> None:
+    """打开交互式向导，完成项目固件的初始配置。"""
     if not _interactive_terminal():
         raise click.UsageError("Firmware setup requires an interactive terminal")
     try:
@@ -261,6 +311,7 @@ def setup() -> None:
 
 @firmware_app.command("generate")
 def generate() -> None:
+    """根据固件配置生成 board 文件并更新固件锁定信息。"""
     current, checkout, board_dir, _ = _plan_from_config()
     _extension_checks(current)
     if current.errors:
@@ -275,7 +326,14 @@ def generate() -> None:
 
 
 @firmware_app.command("build")
-def build(dry_run: bool = typer.Option(False, "--dry-run")) -> None:
+def build(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="只显示构建命令，不执行构建",
+    ),
+) -> None:
+    """构建当前项目配置对应的 MicroPython 固件。"""
     current, checkout, board_dir, build_dir = _plan_from_config()
     _extension_checks(current)
     if current.errors:
@@ -316,7 +374,26 @@ def build(dry_run: bool = typer.Option(False, "--dry-run")) -> None:
 
 
 @firmware_app.command("flash")
-def flash(port: str = typer.Argument(...), dry_run: bool = typer.Option(False, "--dry-run"), yes: bool = typer.Option(False, "--yes", "--confirm"), image: Path | None = typer.Option(None, "--image")) -> None:
+def flash(
+    port: str = typer.Argument(..., help="目标设备串口，如 /dev/ttyUSB0 或 COM3"),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="只显示 esptool 命令，不执行刷写",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "--confirm",
+        help="确认执行刷写（--confirm 为别名）",
+    ),
+    image: Path | None = typer.Option(
+        None,
+        "--image",
+        help="显式固件镜像路径；刷写布局仍以 flash_layout.json 为准",
+    ),
+) -> None:
+    """使用 esptool 将构建产物刷写到 ESP32 设备。"""
     firmware = _firmware_config(); build_dir = _path(firmware.get("build_dir"), ".pyrite/firmware/build")
     try:
         lock = load_lock(_config_path())

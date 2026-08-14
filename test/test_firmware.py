@@ -205,6 +205,30 @@ def test_top_level_help_includes_firmware_and_strips_ansi():
     assert "firmware" in help_text
 
 
+def test_firmware_help_describes_commands_and_options():
+    cases = [
+        (["firmware", "--help"], ["构建计划状态", "交互式向导", "board 文件", "MicroPython 固件", "esptool"]),
+        (["firmware", "options", "--help"], ["list 或 show", "OPTION_ID", "输出格式"]),
+        (["firmware", "board", "--help"], ["ESP32 boards", "构建契约", "MicroPython checkout"]),
+        (["firmware", "board", "list", "--help"], ["--checkout", "项目固件配置", "输出格式"]),
+        (["firmware", "board", "show", "--help"], ["--base-board", "构建契约", "输出格式"]),
+        (["firmware", "board", "new", "--help"], ["--output", "基础 board", "board 文件"]),
+        (["firmware", "plan", "--help"], ["构建计划状态", "--format", "输出格式"]),
+        (["firmware", "config", "--help"], ["--set", "OPTION_ID=true|false", "--keys"]),
+        (["firmware", "setup", "--help"], ["交互式向导", "初始配置"]),
+        (["firmware", "generate", "--help"], ["board 文件", "锁定信息"]),
+        (["firmware", "build", "--help"], ["MicroPython 固件", "--dry-run", "不执行构建"]),
+        (["firmware", "flash", "--help"], ["目标设备串口", "--confirm", "flash_layout.json"]),
+    ]
+
+    for args, expected in cases:
+        result = runner.invoke(app, args)
+        help_text = click.utils.strip_ansi(result.stdout)
+        assert result.exit_code == 0, result.output
+        for text in expected:
+            assert text in help_text, f"{text!r} missing from {' '.join(args)}"
+
+
 def test_firmware_commands_from_child_directory_resolve_extensions_at_project_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

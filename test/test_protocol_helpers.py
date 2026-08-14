@@ -35,3 +35,6 @@ class TestStripReplTrailer:
         result = _strip_repl_trailer(buf)
         # Should not touch data when 0x04 is not at the end
         assert result == buf
+
+    def test_binary_payload_ending_with_execute_byte_is_preserved(self):
+        assert _strip_repl_trailer(b"payload\x04\x04\x04>") == b"payload\x04"

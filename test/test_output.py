@@ -8,12 +8,25 @@ from unittest.mock import patch, MagicMock
 import pytest
 from typer.testing import CliRunner
 
+import cli.project.sync as sync_module
 from cli.main import app, _norm_path
 from cli.project.sync import ProjectSyncManager, compute_file_hash
 from cli.utils.errors import humanize_exception
 from cli.utils.log import INFO, configure, shutdown
 
 runner = CliRunner()
+
+
+class _DeviceDownloadTransport:
+    def __init__(self, chunks=()) -> None:
+        self.chunks = list(chunks)
+
+    @property
+    def in_waiting(self):
+        return len(self.chunks[0]) if self.chunks else 0
+
+    def read(self, _size):
+        return self.chunks.pop(0) if self.chunks else b""
 
 
 def _fake_ports():
@@ -462,6 +475,52 @@ class TestHumanErrors:
             "message": "无法获取文件大小信息",
         }
         assert captured.err == ""
+
+    def test_batch_pull_rejects_total_size_over_limit(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        mp = MagicMock()
+        mp.transport = _DeviceDownloadTransport([b"SZ:9\n"])
+        mgr = ProjectSyncManager(mp)
+        monkeypatch.setattr(sync_module, "MAX_BATCH_DOWNLOAD_BYTES", 8)
+        monkeypatch.setattr(sync_module.time, "sleep", lambda _value: None)
+        times = iter([0, 1, 31])
+        monkeypatch.setattr(sync_module.time, "time", lambda: next(times, 31))
+
+        ok = mgr._download_device_files(
+            ["/payload.bin"],
+            [str(tmp_path / "payload.bin")],
+            fmt="json",
+        )
+
+        assert ok is False
+        assert json.loads(capsys.readouterr().out)["error"] == "download_limit_exceeded"
+        assert not (tmp_path / "payload.bin").exists()
+
+    def test_batch_pull_rejects_file_count_over_limit(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        mp = MagicMock()
+        mgr = ProjectSyncManager(mp)
+        monkeypatch.setattr(sync_module, "MAX_BATCH_DOWNLOAD_FILES", 1)
+
+        ok = mgr._download_device_files(
+            ["/a.py", "/b.py"],
+            [str(tmp_path / "a.py"), str(tmp_path / "b.py")],
+            fmt="json",
+        )
+
+        assert ok is False
+        assert json.loads(capsys.readouterr().out)["error"] == "file_count_limit_exceeded"
+
+    def test_device_discovery_rejects_too_many_entries(self, monkeypatch):
+        mp = MagicMock()
+        mp.run.return_value = "1|/a.py\n1|/b.py\n"
+        mgr = ProjectSyncManager(mp)
+        monkeypatch.setattr(sync_module, "MAX_BATCH_DOWNLOAD_FILES", 1)
+
+        with pytest.raises(RuntimeError, match="too many files"):
+            mgr._discover_device_files("/")
 
 
 # ── fs ls ────────────────────────────────────────────────────────────

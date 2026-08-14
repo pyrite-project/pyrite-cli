@@ -53,6 +53,7 @@ testpaths = [
     "test/test_project_stubs.py",
     "test/test_port_unlock.py",
     "test/test_transport_serial.py",
+    "test/test_webrepl_transport.py",
     "test/test_output.py",
     "test/test_webdav_mount.py",
     "test/test_pkg.py",

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
+import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
@@ -18,6 +19,7 @@ from cli.utils.snapshot import (
     filter_device_entries,
     load_snapshot_manifest,
     manifest_common_remote_root,
+    safe_local_path_for_device_path,
     safe_snapshot_name,
     save_snapshot_files,
     sha256_file,
@@ -84,6 +86,44 @@ def test_filter_device_entries_honors_include_exclude_and_defaults():
 
     assert selected == []
     assert filter_device_entries(entries)[0]["name"] == "/main.py"
+
+
+def test_filter_device_entries_rejects_negative_size():
+    entries = [{"name": "/main.py", "type": "F", "size": "-1"}]
+
+    assert filter_device_entries(entries) == []
+
+
+@pytest.mark.parametrize(
+    "device_path",
+    [
+        "C:/Windows/System32/host.txt",
+        "//server/share/host.txt",
+        "/app/../../host.txt",
+        "/app/name:stream",
+        "/app/CON",
+    ],
+)
+def test_snapshot_temp_path_rejects_host_specific_paths(tmp_path, device_path):
+    with pytest.raises(ValueError, match="unsafe device path"):
+        safe_local_path_for_device_path(tmp_path, device_path)
+
+
+def test_snapshot_save_rejects_device_path_outside_temp_root(tmp_path: Path):
+    class MP:
+        def fs_ls_recursive(self, _remote_path):
+            return [{"name": "C:/host.txt", "type": "F", "size": "1"}]
+
+        def fs_get(self, _remote_path, _local_path):
+            raise AssertionError("unsafe path must be rejected before download")
+
+    with pytest.raises(ValueError, match="unsafe device path"):
+        save_device_snapshot(
+            MP(),
+            name="before",
+            port="COM9",
+            output_dir=str(tmp_path),
+        )
 
 
 def test_diff_plan_classifies_added_changed_deleted_unchanged(tmp_path: Path):

@@ -25,6 +25,7 @@ from ..utils.snapshot import (
     load_snapshot_manifest,
     manifest_common_remote_root,
     normalize_device_path,
+    safe_local_path_for_device_path,
     safe_snapshot_name,
     save_snapshot_files,
     sha256_file,
@@ -64,8 +65,9 @@ def save_device_snapshot(
     with tempfile.TemporaryDirectory(prefix="pyrite-snapshot-") as temp_dir:
         temp_root = Path(temp_dir)
         for entry in entries:
-            remote = normalize_device_path(str(entry["name"]))
-            local_rel = temp_root / remote.strip("/")
+            raw_remote = str(entry["name"])
+            local_rel = safe_local_path_for_device_path(temp_root, raw_remote)
+            remote = normalize_device_path(raw_remote)
             mp.fs_get(remote, str(local_rel))
             files[remote] = local_rel.read_bytes()
     return save_snapshot_files(
@@ -240,8 +242,9 @@ def _current_index_from_device(mp, remote_path: str):
         for entry in entries:
             if entry.get("type") != "F":
                 continue
-            remote = normalize_device_path(str(entry["name"]))
-            local_path = temp_root / remote.strip("/")
+            raw_remote = str(entry["name"])
+            local_path = safe_local_path_for_device_path(temp_root, raw_remote)
+            remote = normalize_device_path(raw_remote)
             mp.fs_get(remote, str(local_path))
             current.append({
                 "path": remote,
@@ -281,7 +284,7 @@ def _snapshot_save_stdout_jsonl(
                 data = reader(remote)
             else:
                 with tempfile.TemporaryDirectory(prefix="pyrite-snapshot-jsonl-") as temp_dir:
-                    local_path = Path(temp_dir) / remote.strip("/")
+                    local_path = safe_local_path_for_device_path(temp_dir, remote)
                     mp.fs_get(remote, str(local_path))
                     data = local_path.read_bytes()
             write_jsonl({

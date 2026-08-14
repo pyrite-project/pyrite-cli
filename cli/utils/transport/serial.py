@@ -94,6 +94,15 @@ class SerialTransport(Transport):
             except Exception:
                 pass
 
+    def reset_input_buffer(self) -> None:
+        """Use pyserial's atomic flush so a chatty device cannot keep us draining."""
+        self._rx_buf = b""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.reset_input_buffer()
+            except Exception:
+                pass
+
     def set_dtr(self, state: bool) -> None:
         """设置 DTR 信号线状态。"""
         if self._ser and self._ser.is_open:

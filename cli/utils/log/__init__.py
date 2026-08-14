@@ -38,6 +38,7 @@ from typing import Any, Dict, Iterator, List, Optional, TextIO
 DEFAULT_JSON_LOG_NAME = "pyrite.jsonl"
 DEFAULT_TEXT_LOG_NAME = "pyrite.log"
 DEFAULT_LOG_FILE_LIMIT = 25
+TRAFFIC_TEXT_PREVIEW_BYTES = 4096
 
 # ═══════════════════════════════════════════════════════════════════
 # 日志级别
@@ -558,13 +559,17 @@ class Logger:
             direction: ``"TX"`` 或 ``"RX"``
             data: 原始字节数据
         """
-        text = data.decode("utf-8", errors="replace")
+        preview = data[:TRAFFIC_TEXT_PREVIEW_BYTES]
+        text = preview.decode("utf-8", errors="replace")
         # 替换控制字符为可读标记
         for c, name in [
             ("\x01", "<RAW>"), ("\x02", "<B>"), ("\x03", "<C>"),
             ("\x04", "<D>"), ("\x05", "<E>"),
         ]:
             text = text.replace(c, name)
+        omitted = len(data) - len(preview)
+        if omitted:
+            text += f" ... ({omitted} bytes omitted)"
 
         hex_str = data.hex(" ") if len(data) <= 128 else f"{data[:64].hex(' ')} ... ({len(data)} 字节)"
 

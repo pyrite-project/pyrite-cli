@@ -12,6 +12,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import cli.utils.flash.core as flash_core
+import cli.utils.flash.facade as flash_facade
+
 from cli.utils.flash import (
     BATCH_ACK_EVERY,
     FLASH,
@@ -74,6 +77,98 @@ class TestRawReplExecutionFraming:
         assert mp._execute("print('first')") == "first"
         assert mp._execute("print('second')") == "second"
         assert transport.pending == []
+
+    def test_raw_exec_response_aborts_at_device_output_limit(self, monkeypatch):
+        transport = _ChunkedRawExecTransport([])
+        transport.pending = [b"12345", b"67890"]
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setattr(flash_core, "MAX_REPL_RESPONSE_BYTES", 8)
+
+        with pytest.raises(RuntimeError, match="device response exceeds"):
+            mp._read_raw_exec_response(timeout=0.01)
+
+    def test_execute_rejects_response_without_protocol_trailer(self):
+        transport = _ChunkedRawExecTransport([[b"OKFORGED"]])
+        mp = MicroPython(port="COM99", transport=transport)
+
+        with pytest.raises(RuntimeError, match="incomplete Raw REPL response"):
+            mp._execute("print('trusted')", timeout=0.01)
+
+
+class _DeviceFileTransport:
+    def __init__(self, chunks=()) -> None:
+        self.connected = True
+        self.chunks = list(chunks)
+        self.writes = []
+
+    def write(self, data) -> None:
+        self.writes.append(data)
+
+    def read(self, _size):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    @property
+    def in_waiting(self):
+        return len(self.chunks[0]) if self.chunks else 0
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+
+class TestDeviceFileDownloadSecurity:
+    def test_rejects_negative_declared_size_before_raw_read(self, monkeypatch):
+        transport = _DeviceFileTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setattr(mp, "run", lambda *_args, **_kwargs: "-1")
+
+        with pytest.raises(RuntimeError, match="invalid device file size"):
+            mp._read_device_file("/malicious.bin")
+
+        assert transport.writes == []
+
+    def test_rejects_declared_size_over_download_limit(self, monkeypatch):
+        transport = _DeviceFileTransport()
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setattr(flash_facade, "MAX_DEVICE_FILE_BYTES", 8)
+        monkeypatch.setattr(mp, "run", lambda *_args, **_kwargs: "9")
+
+        with pytest.raises(RuntimeError, match="exceeds download limit"):
+            mp._read_device_file("/malicious.bin")
+
+        assert transport.writes == []
+
+    def test_preserves_payload_ending_with_execute_byte(self, monkeypatch):
+        transport = _DeviceFileTransport([b"OKA\x04\x04\x04>"])
+        mp = MicroPython(port="COM99", transport=transport)
+        monkeypatch.setattr(mp, "run", lambda *_args, **_kwargs: "2")
+        monkeypatch.setattr(flash_facade.time, "sleep", lambda _value: None)
+
+        assert mp._read_device_file("/payload.bin") == b"A\x04"
+
+
+class TestSparseAckTransferSecurity:
+    def test_rejects_iterator_that_sends_fewer_bytes_than_declared(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        monkeypatch.setattr(flash_facade, "tqdm", None)
+        monkeypatch.setattr(mp, "_write", lambda _chunk: None)
+
+        with pytest.raises(RuntimeError, match="byte count mismatch"):
+            mp._send_data_with_sparse_ack([], total=4)
+
+    def test_rejects_chunk_that_exceeds_declared_total(self, monkeypatch):
+        mp = MicroPython(port="COM99")
+        writes = []
+        monkeypatch.setattr(flash_facade, "tqdm", None)
+        monkeypatch.setattr(mp, "_write", writes.append)
+
+        with pytest.raises(RuntimeError, match="exceeds declared total"):
+            mp._send_data_with_sparse_ack([b"12345"], total=4)
+
+        assert writes == []
 
 
 class TestDeviceRuntimeInfo:

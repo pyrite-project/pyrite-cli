@@ -23,6 +23,20 @@ from ..config import PyriteConfig
 log = get_logger(__name__)
 BATCH_ACK_EVERY = 8
 RAW_REPL_BAUD_FALLBACKS = (115200, DEFAULT_BAUDRATE, 460800, 230400)
+MAX_REPL_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_DEVICE_BANNER_BYTES = 64 * 1024
+MAX_DRAIN_BYTES = 1024 * 1024
+
+
+def _adaptive_sleep(idle_count: int) -> float:
+    """Return sleep duration for REPL read loops: fast when active, slow when idle."""
+    return 0.02 if idle_count > 10 else 0.001
+
+
+def _extend_device_response(buf: bytearray, chunk: bytes, limit: int) -> None:
+    if len(buf) + len(chunk) > limit:
+        raise RuntimeError(f"device response exceeds safety limit ({limit} bytes)")
+    buf.extend(chunk)
 
 
 
@@ -178,9 +192,13 @@ def _build_inline_batch_verify_code(
 
 def _strip_repl_trailer(buf: bytes) -> bytes:
     """去除原始 REPL 响应尾部的协议标记。"""
-    for trailer in (SET_EXECUTE + b">", SET_EXECUTE + SET_EXECUTE, SET_EXECUTE):
+    for trailer in (
+        SET_EXECUTE + SET_EXECUTE + b">",
+        SET_EXECUTE + SET_EXECUTE,
+        SET_EXECUTE,
+    ):
         if buf.endswith(trailer):
-            buf = buf[:-len(trailer)]
+            return buf[:-len(trailer)]
     return buf
 
 
@@ -579,6 +597,15 @@ class MicroPythonBase:
                 log.trace("DTR/RTS 硬件复位完成")
             except Exception as e:
                 log.trace("DTR/RTS 复位跳过: %s", e)
+            # 两次 Ctrl+C：中断可能正在运行的 main.py
+            # 兼容不支持 DTR/RTS 自动复位的设备（如部分 CH340 板卡）
+            try:
+                self._write(SET_RESET)
+                self._write(SET_RESET)
+                time.sleep(0.05)
+                self.transport.reset_input_buffer()
+            except Exception as e:
+                log.trace("Ctrl+C interrupt skipped after reset: %s", e)
 
         return True
 
@@ -696,34 +723,35 @@ class MicroPythonBase:
     def _read_until_raw_repl(self, timeout: int = 3) -> Tuple[bool, bytes]:
         """读取串口数据直到检测到原始 REPL 确认消息或超时。"""
         deadline = time.time() + timeout
-        buf = b""
+        buf = bytearray()
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf += chunk
+                _extend_device_response(buf, chunk, MAX_REPL_RESPONSE_BYTES)
                 self._record_rx(chunk)
                 if b"CTRL-B" in buf:
-                    return True, buf
+                    return True, bytes(buf)
             time.sleep(0.02)
-        return False, buf
+        return False, bytes(buf)
 
     def _capture_initial_banner(self, timeout: float = 0.5) -> None:
         """Capture the normal REPL boot banner before Raw REPL setup clears RX."""
-        deadline = time.time() + timeout
-        buf = b""
-        while time.time() < deadline:
+        hard_deadline = time.monotonic() + timeout
+        idle_deadline = hard_deadline
+        buf = bytearray()
+        while time.monotonic() < min(hard_deadline, idle_deadline):
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf += chunk
+                _extend_device_response(buf, chunk, MAX_DEVICE_BANNER_BYTES)
                 self._record_rx(chunk)
-                deadline = time.time() + 0.08
+                idle_deadline = min(hard_deadline, time.monotonic() + 0.08)
             else:
                 time.sleep(0.02)
         if not buf:
             return
         self.runtime_info = _merge_runtime_info(
             self.runtime_info,
-            _runtime_info_from_banner(buf),
+            _runtime_info_from_banner(bytes(buf)),
         )
         log.debug("已捕获设备欢迎信息: %s", self.runtime_info.banner)
 
@@ -992,9 +1020,15 @@ class MicroPythonBase:
         """排空串口 RX 缓冲并记录。"""
         if not self.transport.is_connected:
             return
+        total = 0
         while self.transport.in_waiting:
             chunk = self.transport.read(self.transport.in_waiting)
             if chunk:
+                total += len(chunk)
+                if total > MAX_DRAIN_BYTES:
+                    raise RuntimeError(
+                        f"device response exceeds safety limit ({MAX_DRAIN_BYTES} bytes)"
+                    )
                 self._record_rx(chunk)
 
     # ── 底层 I/O ──
@@ -1057,27 +1091,22 @@ class MicroPythonBase:
     ) -> Tuple[bool, bytes]:
         """读取串口数据直到遇到终止符或超时。"""
         timeout = timeout or self.timeout
-        buf = b""
+        buf = bytearray()
         deadline = time.time() + timeout
-        sleep_time = 0.001
         idle_count = 0
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf += chunk
+                _extend_device_response(buf, chunk, MAX_REPL_RESPONSE_BYTES)
                 self._record_rx(chunk)
                 idle_count = 0
-                sleep_time = 0.001
                 idx = buf.find(terminator)
                 if idx >= 0:
-                    buf = buf[:idx + len(terminator)]
-                    return True, buf
+                    return True, bytes(buf[:idx + len(terminator)])
             else:
                 idle_count += 1
-                if idle_count > 10:
-                    sleep_time = 0.02
-            time.sleep(sleep_time)
-        return False, buf
+            time.sleep(_adaptive_sleep(idle_count))
+        return False, bytes(buf)
 
     def _read_raw_exec_response(
         self,
@@ -1089,16 +1118,14 @@ class MicroPythonBase:
         buf = bytearray()
         last_eot_count = 0
         last_eot_at: Optional[float] = None
-        sleep_time = 0.001
         idle_count = 0
 
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf.extend(chunk)
+                _extend_device_response(buf, chunk, MAX_REPL_RESPONSE_BYTES)
                 self._record_rx(chunk)
                 idle_count = 0
-                sleep_time = 0.001
 
                 eot_count = buf.count(SET_EXECUTE)
                 if eot_count > last_eot_count:
@@ -1117,12 +1144,10 @@ class MicroPythonBase:
                         return True, bytes(buf)
             else:
                 idle_count += 1
-                if idle_count > 10:
-                    sleep_time = 0.02
 
             if last_eot_at is not None and time.time() - last_eot_at >= 0.1:
                 return True, bytes(buf)
-            time.sleep(sleep_time)
+            time.sleep(_adaptive_sleep(idle_count))
 
         return bool(last_eot_count), bytes(buf)
 
@@ -1131,24 +1156,20 @@ class MicroPythonBase:
     ) -> Tuple[bool, bytes]:
         """等待标记出现在串口数据流中。"""
         deadline = time.time() + timeout
-        buf = b""
-        sleep_time = 0.001
+        buf = bytearray()
         idle_count = 0
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf += chunk
+                _extend_device_response(buf, chunk, MAX_REPL_RESPONSE_BYTES)
                 self._record_rx(chunk)
                 if marker in buf:
-                    return True, buf
+                    return True, bytes(buf)
                 idle_count = 0
-                sleep_time = 0.001
             else:
                 idle_count += 1
-                if idle_count > 10:
-                    sleep_time = 0.02
-            time.sleep(sleep_time)
-        return False, buf
+            time.sleep(_adaptive_sleep(idle_count))
+        return False, bytes(buf)
 
     # ═══════════════════════════════════════════════════════════════
     # 流量监控上下文管理器
@@ -1191,7 +1212,10 @@ class MicroPythonBase:
         self._write(code)
         self._write(SET_EXECUTE)
 
-        _, resp = self._read_raw_exec_response(timeout=timeout)
+        complete, resp = self._read_raw_exec_response(timeout=timeout)
+        if not complete:
+            self.invalidate_device_context(raw_repl=True)
+            raise RuntimeError("incomplete Raw REPL response from device")
         if resp.startswith(b"OK"):
             resp = resp[2:]
         parts = resp.split(SET_EXECUTE, 2)

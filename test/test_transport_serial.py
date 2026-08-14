@@ -48,6 +48,19 @@ class InterruptHungryTransport(Transport):
 
 
 class TestSerialTransportDtrRts:
+    def test_reset_input_buffer_uses_native_serial_flush(self):
+        """A chatty device must not keep the generic drain loop alive forever."""
+        transport = SerialTransport(port="COM99")
+        transport._ser = MagicMock()
+        transport._ser.is_open = True
+        transport._ser.in_waiting = 1
+        transport._ser.read.side_effect = AssertionError("must not drain in a loop")
+
+        transport.reset_input_buffer()
+
+        transport._ser.reset_input_buffer.assert_called_once_with()
+        transport._ser.read.assert_not_called()
+
     def test_connect_retries_after_port_unlock(self):
         transport = SerialTransport(port="COM99")
         ser = MagicMock()

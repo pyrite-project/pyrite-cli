@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyi
-Claude.md
+CLAUDE.md
+AGENTS.md
 .agents/
 .claude/
 pull_test/

@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from ..utils.flash import MicroPython
 
 log = get_logger(__name__)
+MAX_BATCH_DOWNLOAD_FILES = 4096
+MAX_BATCH_DOWNLOAD_BYTES = 64 * 1024 * 1024
+MAX_BATCH_SIZE_HEADER_BYTES = 64 * 1024
+MAX_BATCH_DOWNLOAD_SECONDS = 15 * 60
 
 
 def compute_file_hash(filepath: str) -> str:
@@ -422,6 +426,10 @@ class ProjectSyncManager:
                 sz, _, fp = line.partition("|")
                 if sz.isdigit():
                     files.append((fp, int(sz)))
+                    if len(files) > MAX_BATCH_DOWNLOAD_FILES:
+                        raise RuntimeError(
+                            f"device returned too many files (limit {MAX_BATCH_DOWNLOAD_FILES})"
+                        )
         return files
 
     @staticmethod
@@ -811,6 +819,22 @@ class ProjectSyncManager:
     ) -> bool:
         """Download a known device file list using one raw byte stream."""
         skipped = list(pre_skipped or [])
+        if len(remote_files) != len(local_paths):
+            return self._pull_transfer_error(
+                fmt,
+                "target_count_mismatch",
+                "remote and local download target counts differ",
+                expected=len(remote_files),
+                received=len(local_paths),
+            )
+        if len(remote_files) > MAX_BATCH_DOWNLOAD_FILES:
+            return self._pull_transfer_error(
+                fmt,
+                "file_count_limit_exceeded",
+                "device file count exceeds download limit",
+                limit=MAX_BATCH_DOWNLOAD_FILES,
+                received=len(remote_files),
+            )
         if dry_run:
             if fmt == "json":
                 payload = {
@@ -879,15 +903,31 @@ class ProjectSyncManager:
         self.mp._write(script.encode() + SET_EXECUTE)
         time.sleep(0.3)
 
-        buf = b""
-        deadline = time.time() + max(30, len(remote_files) * 8)
+        buf = bytearray()
+        deadline = time.time() + min(
+            MAX_BATCH_DOWNLOAD_SECONDS,
+            max(30, len(remote_files) * 8),
+        )
         sizes: List[int] = []
         expected_total = -1
         raw_start = -1
 
         while time.time() < deadline:
             if self.mp.transport.in_waiting:
-                buf += self.mp.transport.read(self.mp.transport.in_waiting)
+                chunk = self.mp.transport.read(self.mp.transport.in_waiting)
+                max_buffer = (
+                    MAX_BATCH_SIZE_HEADER_BYTES
+                    + MAX_BATCH_DOWNLOAD_BYTES
+                    + 131072
+                )
+                if len(buf) + len(chunk) > max_buffer:
+                    return self._pull_transfer_error(
+                        fmt,
+                        "download_limit_exceeded",
+                        "device response exceeds batch download limit",
+                        limit=MAX_BATCH_DOWNLOAD_BYTES,
+                    )
+                buf.extend(chunk)
                 if expected_total >= 0 and len(buf) > expected_total + 131072:
                     break
                 if expected_total < 0:
@@ -896,21 +936,65 @@ class ProjectSyncManager:
                         nl = buf.find(b"\n", sz_marker)
                         if nl >= 0:
                             try:
-                                sizes = [
-                                    int(x)
-                                    for x in buf[sz_marker + 3 : nl].decode().split(",")
-                                ]
+                                size_header = bytes(buf[sz_marker + 3 : nl])
+                                if len(size_header) > MAX_BATCH_SIZE_HEADER_BYTES:
+                                    raise ValueError("size header too large")
+                                tokens = size_header.decode("ascii").split(",")
+                                if len(tokens) > MAX_BATCH_DOWNLOAD_FILES:
+                                    raise ValueError("too many size entries")
+                                if any(
+                                    not token
+                                    or len(token) > 20
+                                    or (token != "-1" and not token.isdecimal())
+                                    for token in tokens
+                                ):
+                                    raise ValueError("invalid size entry")
+                                sizes = [int(token) for token in tokens]
+                                if any(size < -1 for size in sizes):
+                                    raise ValueError("invalid negative size")
                                 expected_total = sum(s for s in sizes if s >= 0)
                                 raw_start = nl + 1
-                            except Exception:
-                                pass
+                            except (UnicodeError, ValueError):
+                                return self._pull_transfer_error(
+                                    fmt,
+                                    "invalid_size_info",
+                                    "device returned invalid file size information",
+                                )
+                            if expected_total > MAX_BATCH_DOWNLOAD_BYTES:
+                                return self._pull_transfer_error(
+                                    fmt,
+                                    "download_limit_exceeded",
+                                    "device batch download exceeds byte limit",
+                                    limit=MAX_BATCH_DOWNLOAD_BYTES,
+                                    received=expected_total,
+                                )
+                        elif len(buf) - sz_marker > MAX_BATCH_SIZE_HEADER_BYTES:
+                            return self._pull_transfer_error(
+                                fmt,
+                                "invalid_size_info",
+                                "device size header exceeds safety limit",
+                            )
+                    elif len(buf) > MAX_BATCH_SIZE_HEADER_BYTES:
+                        return self._pull_transfer_error(
+                            fmt,
+                            "size_info_missing",
+                            "device size header exceeds safety limit",
+                        )
                 if expected_total >= 0:
-                    raw = _strip_repl_trailer(buf[raw_start:])
+                    raw = _strip_repl_trailer(bytes(buf[raw_start:]))
                     if len(raw) >= expected_total:
                         time.sleep(0.05)
-                        buf += self.mp.transport.read(
+                        chunk = self.mp.transport.read(
                             self.mp.transport.in_waiting,
                         )
+                        if len(buf) + len(chunk) > max_buffer:
+                            return self._pull_transfer_error(
+                                fmt,
+                                "download_limit_exceeded",
+                                "device response exceeds batch download limit",
+                                limit=MAX_BATCH_DOWNLOAD_BYTES,
+                            )
+                        buf.extend(chunk)
                         break
             else:
                 time.sleep(0.02)
@@ -926,7 +1010,7 @@ class ProjectSyncManager:
                 expected=len(remote_files), received=len(sizes),
             )
 
-        raw = _strip_repl_trailer(buf[raw_start:])
+        raw = _strip_repl_trailer(bytes(buf[raw_start:]))
         if len(raw) < expected_total:
             return self._pull_transfer_error(
                 fmt, "incomplete_data", "数据不完整",

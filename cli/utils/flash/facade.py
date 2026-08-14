@@ -54,6 +54,7 @@ for _name in _core_export_names:
     globals()[_name] = getattr(_core, _name)
 
 log = get_logger(__name__)
+MAX_DEVICE_FILE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -432,6 +433,8 @@ class MicroPython(MicroPythonBase):
         desc: str = "batch transfer",
     ) -> None:
         ack_every = max(1, ack_every)
+        if total < 0:
+            raise ValueError("transfer total must be non-negative")
         self._suppress_traffic = True
         try:
             if self._traffic_monitor:
@@ -451,6 +454,12 @@ class MicroPython(MicroPythonBase):
 
             def send_one(chunk: bytes) -> None:
                 nonlocal sent, chunks_since_ack
+                if not chunk:
+                    return
+                if sent + len(chunk) > total:
+                    raise RuntimeError(
+                        "transfer chunk exceeds declared total byte count"
+                    )
                 self._write(chunk)
                 sent += len(chunk)
                 chunks_since_ack += 1
@@ -473,6 +482,10 @@ class MicroPython(MicroPythonBase):
             else:
                 for chunk in data_iter:
                     send_one(chunk)
+            if sent != total:
+                raise RuntimeError(
+                    f"transfer byte count mismatch: expected {total}, sent {sent}"
+                )
         finally:
             self._suppress_traffic = False
 
@@ -684,7 +697,11 @@ class MicroPython(MicroPythonBase):
         while time.time() < deadline:
             if self.transport.in_waiting:
                 chunk = self.transport.read(self.transport.in_waiting)
-                buf.extend(chunk)
+                _core._extend_device_response(
+                    buf,
+                    chunk,
+                    _core.MAX_REPL_RESPONSE_BYTES,
+                )
                 self._record_rx(chunk)
                 start = buf.find(b"DELTA:")
                 if start >= 0 and buf.find(b"\n", start) >= 0:
@@ -1153,8 +1170,8 @@ class MicroPython(MicroPythonBase):
                 )
 
             prepared_by_index: Dict[int, _PreparedFlashFile] = {}
-            workers = min(8, max(1, len(final_jobs)))
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            io_workers = min(8, max(1, len(final_jobs)))
+            with ThreadPoolExecutor(max_workers=io_workers) as executor:
                 future_map = {
                     executor.submit(read_one, job): idx
                     for idx, job in enumerate(final_jobs)
@@ -1486,7 +1503,23 @@ class MicroPython(MicroPythonBase):
         out = self.run(
             f"import os; print(os.stat({remote_path!r})[6])", timeout=5,
         )
-        expected_size = int(out.strip().splitlines()[-1])
+        try:
+            size_text = out.strip().splitlines()[-1].strip()
+        except IndexError as exc:
+            raise RuntimeError("invalid device file size response") from exc
+        if (
+            not size_text
+            or len(size_text) > 20
+            or not size_text.isascii()
+            or not size_text.isdecimal()
+        ):
+            raise RuntimeError("invalid device file size response")
+        expected_size = int(size_text)
+        if expected_size > MAX_DEVICE_FILE_BYTES:
+            raise RuntimeError(
+                f"device file size {expected_size} exceeds download limit "
+                f"({MAX_DEVICE_FILE_BYTES} bytes)"
+            )
         log.trace("设备文件 %s 大小: %d 字节", remote_path, expected_size)
 
         # 阶段 2：读取原始字节
@@ -1505,15 +1538,22 @@ class MicroPython(MicroPythonBase):
         self._write(script.encode() + SET_EXECUTE)
         time.sleep(0.2)
 
-        buf = b""
-        need = 2 + expected_size + 3
+        buf = bytearray()
+        need = 2 + expected_size + 1
+        max_frame = 2 + expected_size + 3
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.transport.in_waiting:
-                buf += self.transport.read(self.transport.in_waiting)
+                chunk = self.transport.read(self.transport.in_waiting)
+                if len(buf) + len(chunk) > max_frame:
+                    raise RuntimeError("device file response exceeds expected frame")
+                buf.extend(chunk)
                 if len(buf) >= need:
                     time.sleep(0.05)
-                    buf += self.transport.read(self.transport.in_waiting)
+                    chunk = self.transport.read(self.transport.in_waiting)
+                    if len(buf) + len(chunk) > max_frame:
+                        raise RuntimeError("device file response exceeds expected frame")
+                    buf.extend(chunk)
                     break
             else:
                 time.sleep(0.02)
@@ -1524,9 +1564,15 @@ class MicroPython(MicroPythonBase):
                 f"收到 {max(0, len(buf) - 5)} 字节"
             )
 
-        raw = buf[2:] if buf.startswith(b"OK") else buf
-        raw = _strip_repl_trailer(raw)
-        return raw[:expected_size]
+        frame = bytes(buf)
+        if not frame.startswith(b"OK"):
+            raise RuntimeError("invalid device file response prefix")
+        payload_end = 2 + expected_size
+        payload = frame[2:payload_end]
+        trailer = frame[payload_end:]
+        if trailer not in (b"\x04", b"\x04\x04", b"\x04\x04>"):
+            raise RuntimeError("invalid device file response trailer")
+        return payload
 
     # ═══════════════════════════════════════════════════════════════
     # 设备文件管理 (fs)
@@ -1584,7 +1630,6 @@ class MicroPython(MicroPythonBase):
         """递归列出设备目录下的所有文件和子目录。"""
         script = (
             "import os\n"
-            "print(os.listdir())\n"
             "def _st(p):\n"
             " s=os.stat(p); s=os.stat(p)\n"
             " return s\n"

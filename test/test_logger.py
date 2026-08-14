@@ -417,6 +417,20 @@ def test_traffic_monitor():
     monitor.close()
 
 
+def test_traffic_log_bounds_device_controlled_text(monkeypatch):
+    import cli.utils.log as log_module
+
+    records = []
+    monkeypatch.setattr(log_module._mgr, "emit", records.append)
+    log = get_logger("test.traffic.limit")
+
+    log.traffic("RX", b"x" * (log_module.TRAFFIC_TEXT_PREVIEW_BYTES + 100))
+
+    assert len(records) == 1
+    assert len(records[0].text) < log_module.TRAFFIC_TEXT_PREVIEW_BYTES + 100
+    assert "100 bytes omitted" in records[0].text
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 日志操作上下文测试
 # ═══════════════════════════════════════════════════════════════════

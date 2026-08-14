@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import ntpath
 import posixpath
 import re
 from dataclasses import asdict, dataclass
@@ -24,6 +25,14 @@ DEFAULT_EXCLUDES = (
     "*.log",
 )
 DEFAULT_MAX_FILE_BYTES = 1024 * 1024
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 @dataclass(frozen=True)
@@ -102,14 +111,49 @@ def normalize_device_path(path: str) -> str:
     return value
 
 
-def local_relpath_for_device_path(path: str) -> str:
-    normalized = normalize_device_path(path)
+def _safe_device_path_parts(path: str) -> tuple[str, list[str]]:
+    raw = str(path)
+    if not raw or "\x00" in raw:
+        raise ValueError(f"unsafe device path: {path}")
+    if raw.startswith("\\") or raw.startswith("//") or ntpath.splitdrive(raw)[0]:
+        raise ValueError(f"unsafe device path: {path}")
+
+    portable = raw.replace("\\", "/")
+    raw_parts = portable.split("/")
+    if any(part == ".." for part in raw_parts):
+        raise ValueError(f"unsafe device path: {path}")
+
+    normalized = normalize_device_path(portable)
     parts = [part for part in normalized.strip("/").split("/") if part]
     if not parts:
         raise ValueError("snapshot file path cannot be device root")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"unsafe device path: {path}")
+    for part in parts:
+        stem = part.split(".", 1)[0].upper()
+        if (
+            part in {".", ".."}
+            or ":" in part
+            or part.rstrip(" .") != part
+            or stem in _WINDOWS_RESERVED_NAMES
+        ):
+            raise ValueError(f"unsafe device path: {path}")
+    return normalized, parts
+
+
+def local_relpath_for_device_path(path: str) -> str:
+    _normalized, parts = _safe_device_path_parts(path)
     return posixpath.join("files", *parts)
+
+
+def safe_local_path_for_device_path(root: str | Path, path: str) -> Path:
+    """Map an untrusted device path below ``root`` without host-path escapes."""
+    _normalized, parts = _safe_device_path_parts(path)
+    base = Path(root).resolve()
+    target = base.joinpath(*parts).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"unsafe device path: {path}") from exc
+    return target
 
 
 def save_snapshot_files(
@@ -127,7 +171,7 @@ def save_snapshot_files(
     entries: list[SnapshotEntry] = []
     for raw_path, data in sorted(files.items()):
         remote_path = normalize_device_path(raw_path)
-        rel = local_relpath_for_device_path(remote_path)
+        rel = local_relpath_for_device_path(raw_path)
         local_path = target / rel
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(data)
@@ -196,7 +240,7 @@ def filter_device_entries(
             continue
         path = normalize_device_path(str(entry.get("name", "")))
         size = _entry_size(entry)
-        if size is None or size > max_file_bytes:
+        if size is None or size < 0 or size > max_file_bytes:
             continue
         if include and not _matches_any(path, include):
             continue

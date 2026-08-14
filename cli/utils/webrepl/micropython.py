@@ -27,7 +27,7 @@ class WebREPLMicroPython(MicroPython):
         timeout: int = 10,
         transport: Optional["Transport"] = None,
     ) -> None:
-        t = transport or WebREPLTransport(url, password)
+        t = transport or WebREPLTransport(url, password, timeout=timeout)
         log.debug("创建 WebREPL 连接: %s", url)
         super().__init__(port=url, timeout=timeout, transport=t)
         self.url = url
